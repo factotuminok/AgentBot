@@ -13,7 +13,7 @@ DevForge runs everything in one container: web UI, Discord bot, GitHub poller, s
 |---|---|---|---|
 | A-1 | Separate components: **web**, **orchestrator** (the chatbot), **worker** (one per agent run) and, on Podman, a **launcher** that starts the workers. | Keep one process. | The bot must be independent of the website and the omp processes, and each run must be isolated. |
 | A-2 | The orchestrator is a **singleton** and the only owner of the database, the vault, the git mirrors and all GitHub and Discord credentials. | Several replicas with leader election. | Discord allows one gateway session per bot, the poller must run once, and SQLite has one writer. Leader election would add a lot of moving parts for no throughput gain. |
-| A-3 | **One worker per agent run, with a private checkout.** The worker clones from the orchestrator (read-only, no GitHub credentials), works on a temporary branch, and returns its commits as a git bundle. The orchestrator pushes. Workers share no volume. *(Replaces the earlier shared workspace volume.)* | A shared ReadWriteMany volume with one worktree per run. | Runs cannot see each other's code, sessions or files. No RWX storage is needed. Cost: a clone and `setupCommand` at the start of every run. |
+| A-3 | **One worker per agent run, with a private checkout.** The worker makes a shallow checkout of the run's start commit from the orchestrator (read-only, no GitHub credentials), works on a temporary branch, and returns its commits as a git bundle. The orchestrator pushes. Workers share no volume. *(Replaces the earlier shared workspace volume.)* | A shared ReadWriteMany volume with one worktree per run. | Runs cannot see each other's code, sessions or files. No RWX storage is needed. Cost: a checkout and `setupCommand` at the start of every run. |
 | A-4 | Kubernetes starts workers with a **KEDA ScaledJob**, 0–10: one Job pod per agent run. | Orchestrator creates Jobs itself; a Deployment with a KEDA ScaledObject. | A Job finishes when its run finishes, so scale-down never kills a busy pod. The orchestrator needs no Kubernetes API permissions. Cost: KEDA must be installed. |
 | A-5 | Workers **pull** their run from the orchestrator over a WebSocket. | The orchestrator pushes to worker endpoints. | Workers need no Service or published port, and the same worker code runs under the launcher and under KEDA. |
 | A-6 | omp updates stay **in place, for workers only**. After Discord approval the orchestrator installs and packs a newer omp. Each new worker downloads it, falling back to the image's omp if it fails. | Image-only updates. | Users can take a new omp without rebuilding or redeploying. Running runs are not interrupted, and no component restarts. |
@@ -92,7 +92,7 @@ The web component is a thin front end:
 - It sets the security headers and checks the `Origin` header (WEB-05 to WEB-09).
 - It reads and writes all data through the orchestrator's admin API, holding no database or vault of its own. Setup, login and unlock are forwarded to the orchestrator, which owns the vault. The setup token is printed in the **orchestrator's** log.
 - It proxies the log stream (SSE) and log-file downloads from the orchestrator.
-- It runs the **configuration editor**, code-server, on its own home volume as the engine user (§2.5). There is no SSH server. code-server's integrated terminal, extension marketplace, tasks and debuggers are disabled (requirements WEB-14, WEB-31).
+- It runs the **configuration editor**, code-server, on its own home volume as the `agentbot` user (§2.5). There is no SSH server. code-server's integrated terminal, extension marketplace, tasks and debuggers are disabled (requirements WEB-14, WEB-31).
   - The web pod holds no repo checkouts, no model sign-ins and no omp.
 
 When the orchestrator is unreachable, the web UI MUST still serve: login fails with "orchestrator unavailable", and the home page shows it.
@@ -102,7 +102,7 @@ When the orchestrator is unreachable, the web UI MUST still serve: login fails w
 A worker exists for exactly one run. It:
 1. connects to the orchestrator and claims one run (within `AGENTBOT_WORKER_CLAIM_TIMEOUT`, default 15 s; if nothing is left to claim, it exits 0, because another worker won the race);
 2. downloads what the run needs: the skills and agents, the omp runtime copy if one applies (§8), the session file to resume, and the ask scratch inputs;
-3. clones the repo privately and creates the run's temporary branch (§4.6), then runs the repo's `setupCommand`;
+3. makes a shallow checkout of the run's start commit and creates the run's temporary branch (§4.6), then runs the repo's `setupCommand`;
 4. spawns the agent host as a **child process** (AGT-01 still holds inside the worker), with a run-private auth store seeded from the run spec (CRED-02);
 5. relays the host's IPC to the orchestrator, and uploads checkpoints while it runs (RUN-18);
 6. when the host ends, uploads the result (RUN-19), wipes everything (RUN-20), and exits.
@@ -227,7 +227,7 @@ An `mcp-test` connects to one MCP server with the worker's omp, lists its tools 
 The **run spec** contains everything the worker needs:
 - profile, prompt, output schema;
 - time and cost limits, model, thinking level;
-- the checkout: repo, start ref and its commit sha, temporary branch name, whether the run writes code, and whether a checkpoint exists to restore (§4.6);
+- the checkout, absent for `/ask` runs and `mcp-test`: repo, start ref and its commit sha, temporary branch name, whether the run writes code, and whether a kept result or checkpoint exists to restore (§4.6);
 - the bot's git name and email, for local commits only;
 - whether a session file exists to resume;
 - omp setting overrides, MCP servers (implement profile only), and the content hash of the skills and agents bundle;
@@ -365,7 +365,8 @@ flowchart LR
 
 - **RUN-17** **Checkout.** Before claiming, the orchestrator fetches the mirror (creating it on first use), reads `.agentbot.yml` (requirements GH-26), and fixes the run's start ref and commit:
   - the base branch for plan, chat, draft and fresh implement runs;
-  - the issue branch head for revise, fix_ci and resumed runs.
+  - the issue branch head for revise and fix_ci runs;
+  - for a run that continues an earlier one (requeued after a lost worker, or retried after a failure), the **earlier run's start commit**, so that its kept checkpoint applies. This holds even when the issue branch does not exist yet or has moved. The exception is a Retry after a rejected push (RUN-19): that run starts from the issue branch's new head, and the session tells the agent what it did before.
 
   The worker MUST then make a **shallow** checkout from `/internal/git/…`:
   1. initialise an empty repository;
@@ -375,17 +376,20 @@ flowchart LR
 
   - The lease token reaches git only through a per-command `http.extraHeader` environment variable (as WS-02).
   - The endpoint MUST serve only that repo, only `git-upload-pack`, and MUST hide `refs/agentbot/*`.
-  - If the run resumes from a checkpoint, the worker restores the checkpoint as uncommitted changes on the temporary branch.
+  - If the run continues an earlier one, the worker fetches that run's kept checkpoint through the run artifact endpoint and restores it:
+    1. check out the checkpoint commit on the temporary branch;
+    2. reset to its parent with a mixed reset, which keeps the run's commits and turns the checkpoint's working tree back into uncommitted changes.
 
   The agent has no history: `git log`, `git blame` and diffs against older commits show only the start commit, and the prompts MUST say so. Bundles and pushes are unaffected, because the run's commits sit on top of the start commit.
 - **RUN-18** **Checkpoints.** For runs that write code (implement, revise, fix_ci), the worker MUST upload a checkpoint:
+  - when the host first reports `session_file` (the session file only);
   - every 5 minutes;
   - when it receives SIGTERM (eviction, shutdown);
   - before the result.
 
   A checkpoint is a bundle with one commit on top of the temporary branch that holds the whole working tree: tracked files plus untracked files that are not ignored. The session file is uploaded with it. The orchestrator keeps only the latest checkpoint per run, as `refs/agentbot/checkpoints/<runId>` in the mirror. Read-only runs upload only the session file at the same times.
 - **RUN-19** **Result.** When the host ends, the worker MUST do the following before it relays `done` or `failed`:
-  1. For runs that write code: commit any leftover changes on the temporary branch as `AgentBot: remaining changes for #N` (requirements JOB-19), then upload a bundle of the temporary branch relative to the start commit.
+  1. For runs that write code: commit any leftover changes on the temporary branch, as `AgentBot: remaining changes for #N` for implement and as `AgentBot: follow-up changes for #N` for revise and fix_ci (requirements JOB-19, JOB-22). Then upload a bundle of the temporary branch relative to the start commit.
   2. Upload the final session file.
   3. For ask runs, upload new or changed files from `outputs/`.
 
@@ -399,7 +403,12 @@ flowchart LR
   1. delete its checkout, temporary branch, run-local auth store, session copy, skills copy and scratch copy;
   2. exit 0.
 
-  The container (`--rm`, launcher) or Job pod (`ttlSecondsAfterFinished`) is then deleted. The orchestrator MUST delete `refs/agentbot/runs/<runId>` after the push or discard, and `refs/agentbot/checkpoints/<runId>` when the run finishes. A run requeued after a worker loss keeps its checkpoint until the resumed run finishes. Session files stay in the orchestrator until their issue, plan or draft ends (requirements ENG-05). At start, the orchestrator MUST delete `refs/agentbot/*` refs of runs that are finished.
+  The container (`--rm`, launcher) or Job pod (`ttlSecondsAfterFinished`) is then deleted. In the mirror:
+  - **Successful run, or a run whose push was rejected:** the orchestrator MUST delete `refs/agentbot/runs/<runId>` after the push or discard, and `refs/agentbot/checkpoints/<runId>` when the run finishes.
+  - **Failed job run** (a time or cost limit, or an error): it keeps both refs, unpushed, until a Retry's run finishes or the issue ends (requirements JOB-19, WS-08).
+  - **Run requeued after a worker loss:** it keeps its checkpoint until the resumed run finishes.
+
+  Session files stay in the orchestrator until their issue, plan or draft ends (requirements ENG-05). At start, the orchestrator MUST delete the `refs/agentbot/*` refs of runs that are finished and not kept for Retry.
 - **RUN-21** **One run per issue.** At most one run per issue or chat thread MUST be pending or active at a time (the scheduler already guarantees this per issue), so two runs never race to move the same issue branch.
 
 ## 5. Storage
@@ -407,7 +416,7 @@ flowchart LR
 | Volume | Mounted by | Docker/Podman | Kubernetes | Contents |
 |---|---|---|---|---|
 | state | orchestrator | `agentbot-state` | PVC, RWO | `agentbot.db` (SQLite, WAL); `omp-agent/` (omp sign-in store `agent.db`, model cache); `repos/` (bare mirrors, temp refs); `sessions/`; `scratch/` (ask inputs and outputs); `omp/` (skills and agents); `omp-runtime/` (packed omp copies); `logs/agent/`, `logs/orchestrator/` |
-| web home | web | `agentbot-web` | PVC, RWO | engine user's `$HOME`: the config workspace copy and its last-synced revisions, code-server settings and extensions |
+| web home | web | `agentbot-web` | PVC, RWO | the `agentbot` user's `$HOME`: the config workspace copy and its last-synced revisions, queued saves (requirements WEB-27), code-server settings and extensions |
 | worker checkout | one worker | container scratch, size-limited | `emptyDir`, `sizeLimit` (default 20 Gi) | the run's clone, session copy, skills copy, scratch copy |
 | run-local | one worker | tmpfs | `emptyDir`, `medium: Memory` | run-private auth store |
 
@@ -443,7 +452,7 @@ flowchart LR
   - to workers, nothing;
   - worker → web is denied.
 
-  Egress stays open for every component: the orchestrator needs Discord, GitHub, npm and the model providers' sign-in endpoints; workers need model providers, web search and package registries; web needs Open VSX. On Podman the same applies: only the web service publishes ports.
+  Egress stays open for the orchestrator and workers: the orchestrator needs Discord, GitHub, npm and the model providers' sign-in endpoints; workers need model providers, web search and package registries. Web needs no egress beyond the orchestrator; the VS Code extension is bundled and the marketplace is off. On Podman the same applies: only the web service publishes ports.
 - **SEC-16** The master key needs no root-entrypoint stdin trick (DevForge's approach), because no agent ever runs in the orchestrator's container. It is mounted as a file readable only by uid 10001 in the orchestrator.
 
 **Isolation and accepted risks.**
@@ -476,7 +485,7 @@ The image carries an **app identity**: a file `/app/IDENTITY` holding the AgentB
 | Role | Entrypoint duties |
 |---|---|
 | orchestrator | Open the state volume. Run `agentbot orchestrator`. |
-| web | `agentbot web`, which starts code-server on first use with `SHELL=/usr/sbin/nologin`, the marketplace off and only the allowed extensions enabled (requirements WEB-14, WEB-31). The engine user's login shell in the image is `/usr/sbin/nologin`. |
+| web | `agentbot web`, which starts code-server on first use with `SHELL=/usr/sbin/nologin`, the marketplace off and only the allowed extensions enabled (requirements WEB-14, WEB-31). The `agentbot` user's login shell in the image is `/usr/sbin/nologin`. |
 | worker | `agentbot worker`: one run, then exit. |
 | launcher | `agentbot launcher` (Podman only). |
 
@@ -546,8 +555,8 @@ Requirements: Kubernetes ≥ 1.27 and KEDA ≥ 2.12.
 | Failure | Effect |
 |---|---|
 | Orchestrator restart or crash | Discord and polling pause. Runs keep going on their workers and re-attach within 90 s (RUN-06, RUN-07). Uploads are retried. The web UI shows "orchestrator unavailable". |
-| Web restart | Admins are logged out (in-memory sessions). Open VS Code sessions end; saved files are already in the orchestrator, and the workspace is re-synced on start. No effect on Discord or runs. |
-| Orchestrator unreachable while editing | Saves are queued in the web pod and the VS Code status bar shows "orchestrator unavailable". They are sent, and validated, once it is back (WEB-27). |
+| Web restart | Admins are logged out (in-memory sessions). Open VS Code sessions end. Saves already sent are in the orchestrator; queued saves are on the web home volume and are sent after the restart. The workspace is re-synced on start. No effect on Discord or runs. |
+| Orchestrator unreachable while editing | Saves are queued on the web home volume and the VS Code status bar shows "orchestrator unavailable". They are sent, and validated, once it is back (WEB-27). |
 | Worker container or pod lost | Lease expiry after 45 s, then RUN-04: the job resumes on a new worker from its last checkpoint. |
 | KEDA or the launcher missing or not starting workers | Runs stay pending. Discord shows "Waiting for a worker…" and the status page shows pending runs and their age. |
 | Launcher pointed at a rootful socket | The launcher refuses to start (LCH-01). Runs stay pending. |
@@ -565,7 +574,8 @@ requirements.md has been updated for these:
 | AGT-24, AGT-25 | Skills and agents live in the orchestrator and are copied to each worker; skills with extra files are uploaded as a zip. |
 | WS-01, WS-03 to WS-05, WS-07, WS-08 | Mirrors on the state volume, created on first use and pruned when unused; private shallow checkouts on a temporary branch per run (RUN-17 to RUN-20); `setupCommand` from the repository's `.agentbot.yml` at the start of every run. |
 | GH-03, GH-06, GH-10, GH-25 to GH-27, DSC-03, DSC-09, DSC-33 to DSC-38, WEB-15 to WEB-24, WEB-32 | No per-repository settings: every repository the App can access is available; a work channel for any repository; watched repositories get their own channel and are the only ones polled for new issues. |
-| JOB-10, JOB-11, JOB-18, JOB-19, JOB-21 | Session files and uncommitted work survive through uploads and checkpoints; fresh checkouts replace worktree resets; fast-forward push from the result bundle. |
+| JOB-10, JOB-11, JOB-18, JOB-19, JOB-21, JOB-22, DSC-21 | Session files, commits and uncommitted work survive through uploads and checkpoints; a failed job keeps its work for Retry; fresh checkouts replace worktree resets; fast-forward push from the result bundle. |
+| AGT-13, OPS-06, DSC-26, DSC-27, DSC-34 | Prompts state the shallow-checkout rule; the dry-run checks out like a worker; a `/work plan` Execute turns the plan thread into the issue thread. |
 | CHAT-01, CHAT-03, CHAT-06, CHAT-07, DSC-25 | Chat, plan and draft runs check out privately per run; scratch files live in the orchestrator. |
 | DSC-11, DSC-17, DSC-24, DSC-32, OBS-03 | One rate-aware Discord queue. ✅, 👀 and ⏳ follow delivery (RUN-15). Transcripts are cut on the worker (RUN-16). |
 | JOB-08, DSC-06, DSC-28 | Orchestrator restarts no longer abort runs (RUN-04, RUN-07). The ask-user limit and plan failure follow the runs table. |

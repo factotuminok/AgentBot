@@ -17,9 +17,9 @@ src/
   cli.ts                  agentbot orchestrator|web|worker|launcher|health
   shared/                 config schema, protocol types, log, version and app identity, http/ws client helpers
   orchestrator/
-    engine/               controller, scheduler, jobs, plans, chat, draft, ciGate  (from DevForge src/engine, src/controller.ts)
-    discord/              bot, access, progress, render, replies, topMessage, ompUpdate, outbound queue
-    github/               app, poller, feedback, ci
+    engine/               controller, scheduler, jobs, plans, chat, draft, ciGate, watches  (from DevForge src/engine, src/controller.ts)
+    discord/              bot, access, progress, render, replies, topMessage, ompUpdate, outbound queue, watch channels
+    github/               app, repos (installation listing, .agentbot.yml), poller, feedback, ci
     git/                  mirrors, push, git endpoint, bundle import, temp refs
     dispatch/             runs table, leases, worker WebSocket, relay, outbox, scale endpoint
     api/                  admin API, run artifact API, health endpoints
@@ -66,6 +66,7 @@ flowchart LR
     P5 --> P7[7 VS Code config editor]
     P6 --> P7
     P5 --> P8[8 Image + Podman launcher]
+    P7 --> P8
     P8 --> P9[9 Kubernetes + Helm]
     P8 --> P10[10 omp updates + CD]
     P9 --> P11[11 Hardening + release]
@@ -73,7 +74,7 @@ flowchart LR
     P7 --> P11
 ```
 
-Phases 6 and 7 can run alongside 3 to 5 once phase 2 is done.
+Phases 6 and 7 can run alongside 3 to 5 once phase 2 is done. Phase 8 needs phase 7, because the image bundles the VS Code extension.
 
 ### Phase 1: Foundation
 
@@ -90,7 +91,7 @@ Work:
   - `workers.*`;
   - no per-repository settings: `repos[]` and `updates.*` removed; `discord.workChannelId`, `discord.watchCategoryId` and `github.mentionKeyword` added;
   - models for drafts and `/ask` (`models.chat`).
-- Database (DB-01, DB-02), from `src/db.ts`, with the new tables: runs, the relay outbox, open questions, and config revisions.
+- Database (DB-01, DB-02), from `src/db.ts`, with the new tables: runs, the relay outbox, open questions, watches and their cursors, and config revisions.
 - Vault (SEC-03 to SEC-05), from `src/vault.ts`, without the SSH blob.
 - State machine (ISS-01 to ISS-06), from `src/state.ts`, with configurable labels (GH-08).
 
@@ -106,17 +107,18 @@ Work:
 - Controller and phases (ENG-01 to ENG-05), from `src/controller.ts` and `src/main.ts`. Engine restarts never touch runs.
 - Health (OBS-01, architecture §4.5, RUN-12, RUN-13): `/livez`, `/readyz` with the limits block, and `AGENTBOT_WORKER_CAPACITY`.
 - Admin API skeleton (`/internal/admin/*`, web token, SEC-14).
-- GitHub (GH-01 to GH-27), from `src/github/*`:
+- GitHub (GH-01 to GH-25, GH-27), from `src/github/*`:
   - the label rename migration (GH-22 to GH-24);
   - repositories from the App's installations (GH-25);
   - polling for new work only in watched repositories, while following every tracked issue (GH-06, GH-10, GH-27).
-- Discord (DSC-01 to DSC-24, DSC-29 to DSC-38), from `src/discord/*`:
+- Discord (DSC-01 to DSC-20, DSC-22, DSC-24, DSC-29 to DSC-38), from `src/discord/*`:
   - `/forge` renamed to `/work`, and `work` to `start`;
   - the work channel, repo autocomplete, and `/work watch` and `/work unwatch` with channel creation (DSC-33 to DSC-38);
   - commands that track issues at once instead of waiting for a poll;
   - the agent nickname and name in text;
   - the outbound queue with coalescing and priorities (DSC-32).
 - Scheduler and job state handling (JOB-01 to JOB-09), from `src/engine/scheduler.ts` and `jobs.ts`. `runAgent` goes through a `Dispatcher` interface whose only implementation in this phase is a test fake.
+- The plan job (JOB-12 to JOB-17), driven by the fake dispatcher's canned plan output: the plan comment, the revision counter, and the "Plan ready for your approval" message with its three buttons. Phase 5 runs it on real workers.
 - Minimal web, ported from `src/web/*` but talking to the admin API:
   - setup, login, account and sessions (WEB-01 to WEB-11);
   - a Settings form with typed channel IDs (dropdowns and the Repositories page come in phase 6);
@@ -178,16 +180,17 @@ Work:
 
 Ported tests: `workspace` (rewritten for mirrors and bundles), and the S3 script turned into an integration test.
 
-**Exit:** a fake implement run on a test repo pushes its commits to the issue branch. Two failure checks:
+**Exit:** a fake implement run on a test repo pushes its commits to the issue branch. Three failure checks:
 - Evicting the worker mid-run: the next worker resumes with the uncommitted file intact.
-- A human push during the run: the job fails with the Retry message.
+- A human push during the run: the job fails with the Retry message, and Retry starts from the new head.
+- An implement run stopped by its time limit after committing: Retry continues with those commits and the uncommitted work intact.
 
 ### Phase 5: Issue and chat flows end to end
 
 **Goal:** every user-facing flow on the new runtime.
 
 Work:
-- Plan (JOB-12 to JOB-17), implement (JOB-18 to JOB-20), the CI gate (CI-01 to CI-09), the PR (PR-01 to PR-03), revise and fix_ci (JOB-21 to JOB-23), from `src/engine/jobs.ts` and `ciGate.ts`, rebased on dispatch and bundles.
+- Implement (JOB-18 to JOB-20), the CI gate (CI-01 to CI-09), the PR (PR-01 to PR-03), revise and fix_ci (JOB-21 to JOB-23), from `src/engine/jobs.ts` and `ciGate.ts`, rebased on dispatch and bundles. The phase 2 plan job runs on real workers.
 - `/work plan` (DSC-25 to DSC-28), `/work ask` (CHAT-01 to CHAT-06), `/work issue` drafts, `/work start`, `/work status` and `/work cancel`.
 - Retry (DSC-21), idle replies (DSC-23), and restart semantics (JOB-08, NFR-03).
 - Limits and time accounting that leave out worker start and checkout time (AGT-14, RUN-03, NFR-06).
@@ -328,14 +331,14 @@ DevForge's tests are ported with their modules. Tests that pinned DevForge's wor
 
 | Requirements | Phase |
 |---|---|
-| ISS, GH-01 to GH-27, DSC-01 to DSC-24, DSC-29 to DSC-38, JOB-01 to JOB-09, ENG, DB, WEB-01 to WEB-11, OBS-01, OBS-02, SEC-01 to SEC-06, OPS-04 | 1, 2 |
-| RUN-01 to RUN-16, AGT-01 to AGT-29, CRED, CHAT-07 to CHAT-11 | 3 |
-| WS, RUN-17 to RUN-21, STO, JOB-10, JOB-11 | 4 |
-| JOB-12 to JOB-23, CI, PR, DSC-25 to DSC-28, CHAT-01 to CHAT-06, NFR-03, NFR-06 | 5 |
+| ISS, GH-01 to GH-25, GH-27, DSC-01 to DSC-20, DSC-22, DSC-24, DSC-29 to DSC-38, JOB-01 to JOB-09, JOB-12 to JOB-17, ENG, DB, WEB-01 to WEB-11, OBS-01, OBS-02, SEC-01 to SEC-06, SEC-14, RUN-10 to RUN-13, OPS-04 | 1, 2 |
+| RUN-01 to RUN-09, RUN-14 to RUN-16, AGT-01 to AGT-29, CRED, CHAT-07 to CHAT-11 | 3 |
+| WS, GH-26, RUN-17 to RUN-21, STO, JOB-10, JOB-11 | 4 |
+| JOB-18 to JOB-23, CI, PR, DSC-21, DSC-23, DSC-25 to DSC-28, CHAT-01 to CHAT-06, NFR-03, NFR-06 | 5 |
 | WEB-20 to WEB-24, WEB-32, SEC-12, SEC-13, OBS-03 to OBS-06 | 6 |
 | WEB-14, WEB-25 to WEB-31 | 7 |
-| OPS-01 to OPS-03, LCH, UPD-01, NFR-01, NFR-02 | 8 |
-| OPS-07 to OPS-09, SEC-14 to SEC-16, RUN-10 to RUN-13 (Kubernetes) | 9 |
+| OPS-01 to OPS-03, LCH, UPD-01, SEC-16, NFR-01, NFR-02 | 8 |
+| OPS-07 to OPS-09, SEC-15, and the Kubernetes side of RUN-10 to RUN-13 | 9 |
 | UPD-02 to UPD-10, OPS-05, OPS-06 | 10 |
 | NFR-04, NFR-05, everything re-verified | 11 |
 

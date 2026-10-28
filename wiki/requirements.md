@@ -10,7 +10,7 @@ Topology: AgentBot runs as separate components (web, orchestrator, one short-liv
 
 ## 1. Purpose and scope
 
-The system is a long-running service that uses an embedded coding-agent SDK (omp, `@oh-my-pi/pi-coding-agent`) to develop and maintain a configured set of GitHub repositories.
+The system is a long-running service that uses an embedded coding-agent SDK (omp, `@oh-my-pi/pi-coding-agent`) to develop and maintain the GitHub repositories its GitHub App is installed on.
 
 - GitHub issues drive the work.
 - Discord is the control surface: approvals, answers to agent questions, steering, chat and status.
@@ -57,7 +57,7 @@ Any non-terminal state also accepts `cancelled`.
 - **GH-03** The system MUST look up a repository's installation on first use and cache it. A repository the App cannot access MUST be refused, with a message that names it and links to the App's installation page.
 - **GH-04** The commit identity MUST be `<slug>[bot]` with email `<id>+<slug>[bot]@users.noreply.github.com`.
 - **GH-05** GitHub MUST be polled, not driven by webhooks. The interval is `github.pollIntervalSeconds` (default 60), and the first cycle MUST run immediately at start.
-- **GH-06** Each poll cycle MUST look for new work in the watched repositories one after another (GH-10), then follow every tracked issue, whatever its repository (GH-13 to GH-21). An error in one repository MUST be recorded as that repository's `lastError` and MUST NOT stop the others.
+- **GH-06** Each poll cycle MUST look for new work in the watched repositories one after another (GH-10), then follow every tracked issue, whatever its repository (GH-13 to GH-21). An error MUST NOT stop the other repositories or issues. It MUST be recorded on the watch as `lastError` when the repository is watched, and otherwise on the affected issue's status row, and always in the log.
 - **GH-07** A `pollNow(repo)` request MUST join a cycle that is already running and resolve when a cycle started after the request completes. When the poller is stopped, it MUST resolve immediately.
 - **GH-08** The trigger label and the state labels MUST be configurable (GH-22). The default trigger label is `agentbot`. The default state labels are `<trigger>:planning`, `<trigger>:awaiting-approval`, `<trigger>:implementing`, `<trigger>:in-review` and `<trigger>:failed`. The `queued`, `done` and `cancelled` states MUST carry no state label. Missing labels MUST be created.
 - **GH-09** A state change MUST remove the previous state label (a 404 is ignored) and add the new one. If labels are unchanged, nothing is sent. A label sync failure MUST be logged and MUST NOT fail the transition.
@@ -110,7 +110,7 @@ Any non-terminal state also accepts `cancelled`.
 
 ### 2.6 Repositories
 
-- **GH-25** The repositories available to AgentBot MUST be exactly those the GitHub App's installations can access. Archived repositories are excluded. There are no per-repository settings in AgentBot. An admin widens or narrows the set in the App's installation settings on GitHub.
+- **GH-25** The repositories available to AgentBot MUST be exactly those the GitHub App's installations can access. There are no per-repository settings in AgentBot. An admin widens or narrows the set in the App's installation settings on GitHub. Archived repositories are listed on the Repositories page but cannot be watched or worked on. They are not offered in autocomplete, and `/work` commands that name one are refused with "archived (read-only)".
 - **GH-26** A repository MAY carry its own configuration in `.agentbot.yml` on its default branch (at most 64 KiB):
   - `baseBranch`: the branch work starts from and PRs target; default: the repository's default branch;
   - `setupCommand`: run in the worker's checkout before the agent starts (WS-05).
@@ -153,8 +153,8 @@ Any non-terminal state also accepts `cancelled`.
 
 - **JOB-08** At start, the orchestrator MUST re-attach runs still on workers and treat the ones not re-attached as lost (architecture RUN-04, RUN-07). A lost issue job is requeued once with `resume: true`. Orchestrator shutdown MUST NOT abort runs on workers (RUN-09).
 - **JOB-09** A resumed job MUST NOT repeat a step that is already externally visible, such as publishing the plan, pushing, or opening the PR. It MUST only complete the state update.
-- **JOB-10** The session file MUST be kept by the orchestrator between runs. The worker uploads it as soon as it is created, at every checkpoint and at the end of the run (architecture RUN-18, RUN-19). A resumed job MUST continue that session and start with a restart note telling the agent to inspect `git status` and `git log` and carry on.
-- **JOB-11** A resumed implement job MUST restore the uncommitted work from the last checkpoint (architecture RUN-18), so that work survives the loss of a worker.
+- **JOB-10** The session file MUST be kept by the orchestrator between runs. The worker uploads it as soon as it is created, at every checkpoint and at the end of the run (architecture RUN-18, RUN-19). A resumed job MUST continue that session and start with a restart note. The note tells the agent to inspect `git status` and `git log` (which show only the start commit and the run's own commits, AGT-13) and carry on.
+- **JOB-11** A resumed or retried implement job MUST restore the run's commits and its uncommitted work from the last checkpoint (architecture RUN-17, RUN-18), so that the work survives the loss of a worker or a failed run.
 
 ### 4.2 Plan job
 
@@ -180,6 +180,8 @@ Any non-terminal state also accepts `cancelled`.
   - the worker commits any leftover changes as `AgentBot: remaining changes for #N` and uploads its temporary branch as a bundle (architecture RUN-19);
   - the orchestrator fails the job with "Agent produced no commits" when the bundle has no new commits;
   - otherwise the orchestrator pushes the commits to `refs/heads/<branch>` as a fast-forward and verifies that the remote branch exists.
+
+  When the run fails with a time or cost limit or an error, its bundle and last checkpoint MUST be kept, not pushed, so that Retry continues from them (DSC-21, architecture RUN-20). When the push is rejected because the branch moved on GitHub, the bundle is discarded and Retry starts from the new head (architecture RUN-17, RUN-19).
 - **JOB-20** The output MUST be `{prTitle, prBody, testing}`.
 
 ### 4.4 CI gate before the pull request
@@ -226,7 +228,7 @@ Any non-terminal state also accepts `cancelled`.
 - **JOB-21** A follow-up run MUST start from a fresh checkout of the issue branch's current head (architecture RUN-17).
   - `revise` resumes the implement session with the feedback items as input and outputs `{summary}`.
   - `fix_ci` resumes it with the failing checks and their logs.
-- **JOB-22** If the agent made new commits, the worker MUST commit any leftover changes as `AgentBot: follow-up changes for #N` in its result bundle, and the orchestrator pushes it as a fast-forward.
+- **JOB-22** The worker MUST commit any leftover changes as `AgentBot: follow-up changes for #N` in its result bundle. The orchestrator pushes the bundle as a fast-forward when it has new commits; a bundle without new commits means no code changes were needed.
   - On success, revise MUST comment "AgentBot addressed feedback: <summary>" on the PR and mark its items as seen.
   - A failed revise MUST still mark its items as seen, and Retry re-runs the same items.
 - **JOB-23** A non-resumed `fix_ci` MUST increment `ci_attempts` and set `ci_last_sha`. A resume MUST NOT increment it. If the fix pushes nothing, the system MUST comment on the PR that it could not find a fix and post "Couldn't fix the failing checks — this needs a human" in the thread.
@@ -236,10 +238,10 @@ Any non-terminal state also accepts `cancelled`.
 - **WS-01** The orchestrator MUST keep a bare mirror at `<state>/repos/<owner>__<repo>.git` for each repository it works on. The mirror is cloned on first use and fetched with `--prune` before each use. Mirror operations MUST be serialised per repository. A mirror with no tracked issue that has not been used for 14 days MUST be deleted.
 - **WS-02** Tokens MUST reach git only through per-process `GIT_CONFIG_*` environment variables (an `http.extraheader` with a basic `x-access-token` header). Tokens MUST NOT appear in argv, the global environment or `.git/config`. `GIT_TERMINAL_PROMPT=0` MUST be set.
 - **WS-03** Issue branches on GitHub MUST be named `agentbot/issue-<n>-<slug>`, where the slug is at most 40 characters. They are the PR head and the only branches the system pushes. Each run works on its own temporary branch `agentbot/run-<runId>` in a private checkout on its worker, which never leaves the worker except as a bundle (architecture RUN-17 to RUN-20).
-- **WS-04** Plan, chat, draft and ask runs MUST check out read-only from the base branch. Anything they commit is discarded when the run ends.
+- **WS-04** Plan, chat and draft runs MUST check out read-only from the base branch. Anything they commit is discarded when the run ends. `/ask` runs have no checkout.
 - **WS-05** When a repository's `.agentbot.yml` sets `setupCommand` (GH-26), it MUST run with `sh -c` in the worker's checkout at the start of every run that checks out that repository. A non-zero exit MUST fail the run and report the tail of the output.
 - **WS-06** The system MUST NOT delete remote branches. Branch deletion is left to GitHub's "Automatically delete head branches" setting.
-- **WS-07** The mirror's temporary refs (`refs/agentbot/runs/*`, `refs/agentbot/checkpoints/*`) MUST exist only while their run is unfinished or requeued (architecture RUN-20). The system MUST NOT keep local issue branches or worktrees. Other refs MUST NOT be touched. Pruning MUST run at start for every repo and MUST log failures without throwing.
+- **WS-07** The mirror's temporary refs (`refs/agentbot/runs/*`, `refs/agentbot/checkpoints/*`) MUST exist only while their run is unfinished, requeued after a lost worker, or failed with Retry still possible (architecture RUN-20). The system MUST NOT keep local issue branches or worktrees. Other refs MUST NOT be touched. Pruning MUST run at start for every existing mirror and MUST log failures without throwing.
 - **WS-08** Terminal cleanup MUST:
   - delete the issue's temporary refs and checkpoints;
   - delete the issue's session files, for `done` and `cancelled` only;
@@ -295,7 +297,8 @@ Any non-terminal state also accepts `cancelled`.
   - plan, chat and draft are read-only;
   - implement commits, references the issue, and MUST NOT push or change remotes or credentials;
   - fix_ci fixes the root cause and MUST NOT disable checks;
-  - an exit code of 137 or "Killed" means out of memory, and the agent MUST NOT re-run the command and MUST report it.
+  - an exit code of 137 or "Killed" means out of memory, and the agent MUST NOT re-run the command and MUST report it;
+  - the checkout is shallow: only the start commit and the run's own commits are visible, so the agent MUST NOT try to fetch history or compare with older commits.
 
   Repo guidance (`AGENTS.md` and similar files) is loaded by omp from the checkout.
 - **AGT-14** Wall-clock time MUST be checked every 15 s and MUST exclude time spent waiting for a human answer. Cost MUST be checked at the end of every turn. The limits are:
@@ -382,7 +385,7 @@ Any non-terminal state also accepts `cancelled`.
 |---|---|
 | `/work start repo issue` | If the issue is tracked, reply with its thread and state. If it is closed, ask to reopen it. Otherwise add the trigger label, start tracking it at once (without waiting for a poll), open its thread (DSC-34) and reply with the link. |
 | `/work issue repo request` (≤ 4000 characters) | Draft the issue with the read-only `draft` profile on a worker (10 min), with live progress in the command's reply. File the issue with the trigger label and the quoted request appended. Start tracking it at once, then show ✅ with the issue number, link and planning thread. |
-| `/work plan repo prompt` (≤ 4000 characters) | Start a thread in the channel where the command ran and run planning on the request (§7.6). |
+| `/work plan repo prompt` (≤ 4000 characters) | Post a starter message `📋 **Plan** — <request>` in the channel where the command ran, start a thread from it, and run planning on the request (§7.6). |
 | `/work ask repo prompt` | Post a starter message in the channel where the command ran and start a one-day thread for a repo chat (§8.1). |
 | `/work watch repo` | Watch a repository: create its permanent channel and start looking for labelled issues there (DSC-35). |
 | `/work unwatch [repo]` | Stop watching (DSC-36). In a watch channel the repository defaults to that channel's. |
@@ -390,10 +393,14 @@ Any non-terminal state also accepts `cancelled`.
 | `/work cancel` | In an issue thread, cancel the issue. In a plan thread, stop or reject the plan. Anywhere else, reply "Use inside an issue or plan thread". |
 | `/ask prompt [file file2 file3]` | Ask-only chat (§8.2). |
 
-- **DSC-09** The `repo` option of every `/work` subcommand MUST autocomplete from the available repositories (GH-25), filtered by what the user has typed, with watched repositories first. Discord shows at most 25 suggestions. The submitted value MUST be checked against the available repositories, and anything else refused.
-- **DSC-33** `discord.workChannelId` is the **work channel**: the general place to assign work to any available repository. `/work start`, `issue`, `plan`, `ask`, `watch` and `unwatch` MUST be accepted only in the work channel or in a watch channel; elsewhere they are refused with the reason `not-a-work-channel` (DSC-04). In the work channel the `repo` option is required. In a watch channel it defaults to that channel's repository. omp update notices (UPD-02) are posted in the work channel.
-- **DSC-34** An issue's thread MUST be opened in its repository's watch channel when the repository is watched, otherwise in the work channel. This holds whether the issue came from a label or a command. `/work ask` and `/work plan` threads open in the channel where the command ran.
-- **DSC-35** `/work watch repo`, or **Watch** on the Repositories page (WEB-32), MUST:
+- **DSC-09** The `repo` option of every `/work` subcommand MUST autocomplete from the available repositories that are not archived (GH-25), filtered by what the user has typed, with watched repositories first. Discord shows at most 25 suggestions. The submitted value MUST be checked against the available repositories, and anything else refused.
+- **DSC-33** `discord.workChannelId` is the **work channel**: the general place to assign work to any available repository. `/work start`, `issue`, `plan`, `ask`, `watch` and `unwatch` MUST be accepted only in the work channel or in a watch channel; elsewhere they are refused with the reason `not-a-work-channel` (DSC-04).
+  - In the work channel, the `repo` option is required.
+  - In a watch channel, including one whose repository is no longer watched, it defaults to that channel's repository.
+  - Any allowed member (DSC-02) may watch and unwatch.
+  - omp update notices (UPD-02) are posted in the work channel.
+- **DSC-34** An issue's thread MUST be opened in its repository's watch channel when the repository has one, watched or not; otherwise in the work channel. This holds whether the issue came from a label or a command. `/work ask` and `/work plan` threads open in the channel where the command ran. An issue filed by `/work plan` Execute keeps its plan thread (DSC-26).
+- **DSC-35** A repository's **watch channel** is the channel created the first time it is watched. It stays that repository's watch channel after unwatching, until it is deleted in Discord. `/work watch repo`, or **Watch** on the Repositories page (WEB-32), MUST:
   1. create a text channel named after the repository (`owner-repo`, lowercased, other characters replaced by `-`, at most 100 characters), in `discord.watchCategoryId` when set;
   2. set its topic to "Watching owner/repo: issues labelled `<trigger>` start here.";
   3. record the watch;
@@ -404,7 +411,7 @@ Any non-terminal state also accepts `cancelled`.
 - **DSC-37** Watches MUST be keyed by the GitHub repository id:
   - **Rename or transfer.** The stored name is updated, and the channel is renamed to match (best effort).
   - **Lost access.** When the App can no longer access the repository, its watch is suspended, with a message in its channel and a warning on the status page. It resumes when access returns.
-- **DSC-38** Creating watch channels needs the Manage Channels permission (guild-wide, or on the watch category). Without it, `/work watch` MUST fail with that reason and the bot's invite link. The bot's invite link MUST include Manage Channels.
+- **DSC-38** Creating watch channels needs the Manage Channels permission (guild-wide, or on the watch category). Without it, `/work watch` and the Watch button MUST fail with that reason and the bot's invite link. The bot's invite link MUST include Manage Channels.
 
 ### 7.3 Live progress
 
@@ -438,7 +445,7 @@ Any non-terminal state also accepts `cancelled`.
 
 ### 7.5 Results, retry and idle threads
 
-- **DSC-21** A failed job MUST post `❌ <kind> failed: <error>` with a **Retry** button. Retry MUST work only when the job's status is `failed`, the issue has no queued or running job, and the issue is in the expected state: `failed` for plan and implement, `in_review` for revise and fix_ci. Retry requeues the job with `resume: true`. For plan and implement it also moves the issue per ISS-03. Any other click MUST get "This job can no longer be retried."
+- **DSC-21** A failed job MUST post `❌ <kind> failed: <error>` with a **Retry** button. Retry MUST work only when the job's status is `failed`, the issue has no queued or running job, and the issue is in the expected state: `failed` for plan and implement, `in_review` for revise and fix_ci. Retry requeues the job with `resume: true`. The resumed run continues the session from the failed run's kept work (JOB-19): its start commit, its commits and its last checkpoint (architecture RUN-17). For plan and implement it also moves the issue per ISS-03. Any other click MUST get "This job can no longer be retried."
 - **DSC-22** Review and fix results MUST post what changed: "Review feedback addressed", "handled — no code changes needed", or "CI fix pushed (attempt n/max)".
 - **DSC-23** A message in an idle issue thread MUST get a reply that says what the issue is waiting on: a queued job, a plan decision, a PR review, or a Retry.
 - **DSC-24** Steering messages MUST be acknowledged with 👀 once the agent has received them, and with ⏳ while they are queued for a run that cannot take them yet (architecture RUN-15).
@@ -459,7 +466,7 @@ Any non-terminal state also accepts `cancelled`.
   | Button | Effect |
   |---|---|
   | **Approve** | Files a GitHub issue without the trigger label, containing the request, summary and plan. Nothing starts. The reply points to `/work start`. |
-  | **Execute** | Files the issue with the trigger label and the plan-thread marker, and binds it to this thread with the plan as a succeeded plan job. Posts the plan comment, moves the issue to `implementing`, and enqueues `implement`. |
+  | **Execute** | Files the issue with the trigger label and the plan-thread marker, and binds it to this thread. The issue is **created** in `implementing` with the plan as a succeeded plan job, so no state transition fires; the first label applied is the implementing state label. Posts the plan comment, rewrites the thread's starter message to the `📥 **#n title** — <url>` form, and enqueues `implement`. |
   | **Refine** | Asks "What should change?" and re-plans, resuming the session. |
   | **Reject** | Deletes the plan session and archives the thread. |
 
@@ -470,13 +477,13 @@ Any non-terminal state also accepts `cancelled`.
   - **approved:** point to `/work start`.
   - **rejected:** point to `/work plan`.
   - **failed:** re-plan with the reply as feedback.
-  - **executing:** ignore the reply.
+  - **executing:** the thread is now the issue's thread, so replies follow the issue rules (AGT-15, DSC-18, DSC-23).
 - **DSC-28** A plan whose planning run is lost (architecture RUN-04) MUST become `failed`, and the thread MUST be told if it is reachable. A planning run that re-attaches after an orchestrator restart MUST continue normally. At start, plans `approved` or `executing` without an issue number MUST return to awaiting a decision.
 
 ### 7.7 Agent name
 
 - **DSC-29** The admin MUST be able to set `agent.name` (1–32 characters, Discord's nickname limit; default `AgentBot`). At engine start and after every settings save, the bot MUST set its server nickname in the configured guild to `agent.name`. The bot needs the Change Nickname permission for this. Without it, the system MUST log a warning and carry on with the current name; the warning MUST also appear on the status page. The bot's global username and avatar are set in the Discord Developer Portal and are not managed by the system.
-- **DSC-30** All text that names the system MUST use `agent.name`. This covers Discord messages; GitHub comments, PR bodies and issue bodies (for example the `## <name> plan (rev N)` heading and "<name> addressed feedback"); commit messages (`<name>: remaining changes for #N`); and agent prompts. A rename MUST take effect for text written after the save. Text already posted is not edited.
+- **DSC-30** All text that names the system MUST use `agent.name`. This covers Discord messages; GitHub comments, PR bodies and issue bodies (for example the `## <name> plan (rev N)` heading and "<name> addressed feedback"); commit messages (`<name>: remaining changes for #N`, `<name>: follow-up changes for #N`); and agent prompts. A rename MUST take effect for text written after the save. Text already posted is not edited.
 - **DSC-31** These identifiers MUST NOT change when the agent is renamed, so that work in progress is still recognised after a rename:
   - hidden markers in GitHub text (`<!-- agentbot:plan -->`, `<!-- agentbot:plan-thread -->`);
   - the issue branch prefix (WS-03);
@@ -595,7 +602,7 @@ Any non-terminal state also accepts `cancelled`.
 - **WEB-27** The orchestrator is the source of truth for the workspace:
   - **Remote changes.** Changes made elsewhere (the web pages, or another editor) MUST reach the workspace within 5 s. A remote change overwrites a local file only if the local file still equals its last-synced content.
   - **Conflicts.** If the local file was changed, or a save was based on an older revision, web MUST write the orchestrator's version next to it as `<file>.remote` and report a conflict. Nothing is applied until the admin saves a merged file or accepts the server version.
-  - **Orchestrator unreachable.** Saves MUST be queued and sent once it is back.
+  - **Orchestrator unreachable.** Saves MUST be queued on the web home volume, so that a web restart does not lose them, and sent once the orchestrator is back.
 - **WEB-28** The bundled AgentBot extension MUST show:
   - the sync status in the status bar: synced, saving, rejected, conflict, or orchestrator unavailable;
   - validation errors in the Problems panel, at the file and, when known, the line;
@@ -603,10 +610,10 @@ Any non-terminal state also accepts `cancelled`.
 
   It MUST offer the commands "AgentBot: Reload from server" and "AgentBot: Accept server version".
 - **WEB-29** Every change applied from the workspace MUST be logged in the orchestrator, like a page save, with the file and the admin username.
-- **WEB-30** The web pod MUST hold only the masked workspace, code-server data and its internal API token: no repo checkouts, model sign-ins, omp or secrets. code-server runs as the engine user. WEB-31 closes the obvious ways to a shell, but VS Code can still start programs, for example through user-level task settings. VS Code access therefore remains as powerful as the admin login, which it already requires.
+- **WEB-30** The web pod MUST hold only the masked workspace, code-server data and its internal API token: no repo checkouts, model sign-ins, omp or secrets. code-server runs as the `agentbot` user. WEB-31 closes the obvious ways to a shell, but VS Code can still start programs, for example through user-level task settings. VS Code access therefore remains as powerful as the admin login, which it already requires.
 - **WEB-31** code-server's integrated terminal MUST be disabled, in layers:
   1. The bundled extension MUST remove the terminal's commands, keybindings and panel entry, and close any terminal the moment it opens, logging it.
-  2. code-server MUST run with `SHELL=/usr/sbin/nologin`, and the engine user's login shell MUST be `/usr/sbin/nologin`, so a terminal that opens anyway starts no shell.
+  2. code-server MUST run with `SHELL=/usr/sbin/nologin`, and the `agentbot` user's login shell MUST be `/usr/sbin/nologin`, so a terminal that opens anyway starts no shell.
   3. The web process MUST delete `.vscode/tasks.json` and `.vscode/launch.json` from the workspace as soon as they appear, and report it in the extension. Machine-level settings MUST turn off automatic tasks and workspace trust prompts.
 
 ### 9.6 Repositories
@@ -619,9 +626,9 @@ Any non-terminal state also accepts `cancelled`.
 - **WEB-32** The **Repositories** page (`/admin/repos`) MUST list every available repository (GH-25):
   - The orchestrator builds the list with the App credentials: all installations, then each installation's repositories, following every page. It works whether or not the engine is running.
   - Each entry shows `owner/name`, whether the repo is private, its default branch, and whether it is watched, with a link to its watch channel.
-  - Each entry has a **Watch** or **Unwatch** button that does the same as `/work watch` and `/work unwatch` (DSC-35, DSC-36).
+  - Each entry has a **Watch** or **Unwatch** button that does the same as `/work watch` and `/work unwatch` (DSC-35, DSC-36). The page records the admin username as the watch's creator. The buttons work in every engine phase once the bot token is stored, because channel creation and topic changes go over Discord's REST API. Polling of a new watch starts when the engine is `running`.
   - The list is sorted with watched repositories first, then by `owner/name`, and it MUST be filterable by typing when it has more than 20 entries.
-  - Archived repositories are shown, but cannot be watched ("archived (read-only)").
+  - Archived repositories are shown, but cannot be watched (GH-25).
   - Before the App credentials are stored, the page MUST say "Save the GitHub App id and private key to see repositories".
   - If listing fails, the page MUST show the error with a **Retry** button. Errors include an invalid key (GH-02 wording), a wrong App id, or GitHub being unreachable.
   - If the App has no installations, the page MUST say so and link to the App's installation page (`https://github.com/apps/<slug>/installations/new`).
@@ -640,7 +647,7 @@ Any non-terminal state also accepts `cancelled`.
 - **WEB-23** Before the bot token and guild id are stored, each channel field MUST say "Save the Discord bot token and guild id to choose channels" instead of a dropdown.
   - If listing fails, the fields MUST show the error inline with a **Retry** button, and the rest of the page MUST stay usable. Errors include an invalid token, Discord being unreachable, and the bot not being a member of the guild. For the last one, the message MUST include the bot's invite link. That link grants the WEB-21 channel permissions plus Change Nickname (DSC-29) and Manage Channels (DSC-38).
   - The list MUST be cached for at most 60 s, and a **Refresh** button MUST reload it, so that new channels and permission changes appear without a restart.
-- **WEB-24** On save, the orchestrator MUST check every configured channel against the live guild. A channel that no longer exists, is not a text channel, or that the bot cannot view MUST make the save fail with a message naming the field and the channel. Missing permissions other than View Channel MUST NOT block the save; they are shown as a warning with the result of the save. A configured channel that has disappeared MUST be shown in its field as "unknown channel <id>" so that it can be replaced.
+- **WEB-24** On save, the orchestrator MUST check every configured channel against the live guild. A channel that no longer exists, is not a text channel, or that the bot cannot view MUST make the save fail with a message naming the field and the channel. A work or ask-only channel that is a watch channel MUST also fail the save. Missing permissions other than View Channel MUST NOT block the save; they are shown as a warning with the result of the save. A configured channel that has disappeared MUST be shown in its field as "unknown channel <id>" so that it can be replaced.
 
 ## 10. Observability
 
@@ -721,11 +728,12 @@ Any non-terminal state also accepts `cancelled`.
   Applying and stopping MUST be serialised. Runs on workers MUST NOT be aborted. Their worker connections are held by the internal API, not the engine, and stay open. Events that arrive while the engine is not `running` MUST be queued and applied once it is.
 - **ENG-03** Engine start MUST:
   1. create the state directories;
-  2. ensure the mirrors;
-  3. prune the temporary refs of finished runs (WS-07);
+  2. list the existing mirrors, without cloning or fetching anything (mirrors are created on first use, WS-01);
+  3. prune the temporary refs of finished runs in those mirrors (WS-07);
   4. sweep stale session files;
-  5. recover jobs (JOB-08);
-  6. start the poller, the chat idle sweep and plan bookkeeping, and resume dispatch.
+  5. relabel tracked issues if the label names changed (GH-23);
+  6. recover jobs (JOB-08);
+  7. start the poller, the chat idle sweep and plan bookkeeping, and resume dispatch.
 
   A failure to recover plans MUST be logged and MUST NOT abort the start. A Discord login failure MUST end in `error`.
 - **ENG-04** Graceful shutdown of the orchestrator on SIGTERM MUST stop, in order: update checks, the internal API (sockets close with 1001), the engine (poller, idle sweeps, dispatch, then Discord) and the database. Runs on workers MUST keep going (RUN-09). It MUST finish within about 10 s.
@@ -744,7 +752,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 |---|---|---|
 | `discord.guildId` | required string | none |
 | `discord.allowedUserIds`, `allowedRoleIds` | string lists; at least one non-empty | `[]` |
-| `discord.workChannelId` | required; a text channel chosen from the channel dropdown (§9.7); DSC-33 | none |
+| `discord.workChannelId` | required; a text channel chosen from the channel dropdown (§9.7), not an ask-only channel or a watch channel; DSC-33 | none |
 | `discord.watchCategoryId` | optional; a category for watch channels (DSC-35) | none (channels are created at the top level) |
 | `discord.askChannelIds` | string list chosen from the channel dropdown (§9.7); no duplicates, not the work channel or a watch channel | `[]` |
 | `github.appId` | positive integer, required | none |
@@ -763,7 +771,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 | `limits.ciWaitMinutes` | positive number | 60 |
 | `limits.askTimeoutHours` | positive number | 24 |
 | `limits.chatIdleMinutes` | positive number | 30 |
-| `workers.maxConcurrentRuns` | positive integer. Never rejected on save; health reports a warning when it exceeds worker capacity (RUN-10). | 10 |
+| `workers.maxConcurrentRuns` | optional positive integer. Never rejected on save; health reports a warning when it exceeds worker capacity (RUN-10). | unset (= worker capacity) |
 | `workers.reattachGraceSeconds` | positive integer | 90 |
 | `logs.maxGiB` | ≥ 0.1 | 5 |
 | `secrets.discordToken`, `secrets.githubAppPrivateKey` | required, write-only | none |
@@ -800,16 +808,16 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
   - repo chats;
   - ask chats (with owner);
   - plans (`planning`, `awaiting`, `approved`, `executing`, `rejected`, `failed`);
-  - watches (repository id, `owner/name`, channel id, created by, state `watching`, `unwatched` or `suspended`; DSC-35 to DSC-37) and their poll cursors;
+  - watches (repository id, `owner/name`, channel id, created by (Discord user id or admin username), state `watching`, `unwatched` or `suspended`, `lastError`; DSC-35 to DSC-37) and their poll cursors;
   - seen feedback (repo, PR, item id);
   - agent runs (usage);
-  - runs (state, kind, owner, worker id, lease token and expiry, loss count, omp version used; Discord ids of the thread, status message and to-do message; latest progress snapshot and to-do list; architecture §4.1, RUN-14);
+  - runs (state, kind, owner, worker id, lease token and expiry, loss count, omp version used, start commit, whether a kept result or checkpoint exists; Discord ids of the thread, status message and to-do message; latest progress snapshot and to-do list; architecture §4.1, RUN-14);
   - outgoing relay messages to workers that have not been acknowledged yet (architecture RUN-06);
   - open questions (run, Discord message ids, options; RUN-08);
   - a key-value store (vault, log cap, omp update state, loadouts, label names last applied (GH-23), and the revision of each config workspace file (WEB-26)).
 
   Model sign-ins live in omp's own SQLite store `<state>/omp-agent/agent.db`, next to the main database (CRED-01). The packed omp runtime copies and their failed markers live in `<state>/omp-runtime/` (architecture §8).
-- **DB-03** All persistent state MUST live in the orchestrator's **state** volume (`<state>`, RWO): the database, the model sign-in store, the mirrors and their temporary refs, session files, ask scratch files, skills and agents, omp runtime copies, and the orchestrator and agent logs. The web pod has its own **web home** volume (RWO) for the engine user's `$HOME`, the synced copy of the config workspace (WEB-25) and code-server data. Workers keep nothing: their checkout and run-local storage are deleted with them (architecture §5, RUN-20). No volume is shared between components.
+- **DB-03** All persistent state MUST live in the orchestrator's **state** volume (`<state>`, RWO): the database, the model sign-in store, the mirrors and their temporary refs, session files, ask scratch files, skills and agents, omp runtime copies, and the orchestrator and agent logs. The web pod has its own **web home** volume (RWO) for the `agentbot` user's `$HOME`: the synced copy of the config workspace (WEB-25), queued saves (WEB-27) and code-server data. Workers keep nothing: their checkout and run-local storage are deleted with them (architecture §5, RUN-20). No volume is shared between components.
 
 ## 15. omp version and in-place updates (architecture §8)
 
@@ -841,7 +849,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 
   The version MUST be `<major>.<minor>.<run number>`. On `main`, CI MUST push `ghcr.io/<owner>/agentbot:<version>` and `:latest` and tag `v<version>`. CI MUST also lint the Helm chart and render it with default values.
 - **OPS-05** CD MUST run after a successful CI run on `main`, without cancelling a deploy in progress. It MUST deploy the version to each configured target: `helm upgrade` for Kubernetes, or `podman compose pull` and `up -d` for a Podman host. Within 120 s it MUST then see the matching `version` in both the orchestrator's `/readyz` and web's `/healthz` (architecture §4.5). Rollback is a redeploy of the previous version.
-- **OPS-06** A `dry-run` script MUST run the planning profile against a local repo and issue file, with no GitHub or Discord. It answers questions on the console, prints the output and usage, and cleans up its temporary worktree.
+- **OPS-06** A `dry-run` script MUST run the planning profile against a local repo and issue file, with no GitHub or Discord. It makes a shallow checkout of the start commit like a worker, so the no-history rule (AGT-13) is exercised. It answers questions on the console, prints the output and usage, and cleans up its temporary checkout.
 - **OPS-07** A Helm chart MUST deploy the stack to Kubernetes (architecture §7.3):
   - a singleton orchestrator Deployment (`Recreate`) and a web Deployment;
   - a KEDA `ScaledJob` for workers, from 0 to `worker.maxReplicas` (default 10) pods, one run per pod, each pod deleted shortly after its run;
@@ -859,7 +867,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 
   For Podman hosts, 4 GiB is the minimum and 8 GiB is recommended. Concurrency MUST be tunable down for small hosts (`maxConcurrentJobs`, `maxChatSessions`, `AGENTBOT_WORKER_CAPACITY`).
 - **NFR-02** Each worker MUST have its own memory limit (default 4 GiB) and checkout space limit (default 20 GiB), in both runtimes, so that an out-of-memory kill or a full disk affects only that run and is reported for that run only (AGT-19, architecture STO-06). Detection of OOM kills relies on cgroup v2.
-- **NFR-06** Every run pays for a fresh worker start, a repo clone and `setupCommand` before the agent starts. The time MUST NOT count toward the run's time limit (architecture RUN-03), and the status page MUST show it per run, so that slow repos stand out.
+- **NFR-06** Every run pays for a fresh worker start, a shallow checkout and `setupCommand` before the agent starts. The time MUST NOT count toward the run's time limit (architecture RUN-03), and the status page MUST show it per run, so that slow repos stand out.
 
 ## 18. Reliability summary
 
