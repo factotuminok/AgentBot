@@ -68,7 +68,7 @@ flowchart LR
     P5 --> P8[8 Image + Podman launcher]
     P7 --> P8
     P8 --> P9[9 Kubernetes + Helm]
-    P8 --> P10[10 omp updates + CD]
+    P8 --> P10[10 omp updates + tooling]
     P9 --> P11[11 Hardening + release]
     P10 --> P11
     P7 --> P11
@@ -290,23 +290,21 @@ Done on kind (Kubernetes 1.34, KEDA 2.21.0, podman provider) with `bun test/e2e/
 
 Fixed along the way: a lost implement run's re-queued job now resumes from the uploaded checkpoint and session (`implementRun`). Before, it decided resumption from `issue.impl_session`, which a lost run never writes.
 
-### Phase 10: omp updates, CD and tooling
+### Phase 10: omp updates and tooling
 
 Work:
 - In-place omp updates for workers (UPD-02 to UPD-10): install, pack, canary and fallback, cleanup, and Discord notices, from `src/ompUpdate.ts` and `src/discord/ompUpdate.ts`.
-- CD (OPS-05): a deploy job for each target, which waits for the matching version in health.
+- ~~CD (OPS-05)~~: withdrawn after phase 10 — deployments are not run from this repository.
 - `dry-run` (OPS-06), from `scripts/dry-run.ts`.
 
 **Exit:**
 - Approving an update makes the next worker use the new omp, while running workers keep the old one.
 - A deliberately broken copy falls back and re-offers the update.
-- CD deploys a tagged build to the test cluster and the Podman host.
+- ~~CD deploys a tagged build to the test cluster and the Podman host.~~ Withdrawn with OPS-05.
 
 Done:
 - **Updates.** `test/integration/ompUpdate.test.ts` covers the first two points with the real dispatcher, the internal API, worker processes, fake Discord, a fake npm registry and a real packed archive. `test/e2e/omp-update/real-install.ts` installed npm's latest omp over the pin on the host and inside the image, packed it (~270 MB archive, ~950 MB unpacked), and started an agent host from the copy up to `registered`.
 - **Not yet observed in a deployed stack:** an approved update reaching a real model-backed run. That needs Discord and a model.
-- **CD.** `.github/workflows/cd.yml` passes actionlint. `deploy/k8s/deploy.sh` and `deploy/podman/deploy.sh` deployed, upgraded and rolled back locally (kind, and rootless Podman on the macOS client and in the Fedora CoreOS VM with the systemd unit), checking the version in both health endpoints (`test/e2e/deploy/smoke.sh`).
-- **Not yet run on GitHub:** the `workflow_run` trigger, GHCR pulls and the self-hosted runner.
 - **dry-run.** `bun run dry-run` planned against a temp repo with a real model, answered a question from stdin, and cleaned up (`test/integration/dryrun.test.ts` uses the fixture host).
 
 ### Phase 11: Hardening and release
@@ -318,10 +316,9 @@ Work:
 - Security review against architecture §6: token scopes, lease expiry, the web pod contents, NetworkPolicies.
 - Documentation: README with install for Podman and Kubernetes, configuration, and upgrade.
 
-**Exit:** all requirements verified (§7). A tagged release is published, then deployed by CD to both targets.
+**Exit:** all requirements verified (§7). A tagged release is published. (The original "then deployed by CD to both targets" was withdrawn with OPS-05: deployments are not run from this repository.)
 
-Release status: `v0.1.4` was tagged and its image pushed by CI on `main` (test, image and kind jobs green). CD ran and skipped both targets, which are not configured yet (README "Continuous deployment"). Requirement status is in `wiki/verification.md`. Still open for this exit:
-- CD to both targets;
+Release status: `v0.1.4` was tagged and its image pushed by CI on `main` (test, image and kind jobs green). Requirement status is in `wiki/verification.md`. Still open for this exit:
 - the real Discord, GitHub and model end-to-end run (§5), which needs a test guild, a GitHub App on a test repository, and a model sign-in;
 - the requirements still marked partial there.
 
@@ -349,7 +346,7 @@ DevForge's tests are ported with their modules. Tests that pinned DevForge's wor
 | Strict schema for revise and fix_ci output | requirements §20 item 3 | settled in phase 5: strict |
 | Enforcing read-only planning beyond the prompt | requirements §20 item 4 | settled in phase 5: prompt only, writes discarded (WS-04) |
 | Releasing workers while waiting for an answer | architecture §11 item 1 | after release: the phase 11 load test showed no worker shortage at capacity 10, so it is not a release blocker |
-| Moving DevForge's on-prem host to this stack | architecture §11 item 2 | settled in phase 10: compose under a systemd user unit, deployed by CD on a self-hosted runner (architecture §7.2, §7.4) |
+| Moving DevForge's on-prem host to this stack | architecture §11 item 2 | settled: deployments are not run from this repository; operators deploy with `compose.yaml` or the Helm chart (OPS-05 withdrawn) |
 | Web replicas | architecture §11 item 3 | not needed for release |
 | omp refresh hook | architecture §11 item 4 | settled by spike S1 (`wiki/spikes/S1.md`) |
 | Per-repo dependency cache | architecture §11 item 5 | settled in phase 11: not needed for release (`wiki/load-test.md`); revisit when a repository's average setup time exceeds ~60 s |
@@ -368,10 +365,10 @@ DevForge's tests are ported with their modules. Tests that pinned DevForge's wor
 | WEB-14, WEB-25 to WEB-31 | 7 |
 | OPS-01 to OPS-03, LCH, UPD-01, SEC-16, NFR-01, NFR-02 | 8 |
 | OPS-07 to OPS-09, SEC-15, and the Kubernetes side of RUN-10 to RUN-13 | 9 |
-| UPD-02 to UPD-10, OPS-05, OPS-06 | 10 |
+| UPD-02 to UPD-10, OPS-06 | 10 |
 | NFR-04, NFR-05, everything re-verified | 11 |
 
-Withdrawn requirements (WEB-12, WEB-13, WEB-15 to WEB-19, SEC-07 to SEC-11, CRED-04, STO-05) need no work. Where DevForge implements them, the code is not ported.
+Withdrawn requirements (WEB-12, WEB-13, WEB-15 to WEB-19, SEC-07 to SEC-11, CRED-04, STO-05, OPS-05) need no work. Where DevForge implements them, the code is not ported.
 
 The evidence and status of every requirement ID, with the open gaps ordered by risk, are in [`wiki/verification.md`](verification.md).
 

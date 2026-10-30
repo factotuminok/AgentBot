@@ -542,7 +542,7 @@ No entrypoint runs as root.
 - **Capacity.** `AGENTBOT_WORKER_CAPACITY` (default 4) is set on both the launcher and the orchestrator.
 - **Start order.** `depends_on: orchestrator` with `condition: service_started`. The web UI and launcher retry their connection, so the order is a convenience.
 - **Upgrade.** `podman compose pull && podman compose up -d`. Workers already running keep their image and finish their run; new workers use the new image. Runs continue across an orchestrator restart (RUN-06, RUN-07).
-- **Boot.** A systemd user unit, `deploy/podman/agentbot.service`, runs `podman compose up -d` in the deploy directory at boot and `podman compose stop` at shutdown (not `down`, which would remove the network that running workers are attached to). It needs linger for the stack user. The version is pinned as `AGENTBOT_IMAGE` in the directory's `.env`, so a reboot starts the deployed version without a registry pull.
+- **Boot.** Starting the stack at boot belongs to the host's own setup, not this repository: for example a systemd user unit running `podman compose up -d` (with `podman compose stop`, not `down`, at shutdown, because `down` removes the network running workers are attached to), with linger enabled for the stack user.
 
 ### 7.3 Kubernetes
 
@@ -571,17 +571,6 @@ Default resources (values):
 | worker | 500m CPU, 1.5 Gi, 20 Gi ephemeral storage | 4 Gi |
 
 Requirements: Kubernetes ≥ 1.27 and KEDA ≥ 2.12; KEDA ≥ 2.19 is recommended (spike S5).
-
-### 7.4 Continuous deployment (OPS-05)
-
-`.github/workflows/cd.yml` runs after every successful CI push run on `main` (`workflow_run`), in one concurrency group that never cancels a deploy in progress. It computes the CI run's version with ci.yml's formula and runs one job per configured target; a target whose repository variable is unset is skipped.
-
-| Target | Configured by | Job | Script |
-|---|---|---|---|
-| Kubernetes | variable `AGENTBOT_K8S_NAMESPACE`, secret `KUBECONFIG`; optional variables `AGENTBOT_K8S_RELEASE` and `AGENTBOT_K8S_VALUES` (the release's values YAML) | GitHub-hosted runner | `deploy/k8s/deploy.sh <version> -f <values>`: `helm upgrade --install` with `image.tag=<version>`, then both Deployments rolled out |
-| Podman host | variable `AGENTBOT_PODMAN_DIR` (deploy directory); a self-hosted runner labelled `agentbot-podman`, running as the stack user | self-hosted runner on the host, after `podman login ghcr.io` with the job token | `deploy/podman/deploy.sh <version>`: copies `compose.yaml`, creates missing secrets, `podman compose pull`, pins the version in `.env`, `podman compose up -d`, installs and enables the user unit (§7.2), keeps the previous image |
-
-A self-hosted runner on the Podman host was chosen over SSH from a hosted runner: it needs no inbound access and no SSH key in GitHub, and the host's deploy is the same script an operator runs by hand. Both scripts then wait up to 120 s for the orchestrator's `/readyz` and web's `/healthz` (read inside the containers with `bun`, since the image has no curl) to report `version == <version>`, and fail with diagnostics otherwise. Rollback is a redeploy of the previous version: re-run an earlier CD run, or run the script with that version.
 
 ## 8. omp updates (in place, workers only)
 
@@ -648,7 +637,7 @@ requirements.md has been updated for these:
 | SEC-06, SEC-08 to SEC-11, SEC-13 | SEC-06 is replaced by SEC-16. The SSH server is removed. Sign-ins follow CRED-01 to CRED-05. |
 | UPD-03 to UPD-05 | Replaced by UPD-06 to UPD-10. |
 | DB-01 to DB-03 | Volumes per component (§5); the runs and questions tables; sign-ins, mirrors, sessions and scratch on the state volume. |
-| OPS-01 to OPS-05, OPS-07 to OPS-09 | Four roles, Podman compose stack with launcher, Helm chart without RWX storage, health-based deploy check. |
+| OPS-01 to OPS-04, OPS-07 to OPS-09 | Four roles, Podman compose stack with launcher, Helm chart without RWX storage. |
 | NFR-01 to NFR-04 | Memory and disk per worker; reliability across component restarts. |
 | CRED-02, CRED-03, CRED-05 | The run spec's sign-in snapshot carries no refresh tokens; refresh goes through omp's `refreshOAuthCredential` hook, once per sign-in (spike S1). |
 | RUN-17 to RUN-20, STO-03, WS-01, WS-07, WS-08, ENG-03, JOB-19, JOB-22, AGT-13 | Temp refs live in a separate runs repo; the mirror fetches only heads and tags; forced imports; "no commits" is reported instead of an empty bundle; prompts forbid rewriting the start commit (spike S3). |
@@ -660,7 +649,7 @@ requirements.md has been updated for these:
 ## 11. Open items
 
 1. **Releasing workers while waiting for an answer.** Checkpoint the session and stop the worker while waiting for a human answer, then resume on a new worker. This would free workers during up to 24 h question waits.
-2. **The on-prem host.** Settled in phase 10: the host runs this compose stack under a systemd user unit (§7.2), deployed by CD on a self-hosted runner as the stack user (§7.4). Quadlet units per service were not chosen: they would duplicate `compose.yaml`, which stays the one definition for manual installs and CD.
+2. **The on-prem host.** Settled after phase 10: deployments, the on-prem host included, are not run from this repository. It ships the image (CI), `compose.yaml` and the Helm chart; each installation is deployed and upgraded by its operator (README).
 3. **Web replicas.** More than one web replica needs sessions stored in the orchestrator. Not needed at one admin.
 4. **omp refresh hook.** Resolved by spike S1 (`wiki/spikes/S1.md`): omp's `AuthStorageOptions.refreshOAuthCredential` routes every refresh through the orchestrator. CRED-03 is built as written; the short-lived-token fallback is not needed.
 5. **Start-up cost per run.** Every run clones the repo and runs `setupCommand` from scratch. A per-repo dependency cache (a node-local volume in Kubernetes, a named volume under Podman), reused read-only by workers, would cut this. Measured in phase 11 (`wiki/load-test.md`): setup was 7–9 s p50 and 10–14 s p95 at 10 concurrent runs, and 16 s for a typical web app's ~450 MB install, of which a cache would save about 13 s. **Not needed for release.** Build it when a repository's average setup time on the status page exceeds ~60 s, filled by a trusted component and keyed by lockfile hash, because a cache that runs can write to lets one run poison another.

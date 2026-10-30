@@ -863,7 +863,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
   - run `bun install --frozen-lockfile`, typecheck and tests.
 
   The version MUST be `<major>.<minor>.<run number>`. On `main`, CI MUST push `ghcr.io/<owner>/agentbot:<version>` and `:latest` and tag `v<version>`. CI MUST also lint the Helm chart and render it with default values.
-- **OPS-05** CD MUST run after a successful CI run on `main`, without cancelling a deploy in progress. It MUST deploy the version to each configured target: `helm upgrade` for Kubernetes, or `podman compose pull` and `up -d` for a Podman host. Within 120 s it MUST then see the matching `version` in both the orchestrator's `/readyz` and web's `/healthz` (architecture §4.5). Rollback is a redeploy of the previous version.
+- **OPS-05** Withdrawn: deployments are not run from this repository. CI publishes the image and tag (OPS-04); each installation is deployed and upgraded by its operator with `compose.yaml` or the Helm chart.
 - **OPS-06** A `dry-run` script MUST run the planning profile against a local repo and issue file, with no GitHub or Discord. It makes a shallow checkout of the start commit like a worker, so the no-history rule (AGT-13) is exercised. It answers questions on the console, prints the output and usage, and cleans up its temporary checkout.
 - **OPS-07** A Helm chart MUST deploy the stack to Kubernetes (architecture §7.3):
   - a singleton orchestrator Deployment (`Recreate`) and a web Deployment;

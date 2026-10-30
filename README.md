@@ -99,7 +99,11 @@ kubectl -n agentbot port-forward svc/agentbot-web 8080:8080   # or enable web.in
 - **Workers:** `worker.diskLimit` (checkout space, default 20Gi), `worker.resources` (default 500m CPU / 1.5 Gi requested, 4 Gi limit), `worker.image` (a derived image with your repositories' toolchains).
 - **NetworkPolicies** (on by default): the orchestrator accepts only web, workers and the KEDA operator (`networkPolicy.keda` selects it), web only the ingress controller (`networkPolicy.web.ingressController`, or `networkPolicy.web.allowAll=true`), workers nothing. Web may connect only to DNS and the orchestrator. Workers may connect to DNS, the orchestrator and the internet, but not to link-local addresses (cloud metadata) or `networkPolicy.worker.clusterCIDRs` (default: every private range). Narrow that list to your cluster's pod and Service CIDRs if workers need a private registry or proxy. Set `networkPolicy.dns` if your cluster's DNS is not kube-dns in `kube-system`, and add NodeLocal DNSCache's address there if you use it.
 
+**Upgrade:** `helm upgrade agentbot deploy/helm/agentbot -n agentbot --reuse-values --set image.tag=<version>`. The orchestrator and web restart once each (`Recreate`); runs in progress keep their worker pod and finish.
+
 `values.yaml` documents every value. `test/e2e/k8s/install-smoke.sh` installs the chart on a local kind cluster (`test/e2e/k8s/kind.sh up`, kind on Podman with KEDA) and runs a real worker through it.
+
+Deployments of a particular installation (which version, where, when) are not run from this repository: CI only tests, publishes `ghcr.io/factotuminok/agentbot:<version>` and `:latest`, and tags `v<version>`.
 
 ## Configuration
 
@@ -121,35 +125,6 @@ Read [architecture §6](wiki/architecture.md) before exposing AgentBot to untrus
 - **Workers can't claim other runs from their own address.** Claims are tied to the worker's network address (`AGENTBOT_WORKER_ADDRESS_BINDING`, on by default; leave it on unless a service mesh rewrites source addresses). Moving the agent into a separate container from its supervisor is planned as the first change after this release.
 - **Keep all watched repositories at one trust level** (same owner, no public repositories accepting issues from strangers) until that split ships.
 - **On Podman, workers can reach the web UI's published port through the host.** They can't sign in without the password, but repeated failed logins count against the same address as a browser on the host. Put a TLS reverse proxy in front for remote access and set `AGENTBOT_WEB_TRUSTED_PROXIES`.
-
-## Deploying a version
-
-One script per target deploys a released version (`ghcr.io/<owner>/agentbot:<version>`, built by CI on `main`) and waits up to 120 s until the orchestrator's `/readyz` and web's `/healthz` both report it; otherwise it prints diagnostics (rollout or compose status, logs, events) and exits 1 (OPS-05).
-
-```sh
-# Kubernetes: helm upgrade --install with image.tag=<version>, then both Deployments rolled out and the version in health.
-# Extra arguments go to helm; pass your values file every time (values are not reused from the last release).
-NAMESPACE=agentbot deploy/k8s/deploy.sh 0.1.42 -f my-values.yaml
-
-# Podman host, as the stack user: copies compose.yaml into ~/agentbot (AGENTBOT_DEPLOY_DIR), creates missing secrets,
-# podman compose pull, pins AGENTBOT_IMAGE in ~/agentbot/.env, podman compose up -d, enables the systemd user unit.
-deploy/podman/deploy.sh 0.1.42
-```
-
-- **Kubernetes** env: `NAMESPACE` (default `agentbot`), `RELEASE` (default `agentbot`), `IMAGE` (image repository, default `ghcr.io/factotuminok/agentbot`), `KUBE_CONTEXT`, `HELM`, `TIMEOUT` (default 120). A private image needs `imagePullSecrets` in your values.
-- **Podman host** env: `IMAGE`, `AGENTBOT_DEPLOY_DIR` (default `~/agentbot`), `TIMEOUT`. Put the compose variables (`AGENTBOT_WORKER_CAPACITY` and the others above), and `PODMAN_COMPOSE_PROVIDER` if you choose the provider, into the deploy directory's `.env`, in shell syntax; the script keeps everything there except `AGENTBOT_IMAGE`, and leaves `.env` alone when the pull fails. It installs `deploy/podman/agentbot.service` as a systemd user unit (`podman compose up -d` at boot, `podman compose stop` at shutdown, both with that `.env`), so the stack starts after a reboot with the deployed version; it refuses to run until linger is on (`sudo loginctl enable-linger <user>`). It keeps the current and the previous image and removes older ones. For a private image, `podman login ghcr.io` as the stack user first.
-- **Rollback** is a deploy of the previous version: `deploy/k8s/deploy.sh <previous>` or `deploy/podman/deploy.sh <previous>` (each prints the version it replaced), best from a checkout of tag `v<previous>` so that the chart or `compose.yaml` matches. Running workers keep their image and finish their run in both directions.
-
-### Continuous deployment
-
-`.github/workflows/cd.yml` runs after each successful CI run of a push to `main`, computes that run's version (`<major>.<minor>.<CI run number>`, as CI does) and deploys it to every configured target. A newer run waits for a deploy in progress; it is never cancelled. A target is configured by its repository variable (Settings → Secrets and variables → Actions); without it, its job is skipped.
-
-| Target | Set up |
-|---|---|
-| Kubernetes | Variable `AGENTBOT_K8S_NAMESPACE`; secret `KUBECONFIG` (a kubeconfig whose current context may install the chart into that namespace). Optional variables: `AGENTBOT_K8S_RELEASE` (default `agentbot`) and `AGENTBOT_K8S_VALUES` (the release's Helm values as YAML, passed with `-f` on every deploy). The cluster must reach the API server from a GitHub-hosted runner and pull from GHCR (make the package public or add `imagePullSecrets`). |
-| Podman host | Variable `AGENTBOT_PODMAN_DIR` (the deploy directory, e.g. `/home/agentbot/agentbot`). On the host, as the stack user: enable the Podman socket and linger (see "Running on Podman"), then [add a self-hosted runner](https://docs.github.com/actions/hosting-your-own-runners) for this repository with the extra label `agentbot-podman` and install it as a service running as that user (`sudo ./svc.sh install <user>`). The job logs in to GHCR with its own token, deploys, and logs out. |
-
-To roll back from GitHub, re-run an earlier CD run (GitHub allows re-runs for 30 days): it deploys that run's version from that run's commit. `test/e2e/deploy/smoke.sh` exercises both scripts locally (kind, and rootless Podman with a throwaway registry): deploy, upgrade, roll back, and a failed deploy.
 
 ## Planning dry run
 

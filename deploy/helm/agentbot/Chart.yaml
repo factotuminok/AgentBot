@@ -3,7 +3,7 @@ name: agentbot
 description: AgentBot on Kubernetes (architecture §7.3) — orchestrator, web UI and KEDA-scaled one-run workers.
 type: application
 version: 0.1.0
-# The image tag defaults to this; CD sets image.tag to the released <major>.<minor>.<run> version (OPS-05).
+# The image tag defaults to this; set image.tag to the released <major>.<minor>.<run> version CI published (OPS-04).
 appVersion: "0.1.0"
 # OPS-08: Helm refuses to install on an older cluster. The KEDA ScaledJob CRD is checked in templates/validate.yaml.
 kubeVersion: ">= 1.27.0-0"
