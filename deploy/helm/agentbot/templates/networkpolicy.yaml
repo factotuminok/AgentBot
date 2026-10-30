@@ -1,0 +1,91 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /* SEC-15: ingress for every pod. Egress (security review F5): web reaches DNS and the orchestrator only; workers
+  reach DNS, the orchestrator and the internet, but not link-local (cloud metadata) or the cluster's own ranges. The
+  orchestrator's egress stays open (Discord, GitHub, npm, sign-in endpoints). */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "agentbot.orchestratorService" . }}
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "orchestrator") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "agentbot.selectorLabels" (dict "root" . "component" "orchestrator") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    # orchestrator:8081 only from web, workers and KEDA.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "agentbot.selectorLabels" (dict "root" . "component" "web") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "agentbot.selectorLabels" (dict "root" . "component" "worker") | nindent 14 }}
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.keda.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.keda.podSelector | nindent 12 }}
+      ports:
+        - port: 8081
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "agentbot.webService" . }}
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "web") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "agentbot.selectorLabels" (dict "root" . "component" "web") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # web:8080 only from the ingress controller (or from anywhere with allowAll). Workers are not allowed.
+    - ports:
+        - port: 8080
+          protocol: TCP
+      {{- if not .Values.networkPolicy.web.allowAll }}
+      from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.web.ingressController.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.web.ingressController.podSelector | nindent 12 }}
+      {{- end }}
+  # Web needs nothing but name lookups and the orchestrator; the VS Code extension is bundled, the marketplace off.
+  egress:
+    {{- include "agentbot.dnsEgress" . | nindent 4 }}
+    {{- include "agentbot.orchestratorEgress" . | nindent 4 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "agentbot.fullname" . }}-worker
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "worker") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "agentbot.selectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
+  # Nothing may connect to a worker.
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    {{- include "agentbot.dnsEgress" . | nindent 4 }}
+    {{- include "agentbot.orchestratorEgress" . | nindent 4 }}
+    # Model providers, web search and package registries: anywhere except link-local (169.254.169.254 and
+    # fd00:ec2::254 are the cloud metadata services, which hand out node credentials) and the cluster's ranges.
+    {{- $v4 := list "169.254.0.0/16" }}
+    {{- $v6 := list "fd00:ec2::254/128" }}
+    {{- range .Values.networkPolicy.worker.clusterCIDRs }}
+    {{- if contains ":" . }}{{ $v6 = append $v6 . }}{{ else }}{{ $v4 = append $v4 . }}{{ end }}
+    {{- end }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: {{ toJson $v4 }}
+        - ipBlock:
+            cidr: ::/0
+            except: {{ toJson $v6 }}
+{{- end }}

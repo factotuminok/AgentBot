@@ -5,7 +5,10 @@ import { encodeId } from "../../src/orchestrator/discord/render";
 import { createFakeDispatcher, type FakeDispatcher } from "../../src/orchestrator/dispatch/fake";
 import { type AskChat, createAskChat } from "../../src/orchestrator/engine/chat";
 import type { Scheduler } from "../../src/orchestrator/engine/deps";
+import { createIssueDrafter, type IssueDrafter } from "../../src/orchestrator/engine/draft";
 import { createTrackIssue } from "../../src/orchestrator/engine/issues";
+import { createPlanner, type Planner } from "../../src/orchestrator/engine/plans";
+import { createRepoChat, type RepoChat } from "../../src/orchestrator/engine/repoChat";
 import { createScheduler } from "../../src/orchestrator/engine/scheduler";
 import { createPoller } from "../../src/orchestrator/github/poller";
 import type { Actor } from "../../src/orchestrator/discord/surface";
@@ -19,6 +22,9 @@ interface Bot {
 	bot: BotHandle;
 	scheduler: Scheduler;
 	askChat: AskChat;
+	repoChat: RepoChat;
+	planner: Planner;
+	drafter: IssueDrafter;
 	allowed: Actor;
 	stranger: Actor;
 }
@@ -29,7 +35,7 @@ afterEach(async () => {
 	if (!current) return;
 	current.bot.detach();
 	await current.scheduler.detach();
-	await current.askChat.stop();
+	await Promise.all([current.askChat.stop(), current.repoChat.stop(), current.planner.stop(), current.drafter.stop()]);
 	await current.h.stop();
 	current = undefined;
 });
@@ -40,13 +46,19 @@ async function setup(opts: { config?: Record<string, unknown>; dispatcher?: Fake
 	const trackIssue = createTrackIssue(h.deps, scheduler);
 	const poller = createPoller(h.deps, scheduler, trackIssue);
 	const askChat = createAskChat(h.deps, { scratchRoot: join(h.stateDir, "scratch") });
-	const bot = attachBot({ deps: h.deps, connection: h.discord, scheduler, trackIssue, poller, askChat });
+	const repoChat = createRepoChat(h.deps);
+	const planner = createPlanner(h.deps, { scheduler });
+	const drafter = createIssueDrafter(h.deps, { trackIssue });
+	const bot = attachBot({ deps: h.deps, connection: h.discord, scheduler, trackIssue, poller, askChat, repoChat, planner, drafter });
 	await h.discord.login("token");
 	current = {
 		h,
 		bot,
 		scheduler,
 		askChat,
+		repoChat,
+		planner,
+		drafter,
 		allowed: h.discord.actor(ALLOWED_USER, { username: "alice" }),
 		stranger: h.discord.actor("u-stranger", { username: "mallory" }),
 	};
@@ -147,16 +159,11 @@ describe("access (DSC-02 to DSC-04, DSC-33)", () => {
 		expect(e.responses).toEqual([{ type: "reply", msg: { content: "Not authorized.", ephemeral: true }, ephemeral: true }]);
 	});
 
-	test("/ask outside an ask channel is refused; /work issue, plan and ask need workers", async () => {
+	test("/ask outside an ask channel is refused", async () => {
 		const b = await setup();
-		b.h.gh.addRepo("acme/app");
 		const ask = await b.h.discord.emitCommand({ command: "ask", options: { prompt: "hi" }, actor: b.allowed, channelId: b.h.workChannelId });
 		expect(ask.responses[0]).toMatchObject({ type: "reply", ephemeral: true });
-		for (const sub of ["issue", "plan", "ask"]) {
-			const e = await work(b, sub, { repo: "acme/app", request: "x", prompt: "x" });
-			expect(answerText(e)).toContain("needs agent workers");
-		}
-		expect(b.h.db.openIssues()).toEqual([]);
+		expect(b.h.db.raw.query("SELECT * FROM chats").all()).toEqual([]);
 	});
 });
 
@@ -380,6 +387,27 @@ describe("thread messages (DSC-18, DSC-23, DSC-24)", () => {
 		const reply = b.h.discord.messages(issue.thread_id!).find(m => m.replyTo === e.ref!.messageId);
 		expect(reply?.content).toContain("waiting for your decision");
 	});
+
+	test("bot authors, direct messages and messages outside threads are ignored by the bot itself (DSC-08)", async () => {
+		const b = await setup();
+		const { issue } = await issueAwaitingApproval(b);
+		const thread = issue.thread_id!;
+		const before = b.h.discord.messages(thread).length;
+		// An allowed member's id, so only the bot-author rule can drop it.
+		const otherBot = b.h.discord.actor(b.allowed.userId, { username: "otherbot", isBot: true });
+		// Delivered past the fake's adapter filter, so only the bot's own checks can drop them.
+		const fromBot = await b.h.discord.emitMessage({ channelId: thread, content: "status?", actor: otherBot, unfiltered: true });
+		const direct = await b.h.discord.emitMessage({ channelId: thread, content: "status?", actor: b.allowed, unfiltered: true, guildId: null });
+		const outside = await b.h.discord.emitMessage({ channelId: b.h.workChannelId, content: "status?", actor: b.allowed });
+		await b.h.discord.settled();
+		const refs = [fromBot, direct, outside].map(e => e.ref!.messageId);
+		for (const channel of [thread, b.h.workChannelId]) {
+			expect(b.h.discord.messages(channel).filter(m => m.authorId === b.h.discord.botUserId && m.replyTo && refs.includes(m.replyTo))).toEqual([]);
+		}
+		for (const id of refs) expect(b.h.discord.message(id)?.reactions).toEqual([]);
+		// Only the three user messages were added to the thread and channel; the bot posted nothing.
+		expect(b.h.discord.messages(thread)).toHaveLength(before + 2);
+	});
 });
 
 describe("/work status and cancel", () => {
@@ -392,11 +420,65 @@ describe("/work status and cancel", () => {
 		expect(text).toContain(`<#${issue.thread_id}>`);
 	});
 
-	test("cancel works in an issue thread only", async () => {
+	test("cancel outside an issue, plan or chat thread is refused; in an issue thread it cancels the issue", async () => {
 		const b = await setup();
-		expect(answerText(await work(b, "cancel"))).toBe("Use inside an issue or plan thread");
+		expect(answerText(await work(b, "cancel"))).toBe("Use inside an issue, plan or chat thread");
 		const { issue } = await issueAwaitingApproval(b);
 		await work(b, "cancel", {}, { channelId: issue.thread_id! });
 		expect(b.h.db.getIssue(issue.id)?.state).toBe("cancelled");
+	});
+
+	test("cancel in a /work ask thread stops the live run and lists it in status until then (requirements §20 item 2)", async () => {
+		const b = await setup();
+		b.h.gh.addRepo("acme/app");
+		b.h.dispatcher.once({ kind: "chat" }, { hold: true });
+		const started = await work(b, "ask", { repo: "acme/app", prompt: "How does it build?" });
+		const threadId = b.h.discord.channels().find(c => c.kind === "thread")?.id;
+		expect(answerText(started)).toContain(`<#${threadId}>`);
+		await until(() => b.h.dispatcher.run({ kind: "chat", threadId: threadId! })?.registered === true, "the chat run");
+		expect(answerText(await work(b, "status"))).toContain(`chat <#${threadId}>`);
+		await work(b, "cancel", {}, { channelId: threadId! });
+		await until(() => b.h.dispatcher.runs[0]!.state === "finished", "the run to stop");
+		expect(b.h.dispatcher.runs[0]!.aborted).toBe("user");
+		await until(() => b.h.discord.messages(threadId!).some(m => m.content.includes("Stopped.")), "Stopped.");
+		expect(answerText(await work(b, "cancel", {}, { channelId: threadId! }))).toBe("Nothing is running in this chat.");
+	});
+});
+
+describe("Retry and hand-off (DSC-21, AGT-10)", () => {
+	test("Retry requeues a failed implement with resume, once; later clicks are refused", async () => {
+		const b = await setup();
+		const { issue, plan } = await issueAwaitingApproval(b);
+		b.h.dispatcher.once({ kind: "implement" }, { commits: 0 });
+		await b.h.discord.emitComponent({ message: { channelId: plan.channelId, messageId: plan.id }, customId: planId(issue, "approve"), actor: b.allowed });
+		await until(() => b.h.db.getIssue(issue.id)?.state === "failed", "the implement job to fail");
+		await until(() => !!b.h.discord.messages(issue.thread_id!).find(m => m.content.startsWith("❌ implement failed")), "the failure message");
+		const failure = b.h.discord.messages(issue.thread_id!).find(m => m.content.startsWith("❌ implement failed"))!;
+		expect(failure.content).toContain("Agent produced no commits");
+		const button = failure.components[0]?.components[0];
+		const retryId = button && "custom_id" in button ? button.custom_id : "";
+		// The retried run fails again too, so the issue settles in `failed` once more.
+		b.h.dispatcher.once({ kind: "implement" }, { commits: 0 });
+		await b.h.discord.emitComponent({ message: { channelId: failure.channelId, messageId: failure.id }, customId: retryId, actor: b.allowed });
+		await until(() => b.h.dispatcher.calls.filter(c => c.req.kind === "implement").length === 2, "the retried run");
+		expect(b.h.dispatcher.calls.at(-1)!.req.resume).toBe(true);
+		await until(() => b.h.db.getIssue(issue.id)?.state === "failed" && !b.scheduler.isBusy(issue.id), "the retried job to fail");
+		await b.h.discord.settled();
+		expect(b.h.discord.message(failure.id)?.content).toContain("🔁 Retried by @alice");
+		const again = await b.h.discord.emitComponent({ message: { channelId: failure.channelId, messageId: failure.id }, customId: retryId, actor: b.allowed });
+		expect(answerText(again)).toBe("This job can no longer be retried.");
+	});
+
+	test("the hand-off button under an issue a chat filed starts the pipeline on it", async () => {
+		const b = await setup();
+		b.h.gh.addRepo("acme/app");
+		const gh = b.h.gh.addIssue("acme/app", { title: "Filed from a chat" });
+		const note = await b.h.discord.send(b.h.workChannelId, { content: `Created https://github.com/acme/app/issues/${gh.number}` });
+		await b.h.discord.emitComponent({ message: note, customId: encodeId({ type: "issue", repo: "acme/app", number: gh.number, action: "handoff" }), actor: b.allowed });
+		const issue = b.h.db.findIssue("acme/app", gh.number);
+		expect(issue?.thread_id).toBeTruthy();
+		expect(b.h.gh.getIssue("acme/app", gh.number).labels).toContain("agentbot");
+		await b.h.discord.settled();
+		expect(b.h.discord.message(note.messageId)?.content).toContain(`📥 Handed to AgentBot by @alice: Started <#${issue!.thread_id}>`);
 	});
 });

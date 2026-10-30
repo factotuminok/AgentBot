@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createFakeDispatcher } from "../../src/orchestrator/dispatch/fake";
 import type { EngineDeps } from "../../src/orchestrator/engine/deps";
 import { terminalCleanup } from "../../src/orchestrator/engine/jobs";
 import type { IssueState } from "../../src/orchestrator/engine/state";
@@ -86,13 +87,13 @@ describe("removeSessions", () => {
 	});
 });
 
-/** Deps for `terminalCleanup`: the DB, the sessions dir and a fake Discord thread. */
+/** Deps for `terminalCleanup`: the DB, the sessions dir, a fake Discord thread and a dispatcher keeping no refs. */
 async function cleanupDeps(db: Db) {
 	const discord = createFakeDiscord();
 	const channel = discord.addChannel({ name: "work" });
 	const top = await discord.send(channel.id, { content: "📥 top" });
 	const threadId = await discord.startThread(top, { name: "#1", autoArchiveMinutes: 10080 });
-	const deps = { db, sessionDir, discord } as unknown as EngineDeps;
+	const deps = { db, sessionDir, discord, dispatcher: createFakeDispatcher() } as unknown as EngineDeps;
 	return { deps, discord, threadId };
 }
 
@@ -178,5 +179,29 @@ describe("sweepSessions", () => {
 		expect(db.getIssue(inReview.id)?.impl_session).toBe(review);
 		expect(db.getIssue(failedIssue.id)?.impl_session).toBe(failed);
 		expect(db.getPlan("p2")?.session_file).toBe(awaiting);
+	});
+
+	test("deletes sessions of ended /work issue drafts and keeps those of live drafts (ENG-05)", async () => {
+		const db = openDb(":memory:");
+		const draft = (id: string, state: "drafting" | "done" | "failed") => {
+			const session = makeSession(`draft-${id}`);
+			db.insertDraft({ id, repo: "o/r", request: "r", author: "alice", authorId: "u1", channelId: "c1" });
+			db.updateDraft(id, { state, session_file: session });
+			return session;
+		};
+		const done = draft("d1", "done");
+		const failed = draft("d2", "failed");
+		const live = draft("d3", "drafting");
+
+		await sweepSessions({ db, sessionDir });
+
+		for (const key of [done, failed]) {
+			expect(existsSync(fileOf(key))).toBe(false);
+			expect(existsSync(join(sessionDir, key))).toBe(false);
+		}
+		expect(db.getDraft("d1")?.session_file).toBeNull();
+		expect(db.getDraft("d2")?.session_file).toBeNull();
+		expect(existsSync(fileOf(live))).toBe(true);
+		expect(db.getDraft("d3")?.session_file).toBe(live);
 	});
 });

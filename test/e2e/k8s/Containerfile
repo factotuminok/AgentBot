@@ -1,0 +1,10 @@
+# Kubernetes scenario image (test/e2e/k8s/scenarios.sh), built from the repository root on top of the release image:
+#   podman build -f test/e2e/k8s/Containerfile -t localhost/agentbot-k8s-e2e:dev .
+# Adds the test fakes and fixtures and an entry point that runs the scenario orchestrator for `orchestrator` and a worker
+# with the fixture agent host for `worker` (test/e2e/k8s/entrypoint.sh), so the chart runs it with only
+# image.repository/tag changed. Every other role, and `agentbot health`, is the release image's.
+ARG BASE_IMAGE=localhost/agentbot:dev
+FROM ${BASE_IMAGE}
+COPY test/ /app/test/
+COPY --chmod=0755 test/e2e/k8s/entrypoint.sh /usr/local/bin/agentbot-k8s-e2e
+ENTRYPOINT ["agentbot-k8s-e2e"]

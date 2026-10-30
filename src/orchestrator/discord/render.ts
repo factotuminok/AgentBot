@@ -175,11 +175,14 @@ export function requestPlanMessage(p: {
 	};
 }
 
-/** Notice that a newer omp is available, with the button that installs it. `failure` explains why an earlier attempt did not work. */
-export function ompUpdateMessage(p: { agentName: string; current: string; latest: string; failure?: string }): OutMessage {
+/**
+ * Notice that a newer omp is available for workers (UPD-02), with the button that installs it. `current` is the omp new
+ * workers use now; `failure` explains why an earlier attempt did not work (UPD-03, UPD-08).
+ */
+export function ompUpdateMessage(p: { current: string; latest: string; failure?: string }): OutMessage {
 	const failure = p.failure ? `\n❌ ${clipText(p.failure, MAX_ERROR)}` : "";
 	return {
-		content: `⬆️ **omp ${p.latest}** is available (running ${p.current}). Approving installs it and restarts ${p.agentName}; running jobs resume after the restart.${failure}\nhttps://www.npmjs.com/package/@oh-my-pi/pi-coding-agent/v/${p.latest}`,
+		content: `⬆️ **omp ${p.latest}** is available (workers use ${p.current}). Approving installs it for new workers; workers already running keep their omp, and nothing restarts.${failure}\nhttps://www.npmjs.com/package/@oh-my-pi/pi-coding-agent/v/${p.latest}`,
 		components: [buttonRow(button({ type: "omp", version: p.latest, action: "approve" }, "Approve update", ButtonStyle.Success))],
 	};
 }
@@ -318,24 +321,22 @@ ${warning}**Testing:** ${clipText(p.testing, 500)}${p.ci ? `\n\n**CI:** ${p.ci}`
 _Next: review the pull request on GitHub. Reviews, inline comments, and comments containing \`${p.mentionKeyword}\` make ${p.agentName} revise it here; merging it completes this thread._`;
 }
 
-/** Posted after a review-feedback or CI-fix run (DSC-22). */
-export function followUpMessage(p: {
-	agentName: string;
-	kind: "revise" | "fix_ci";
-	prNumber: number;
-	pushed: boolean;
-	summary: string;
-	checks?: string;
-	oomKills: number;
-}): string {
+/** Posted after a review-feedback or CI-fix run (DSC-22). A fix_ci message carries its attempt out of `maxCiFixAttempts`. */
+export function followUpMessage(
+	p: { agentName: string; prNumber: number; pushed: boolean; summary: string; oomKills: number } & (
+		| { kind: "revise" }
+		| { kind: "fix_ci"; attempt: number; maxAttempts: number; checks?: string }
+	),
+): string {
 	const summary = clipText(p.summary, 1500);
 	const warning = p.oomKills > 0 ? `\n\n${oomWarning(p.oomKills, p.agentName)}` : "";
 	if (p.kind === "revise") {
 		const head = p.pushed ? `✅ **Review feedback addressed** — pushed changes to PR #${p.prNumber}.` : `✅ **Review feedback handled** — no code changes were needed on PR #${p.prNumber}.`;
 		return `${head}${warning}\n\n${summary}\n\n_Waiting for more review or for the PR to be merged._`;
 	}
-	if (p.pushed) return `✅ **CI fix pushed** to PR #${p.prNumber}.${warning}\n\n${summary}\n\n_Waiting for the checks to run again._`;
-	return `⚠️ **Couldn't fix the failing checks** (${p.checks ?? "unknown"}) on PR #${p.prNumber} — this needs a human.${warning}\n\n${summary}`;
+	const attempt = `(attempt ${p.attempt}/${p.maxAttempts})`;
+	if (p.pushed) return `✅ **CI fix pushed** to PR #${p.prNumber} ${attempt}.${warning}\n\n${summary}\n\n_Waiting for the checks to run again._`;
+	return `⚠️ **Couldn't fix the failing checks** (${p.checks ?? "unknown"}) on PR #${p.prNumber} ${attempt} — this needs a human.${warning}\n\n${summary}`;
 }
 
 /** Posted after a CI fix was pushed while the pull request is still waiting for green CI. */

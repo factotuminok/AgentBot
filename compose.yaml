@@ -1,0 +1,141 @@
+# AgentBot on rootless Podman (architecture §7.2, requirements OPS-03): `podman compose up -d`.
+#
+# Before the first start: enable the user's Podman socket (`systemctl --user enable --now podman.socket`) and run
+# `scripts/init-secrets.sh` once. Works with both compose providers `podman compose` can run: docker-compose (talking to
+# the Podman socket) and podman-compose. Docker Engine is not supported: the launcher refuses a rootful socket (LCH-01).
+#
+# Variables (shell environment or a `.env` file next to this file):
+#   AGENTBOT_IMAGE                 image of all three services and of the workers (default ghcr.io/factotuminok/agentbot:latest)
+#   AGENTBOT_WORKER_IMAGE          derived worker image with target-repo toolchains, built FROM the same version (optional)
+#   AGENTBOT_WORKER_CAPACITY       most worker containers at once, also the orchestrator's run cap (default 4)
+#   AGENTBOT_WORKER_MEMORY         memory limit per worker, no swap (default 4g); AGENTBOT_WORKER_DISK checkout limit (default 20g)
+#   AGENTBOT_WORKER_CPUS           CPU quota per worker, in CPUs like `podman run --cpus` (default 2)
+#   AGENTBOT_SECRETS_DIR           directory written by scripts/init-secrets.sh (default ./secrets, next to this file)
+#   AGENTBOT_WORKER_SECRET         Podman secret holding the worker token (default agentbot_worker_token)
+#   AGENTBOT_NETWORK               the stack network's fixed name (default agentbot); workers join their own network,
+#                                  `<AGENTBOT_NETWORK>-workers`, where only the orchestrator is reachable (architecture §6)
+#   AGENTBOT_WEB_HOST_PORT         host port of the web UI on 127.0.0.1 (default 8080)
+#   AGENTBOT_WEB_TRUSTED_PROXIES   addresses/CIDRs of your reverse proxy as web sees it: the login throttle then counts the
+#                                  right-most untrusted X-Forwarded-For entry instead of the proxy (default none)
+#   AGENTBOT_WORKER_ADDRESS_BINDING  one claim per worker address (architecture §6; default on, off only if workers share one)
+#   AGENTBOT_HOST_PODMAN_SOCKET    the user's Podman socket (default $XDG_RUNTIME_DIR/podman/podman.sock); set it where
+#                                  XDG_RUNTIME_DIR is not the Podman host's, e.g. a podman machine (/run/user/<uid>/...)
+#
+# Secrets are files, not `external: true` Podman secrets: docker-compose refuses external secrets outside Swarm
+# ("unsupported external secret"), so only files work with both providers. Each file is mounted only into the services
+# that read it. Its owner and mode 0400 carry into the container because the three services run with
+# `userns_mode: keep-id:uid=10001,gid=10001`, which maps the host user to agentbot (10001); compose's secret uid/gid/mode
+# are ignored outside Swarm. The worker token is also a Podman secret with the same value, because the launcher gives
+# it to workers by name and never holds it (LCH-04).
+
+name: agentbot
+
+x-agentbot: &agentbot
+  image: ${AGENTBOT_IMAGE:-ghcr.io/factotuminok/agentbot:latest}
+  user: "10001:10001"
+  userns_mode: "keep-id:uid=10001,gid=10001"
+  init: true
+  restart: unless-stopped
+  networks: [agentbot]
+
+# Docker/Podman probe timings (requirements OBS-01); each service adds its `test`.
+x-health: &health
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+
+services:
+  orchestrator:
+    <<: *agentbot
+    command: ["orchestrator"]
+    # Web and the launcher reach it on `agentbot`, workers on `workers`.
+    networks: [agentbot, workers]
+    environment:
+      AGENTBOT_MASTER_KEY_FILE: /run/secrets/agentbot_master_key
+      AGENTBOT_WEB_API_TOKEN_FILE: /run/secrets/agentbot_web_api_token
+      AGENTBOT_WORKER_TOKEN_FILE: /run/secrets/agentbot_worker_token
+      AGENTBOT_SCALE_TOKEN_FILE: /run/secrets/agentbot_scale_token
+      AGENTBOT_WORKER_CAPACITY: ${AGENTBOT_WORKER_CAPACITY:-4}
+      # Checkpoint and result bundles larger than a worker's checkout limit are refused (STO-06).
+      AGENTBOT_WORKER_DISK: ${AGENTBOT_WORKER_DISK:-20g}
+      AGENTBOT_WORKER_ADDRESS_BINDING: ${AGENTBOT_WORKER_ADDRESS_BINDING:-on}
+    secrets: [agentbot_master_key, agentbot_web_api_token, agentbot_worker_token, agentbot_scale_token]
+    volumes:
+      - agentbot-state:/state
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8081/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+
+  web:
+    <<: *agentbot
+    command: ["web"]
+    environment:
+      AGENTBOT_WEB_API_TOKEN_FILE: /run/secrets/agentbot_web_api_token
+      AGENTBOT_ORCHESTRATOR_URL: http://orchestrator:8081
+      AGENTBOT_WEB_TRUSTED_PROXIES: ${AGENTBOT_WEB_TRUSTED_PROXIES:-}
+    secrets: [agentbot_web_api_token]
+    volumes:
+      - agentbot-web:/home/agentbot
+    ports:
+      - "127.0.0.1:${AGENTBOT_WEB_HOST_PORT:-8080}:8080"
+    depends_on:
+      orchestrator:
+        condition: service_started
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+
+  launcher:
+    <<: *agentbot
+    command: ["launcher"]
+    # SELinux keeps a confined container away from the user's socket; keep-id makes agentbot its owner (spike S6).
+    security_opt: ["label=disable"]
+    environment:
+      AGENTBOT_ROLE: launcher
+      AGENTBOT_IMAGE: ${AGENTBOT_IMAGE:-ghcr.io/factotuminok/agentbot:latest}
+      AGENTBOT_WORKER_IMAGE: ${AGENTBOT_WORKER_IMAGE:-}
+      AGENTBOT_WORKER_NETWORK: ${AGENTBOT_NETWORK:-agentbot}-workers
+      AGENTBOT_WORKER_SECRET: ${AGENTBOT_WORKER_SECRET:-agentbot_worker_token}
+      AGENTBOT_WORKER_CAPACITY: ${AGENTBOT_WORKER_CAPACITY:-4}
+      AGENTBOT_WORKER_MEMORY: ${AGENTBOT_WORKER_MEMORY:-4g}
+      AGENTBOT_WORKER_CPUS: ${AGENTBOT_WORKER_CPUS:-2}
+      AGENTBOT_WORKER_DISK: ${AGENTBOT_WORKER_DISK:-20g}
+      AGENTBOT_ORCHESTRATOR_URL: http://orchestrator:8081
+      AGENTBOT_PODMAN_SOCKET: /run/podman/podman.sock
+      AGENTBOT_SCALE_TOKEN_FILE: /run/secrets/agentbot_scale_token
+    secrets: [agentbot_scale_token]
+    volumes:
+      - ${AGENTBOT_HOST_PODMAN_SOCKET:-${XDG_RUNTIME_DIR}/podman/podman.sock}:/run/podman/podman.sock
+    depends_on:
+      orchestrator:
+        condition: service_started
+    healthcheck:
+      <<: *health
+      test: ["CMD", "agentbot", "health"]
+
+networks:
+  agentbot:
+    name: ${AGENTBOT_NETWORK:-agentbot}
+  # Worker containers only (the launcher attaches them): the orchestrator is on it too, web and the launcher are not.
+  # Strict isolation blocks traffic to and from every other bridge network, so a worker cannot reach web even by its
+  # address (security review F6, SEC-15). Podman 6 isolates every network so by default; on older Podman only
+  # podman-compose applies `isolate: strict`, because Podman's Docker API (docker-compose) drops the option.
+  workers:
+    name: ${AGENTBOT_NETWORK:-agentbot}-workers
+    driver_opts:
+      isolate: strict
+
+volumes:
+  agentbot-state: {}
+  agentbot-web: {}
+
+secrets:
+  agentbot_master_key:
+    file: ${AGENTBOT_SECRETS_DIR:-./secrets}/agentbot_master_key
+  agentbot_web_api_token:
+    file: ${AGENTBOT_SECRETS_DIR:-./secrets}/agentbot_web_api_token
+  agentbot_worker_token:
+    file: ${AGENTBOT_SECRETS_DIR:-./secrets}/agentbot_worker_token
+  agentbot_scale_token:
+    file: ${AGENTBOT_SECRETS_DIR:-./secrets}/agentbot_scale_token

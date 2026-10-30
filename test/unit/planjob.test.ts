@@ -89,7 +89,7 @@ describe("plan job (JOB-12 to JOB-16)", () => {
 			model: "anthropic/opus",
 			session: `issue-${issue.id}-plan`,
 			resume: false,
-			repo: "o/r",
+			checkout: { repo: "o/r" },
 			threadId: issue.thread_id,
 			limits: { minutes: 30, costUsd: 15 },
 		});
@@ -215,24 +215,29 @@ describe("plan job (JOB-12 to JOB-16)", () => {
 		expect(h.db.getJob(job.id)?.error).toBe("plan job exceeded the $15 cost limit (limits.maxCostUsdPerJob)");
 	});
 
-	test.each(["implement", "revise", "fix_ci"] as const)("%s fails clearly in this build", async kind => {
+	test("an implement job after the plan runs on the published plan and opens the PR", async () => {
 		const { scheduler, trackIssue } = await setup();
-		const { issue, job: plan } = await track(trackIssue);
+		const { issue, job: plan, number } = await track(trackIssue);
 		await until(() => finished(h.db.getJob(plan.id)), "plan");
+		// The fake dispatcher's push does not reach the fake GitHub; the branch is there already.
+		h.gh.getRepo("o/r").branches.set(`agentbot/issue-${number}-add-thing`, "pushed");
 		h.db.setIssueState(issue.id, "implementing");
-		const job = scheduler.enqueue(issue.id, kind);
-		await until(() => finished(h.db.getJob(job.id)), `${kind} job`);
-		expect(h.db.getJob(job.id)?.error).toBe(`${kind} runs need worker checkouts, which this build does not have yet`);
-		expect(h.dispatcher.calls).toHaveLength(1);
+		const job = scheduler.enqueue(issue.id, "implement");
+		await until(() => finished(h.db.getJob(job.id)), "implement job");
+		expect(h.db.getJob(job.id)?.status).toBe("succeeded");
+		expect(h.dispatcher.calls[1]!.req.prompt).toContain("## Approved plan\n## Plan\n1. Make the change.");
+		expect(h.db.getIssue(issue.id)).toMatchObject({ state: "in_review", branch: `agentbot/issue-${number}-add-thing` });
 	});
 
 	test("a failed implement job leaves the issue failed", async () => {
 		const { scheduler, trackIssue } = await setup();
 		const { issue, job: plan } = await track(trackIssue);
 		await until(() => finished(h.db.getJob(plan.id)), "plan");
+		h.dispatcher.once({ kind: "implement" }, { commits: 0 });
 		h.db.setIssueState(issue.id, "implementing");
 		const job = scheduler.enqueue(issue.id, "implement");
 		await until(() => finished(h.db.getJob(job.id)), "implement job");
+		expect(h.db.getJob(job.id)).toMatchObject({ status: "failed", error: "Agent produced no commits" });
 		await until(() => h.db.getIssue(issue.id)?.state === "failed", "failed state");
 	});
 });

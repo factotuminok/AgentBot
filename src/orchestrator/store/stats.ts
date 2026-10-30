@@ -29,7 +29,8 @@ const TOTALS_SQL = `COUNT(*) AS runs, COALESCE(SUM(cost_usd), 0) AS costUsd, COA
 
 /**
  * OBS-06: totals for the window, by kind and by repo (sorted by cost), job outcomes and mean duration per kind, and the
- * cost per UTC day for the last 14 days (oldest first, zero-filled, independent of the window).
+ * cost per UTC day for the last 14 days (oldest first, zero-filled, independent of the window). NFR-06: setup time of
+ * the runs started in the window per repository (`/ask` runs, which have none, as `ask`), slowest average first.
  */
 export function usageReport(db: Db, window: UsageWindow, now = new Date()): UsageReport {
 	const span = USAGE_WINDOWS[window];
@@ -59,6 +60,16 @@ export function usageReport(db: Db, window: UsageWindow, now = new Date()): Usag
 			FROM jobs WHERE finished_at IS NOT NULL AND finished_at >= ? GROUP BY kind ORDER BY kind`,
 		)
 		.all(since);
+	const setup = raw
+		.query<{ repo: string; runs: number; avgMs: number; maxMs: number }, [string]>(
+			`SELECT COALESCE(repo, kind) AS repo, COUNT(*) AS runs,
+				AVG((julianday(started_at) - julianday(claimed_at)) * 86400000) AS avgMs,
+				MAX((julianday(started_at) - julianday(claimed_at)) * 86400000) AS maxMs
+			FROM runs WHERE started_at IS NOT NULL AND claimed_at IS NOT NULL AND started_at >= ?
+			GROUP BY COALESCE(repo, kind) ORDER BY avgMs DESC, repo`,
+		)
+		.all(since)
+		.map(row => ({ ...row, avgMs: Math.round(row.avgMs), maxMs: Math.round(row.maxMs) }));
 
 	const firstDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (DAILY_DAYS - 1)));
 	const perDay = new Map<string, number>();
@@ -74,7 +85,7 @@ export function usageReport(db: Db, window: UsageWindow, now = new Date()): Usag
 		return { day, costUsd: perDay.get(day) ?? 0 };
 	});
 
-	return { window, ...(span === undefined ? {} : { since }), totals, byKind, byRepo, jobs, daily };
+	return { window, ...(span === undefined ? {} : { since }), totals, byKind, byRepo, jobs, daily, setup };
 }
 
 /** Issue counts for every state, and the open issues with their active job. */

@@ -43,7 +43,11 @@ export function createPoller(deps: EngineDeps, scheduler: Scheduler, trackIssue:
 	async function syncWatches(): Promise<void> {
 		const watches = db.listWatches().filter(w => w.state !== "unwatched");
 		if (watches.length === 0) return;
-		const byId = new Map<number, AvailableRepo>((await github.listRepositories()).map(r => [r.id, r]));
+		let listed = await github.listRepositories();
+		// The listing is cached (GH-25): a repository added to the installation and watched since (e.g. from the web
+		// Repositories page, which lists with its own client) is missing from it. Look again before suspending anything.
+		if (watches.some(w => w.state !== "suspended" && !listed.some(r => r.id === w.repo_id))) listed = await github.listRepositories({ refresh: true });
+		const byId = new Map<number, AvailableRepo>(listed.map(r => [r.id, r]));
 		for (const watch of watches) {
 			const repo = byId.get(watch.repo_id);
 			if (!repo) {
@@ -104,9 +108,9 @@ export function createPoller(deps: EngineDeps, scheduler: Scheduler, trackIssue:
 		const pr = issue.pr_number!;
 		const pull = await github.getPull(issue.repo, pr);
 		if (pull.state === "closed") {
-			const ended = await applyEvent(deps, issue, pull.merged ? "pr_merged" : "pr_closed");
-			// The issue is terminal now: this only cancels queued jobs and aborts a live run.
-			await scheduler.cancelIssue(ended.id, pull.merged ? "PR merged" : "PR closed");
+			// GH-14: queued jobs and the live run stop first, so nothing acts on the issue once it is terminal.
+			await scheduler.stopJobs(issue.id);
+			const ended = await applyEvent(deps, db.getIssue(issue.id) ?? issue, pull.merged ? "pr_merged" : "pr_closed");
 			await terminalCleanup(
 				deps,
 				ended,

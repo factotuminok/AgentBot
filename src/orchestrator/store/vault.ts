@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes, scrypt, type ScryptOptions } from "node:crypto";
 import { parseSettings, type Settings } from "../../shared/config";
+import { addLogSecret } from "../../shared/log";
 import type { Db } from "./db";
 
 /**
@@ -18,6 +19,14 @@ const OMP_AAD = "agentbot:omp:v1";
 const KEYFILE_INFO = "agentbot:keyfile:v1";
 const SCRYPT_PARAMS = { N: 2 ** 15, r: 8, p: 1 } as const;
 const MIN_KEY_FILE_CHARS = 32;
+
+/** F9: the settings' secrets are masked in every log line and agent-log entry once the vault has handled them. */
+function maskSecrets(settings: Settings): Settings {
+	addLogSecret(settings.secrets.discordToken);
+	addLogSecret(settings.secrets.githubAppPrivateKey);
+	for (const key of Object.values(settings.secrets.providerKeys)) addLogSecret(key);
+	return settings;
+}
 
 interface Sealed {
 	iv: string;
@@ -201,11 +210,11 @@ export async function openVault(db: Db, masterKey?: Uint8Array): Promise<Vault> 
 
 		readSettings() {
 			const raw = readBlob(record?.settings, SETTINGS_AAD, "settings") as { config: unknown; secrets: unknown } | undefined;
-			return raw && parseSettings(raw);
+			return raw && maskSecrets(parseSettings(raw));
 		},
 
 		writeSettings(settings) {
-			save({ ...record!, settings: sealBlob(settings, SETTINGS_AAD) });
+			save({ ...record!, settings: sealBlob(maskSecrets(settings), SETTINGS_AAD) });
 		},
 
 		readOmpConfig: () => readBlob(record?.omp, OMP_AAD, "omp config"),

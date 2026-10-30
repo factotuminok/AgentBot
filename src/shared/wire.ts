@@ -39,8 +39,51 @@ export interface RunSpec {
 	createIssueRepo?: string;
 	/** Ask runs (CHAT-07): scratch input names to download (`GET …/scratch/inputs/<name>`); outputs go back with PUT. */
 	scratch?: { inputs: string[] };
-	/** Phase 4: checkout (repo, start ref + sha, temp branch, writes code, restore), git identity, setupCommand. */
-	checkout?: never;
+	/** The repository checkout; absent for `/ask` runs (architecture RUN-17). */
+	checkout?: CheckoutSpec;
+	/** The active in-place omp copy (UPD-07), when there is one that is not marked failed; `GET …/omp-runtime`. */
+	ompRuntime?: OmpRuntimeSpec;
+}
+
+/**
+ * A packed omp runtime copy (architecture UPD-06, UPD-07): a gzipped tar of an app tree (`src/`, `package.json`,
+ * `bun.lock`, `node_modules/` with omp pinned to `version`). A worker uses it only when `identity` equals its own; it
+ * checks `sha256`, unpacks it into its checkout root, and spawns the host from `OMP_RUNTIME_HOST_ENTRY` inside it.
+ */
+export interface OmpRuntimeSpec {
+	/** Copy id: `<version>-<time>`, the directory under `<state>/omp-runtime/`. */
+	copy: string;
+	/** The omp version installed in the copy. */
+	version: string;
+	/** App identity (architecture §7.1) of the image the copy was made from. */
+	identity: { version: string; hash: string };
+	/** Hex sha256 and size of the archive. */
+	sha256: string;
+	size: number;
+}
+
+/** The agent host entry inside an unpacked omp runtime copy. */
+export const OMP_RUNTIME_HOST_ENTRY = "src/worker/host/host.ts";
+
+/** The run's repository checkout (architecture §4.2, RUN-17 to RUN-19). */
+export interface CheckoutSpec {
+	/** `owner/name`, fetched from `<orchestrator>/internal/git/<owner>/<name>.git`. */
+	repo: string;
+	/** Where the start commit came from, e.g. `refs/heads/main`; for logs. */
+	startRef: string;
+	startCommit: string;
+	/** The run's temporary branch, `agentbot/run-<runId>` (WS-03). */
+	branch: string;
+	/** implement, revise and fix_ci: checkpoints hold the working tree, and the result is a bundle (RUN-18, RUN-19). */
+	writesCode: boolean;
+	/** The commit message for leftover changes (JOB-19, JOB-22); only when `writesCode`. */
+	leftoverMessage?: string;
+	/** An earlier run's checkpoint (or unpushed result) is kept: download `…/checkpoint` and restore it (RUN-17). */
+	restore: boolean;
+	/** `setupCommand` from the repository's `.agentbot.yml` (GH-26, WS-05). */
+	setupCommand?: string;
+	/** The bot's git identity, for local commits only (GH-04). */
+	identity: { name: string; email: string };
 }
 
 /** What `mcp-test` connects to (AGT-21). */
@@ -62,7 +105,13 @@ export type WorkerControl =
 	| { t: "checkpoint"; runId: string }
 	| { t: "gone"; runId: string; exitCode: number | null; signal: string | null; oomKills: number }
 	| { t: "credential-request"; runId: string; requestId: number; provider: string; credentialId: string; accessToken?: string }
-	| { t: "mcp-test-result"; runId: string; ok: boolean; tools: string[]; error?: string };
+	| { t: "mcp-test-result"; runId: string; ok: boolean; tools: string[]; error?: string }
+	/**
+	 * UPD-08: the host spawned from the run's omp runtime copy exited before it relayed `registered`. The orchestrator
+	 * marks the copy failed; the worker restarts the run with the image's omp and sends `run-info` again. `output` is the
+	 * tail of that host's stderr.
+	 */
+	| { t: "omp-runtime-failed"; runId: string; copy: string; version: string; exitCode: number | null; signal: string | null; output: string };
 
 /** Control: orchestrator → worker. */
 export type OrchestratorControl =
@@ -95,7 +144,27 @@ export const ARTIFACTS = {
 	/** GET `scratch/inputs/<name>`; PUT `scratch/outputs/<name>` (CHAT-07, CHAT-10). */
 	scratchInput: (name: string) => `scratch/inputs/${encodeURIComponent(name)}`,
 	scratchOutput: (name: string) => `scratch/outputs/${encodeURIComponent(name)}`,
+	/**
+	 * GET: a bundle of the continued run's kept checkpoint, or of its unpushed result when no checkpoint is kept, relative
+	 * to this run's start commit (RUN-17). PUT: this run's checkpoint bundle, head `CHECKPOINT_REF` (RUN-18).
+	 */
+	checkpoint: "checkpoint",
+	/** PUT: the result bundle, head `refs/heads/<branch>`; not sent when the branch has no new commits (RUN-19). */
+	result: "result",
+	/** GET: the archive of the omp runtime copy the run spec names (`RunSpec.ompRuntime`, UPD-07). */
+	ompRuntime: "omp-runtime",
 } as const;
+
+/** The git endpoint (architecture §4.5): `/internal/git/<owner>/<name>.git/…`, read-only, lease-token authorised. */
+export const GIT_PATH_PREFIX = "/internal/git/";
+
+/** The temporary branch of a run (WS-03). */
+export function runBranch(runId: string): string {
+	return `agentbot/run-${runId}`;
+}
+
+/** The ref a worker's checkpoint commit is bundled from (RUN-18). */
+export const CHECKPOINT_REF = "refs/agentbot/checkpoint";
 
 export function runArtifactPath(runId: string, artifact: string): string {
 	return `/internal/runs/${encodeURIComponent(runId)}/${artifact}`;

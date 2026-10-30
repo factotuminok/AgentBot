@@ -2,9 +2,11 @@ import { existsSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { emptyOmpConfig, type OmpConfig, parseOmpConfig } from "../../shared/ompconfig";
-import type { CredentialSnapshot, RunSpec } from "../../shared/wire";
+import { type CheckoutSpec, type CredentialSnapshot, type OmpRuntimeSpec, type RunSpec, runBranch } from "../../shared/wire";
+import { isRepoName } from "../git/repos";
+import type { RunRow } from "../store/db";
 import { isSessionKey, sessionPath } from "../store/sessions";
-import type { RunRequest } from "./dispatcher";
+import { type RunRequest, writesCode } from "./dispatcher";
 
 /**
  * Builds the run spec a worker gets with `assign` (architecture §4.2). It is assembled at claim time, so the credentials
@@ -29,13 +31,13 @@ export function sessionDir(stateDir: string): string {
 	return join(stateDir, "sessions");
 }
 
-/**
- * Why `req` cannot run on a worker, or undefined. Every kind but `ask` checks out its repository (architecture §4.2),
- * and checkouts arrive in phase 4.
- */
+/** Why `req` cannot run on a worker, or undefined. Every kind but `ask` checks out its repository (architecture §4.2). */
 export function unrunnableReason(req: RunRequest): string | undefined {
 	if (!isSessionKey(req.session)) return `invalid session key ${JSON.stringify(req.session)}`;
-	if (req.kind !== "ask") return `${req.kind} runs need a repository checkout, which this version of the worker cannot make yet`;
+	if (req.kind === "ask") return req.checkout ? "ask runs have no repository checkout" : undefined;
+	if (!req.checkout) return `${req.kind} runs need a repository checkout`;
+	if (!isRepoName(req.checkout.repo)) return `invalid repository name ${JSON.stringify(req.checkout.repo)}`;
+	if (writesCode(req.kind) && !req.checkout.issueBranch) return `${req.kind} runs need the issue branch`;
 	return undefined;
 }
 
@@ -62,13 +64,34 @@ function runOmpConfig(raw: unknown, req: RunRequest): OmpConfig {
 	return req.profile === "implement" ? config : { ...config, mcpServers: {} };
 }
 
-export async function buildRunSpec(runId: string, req: RunRequest, src: SpecSources): Promise<RunSpec> {
+/** The worker's checkout of a prepared run (RUN-17); `restore` when the run continues one whose refs are kept. */
+function checkoutSpec(row: RunRow, req: RunRequest, restore: boolean): CheckoutSpec | undefined {
+	const checkout = req.checkout;
+	if (!checkout) return undefined;
+	if (!row.repo || !row.start_ref || !row.start_commit) throw new Error(`run ${row.id} has no prepared checkout`);
+	const code = writesCode(req.kind);
+	return {
+		repo: row.repo,
+		startRef: row.start_ref,
+		startCommit: row.start_commit,
+		branch: runBranch(row.id),
+		writesCode: code,
+		...(code && checkout.leftoverMessage ? { leftoverMessage: checkout.leftoverMessage } : {}),
+		restore: code && restore,
+		...(row.setup_command ? { setupCommand: row.setup_command } : {}),
+		identity: checkout.identity,
+	};
+}
+
+/** `ompRuntime`: the active omp runtime copy the run is given (UPD-07), if any. */
+export async function buildRunSpec(row: RunRow, req: RunRequest, src: SpecSources, restore: boolean, ompRuntime?: OmpRuntimeSpec): Promise<RunSpec> {
 	const reason = unrunnableReason(req);
 	if (reason) throw new Error(reason);
 	const omp = runOmpConfig(src.ompConfig(), req);
+	const checkout = checkoutSpec(row, req, restore);
 	const [credentials, skillsHash] = await Promise.all([src.credentials(), src.skillsHash()]);
 	return {
-		runId,
+		runId: row.id,
 		kind: req.kind,
 		profile: req.profile,
 		prompt: req.prompt,
@@ -83,5 +106,7 @@ export async function buildRunSpec(runId: string, req: RunRequest, src: SpecSour
 		credentials,
 		...(req.createIssue ? { createIssueRepo: req.createIssue.repo } : {}),
 		...(req.scratchDir ? { scratch: { inputs: await regularFiles(join(req.scratchDir, "inputs")) } } : {}),
+		...(checkout ? { checkout } : {}),
+		...(ompRuntime ? { ompRuntime } : {}),
 	};
 }

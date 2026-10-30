@@ -89,6 +89,13 @@ export function createScheduler(deps: EngineDeps): Scheduler {
 		}
 	}
 
+	async function stopJobs(issueId: number): Promise<void> {
+		db.cancelQueuedJobs(issueId);
+		const entry = entryFor(issueId);
+		if (entry?.handle) await entry.handle.abort("user").catch(err => log("warn", "abort failed", { issue_id: issueId, error: errorMessage(err) }));
+		else if (entry) entry.cancelPending = true;
+	}
+
 	return {
 		tick,
 		enqueue(issueId, kind, input = {}) {
@@ -98,13 +105,11 @@ export function createScheduler(deps: EngineDeps): Scheduler {
 			return job;
 		},
 		isBusy: issueId => db.activeJob(issueId) !== null,
+		stopJobs,
 		async cancelIssue(issueId, reason) {
 			let issue = db.getIssue(issueId);
 			if (!issue) return;
-			db.cancelQueuedJobs(issueId);
-			const entry = entryFor(issueId);
-			if (entry?.handle) await entry.handle.abort("user").catch(err => log("warn", "abort failed", { issue_id: issueId, error: errorMessage(err) }));
-			else if (entry) entry.cancelPending = true;
+			await stopJobs(issueId);
 			if (issue.state === "done" || issue.state === "cancelled") return;
 			issue = await applyEvent(deps, issue, "cancelled");
 			await terminalCleanup(deps, issue, `⏹️ **Cancelled** — ${reason}. Archiving this thread.`);

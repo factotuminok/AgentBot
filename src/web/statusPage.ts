@@ -1,5 +1,5 @@
 import type { StatusReport, UsageWindow } from "../shared/adminApi";
-import { type Cell, formatCount, formatDuration, formatTime, formatUsd, type LiveContext, liveView } from "./live";
+import { type Cell, formatCount, formatDuration, formatTime, formatUsd, type LiveContext, liveView, loadoutSummary } from "./live";
 import { esc, layout, nav, table } from "./views";
 
 export const USAGE_WINDOWS: readonly UsageWindow[] = ["24h", "7d", "30d", "all"];
@@ -61,6 +61,29 @@ ${table(["Repository", "Runs", "Cost"], usage.byRepo.map(row => [row.repo, forma
 ${table(["Kind", "Succeeded", "Failed", "Cancelled", "Success rate", "Avg duration"], usage.jobs.map(outcomeCells), "No finished jobs in this window.")}
 <h3>Daily cost (last ${usage.daily.length} days)</h3>
 ${dailyChart(usage.daily)}
+<h3>Setup time by repository</h3>
+<p class="hint">From a worker claiming a run to its agent starting: worker start, downloads, checkout and <code>setupCommand</code>.</p>
+${table(
+	["Repository", "Runs", "Average", "Slowest"],
+	usage.setup.map(row => [row.repo, formatCount(row.runs), formatDuration(row.avgMs), formatDuration(row.maxMs)]),
+	"No runs started in this window.",
+)}
+</section>`;
+}
+
+const LOADOUT_HEADERS = ["Profile", "Captured", "Tools", "Skills", "Agents", "MCP servers"];
+
+function loadoutSection(loadouts: StatusReport["loadouts"]): string {
+	const rows: Cell[][] = loadouts.map(loadout => [
+		loadout.profile,
+		formatTime(loadout.capturedAt),
+		loadout.tools.join(", ") || "—",
+		loadout.skills.map(skill => skill.name).join(", ") || "—",
+		loadout.agents.map(agent => agent.name).join(", ") || "—",
+		loadout.mcp.map(m => `${m.server} (${m.status}, ${m.tools.length} tools${m.error ? `: ${m.error}` : ""})`).join("; ") || "—",
+	]);
+	return `<section id="loadouts"><h2>Latest loadout per profile</h2>
+${table(LOADOUT_HEADERS, rows, "No run has reported a loadout yet.")}
 </section>`;
 }
 
@@ -86,7 +109,7 @@ const FILL_JS = `function fill(id, rows, empty) {
 
 /** Polls `/status.json` and re-renders the live sections with the same `liveView` the server uses. */
 const STATUS_PAGE_SCRIPT = `<script>
-${[formatUsd, formatCount, formatDuration, formatTime, liveView].map(fn => fn.toString()).join("\n")}
+${[formatUsd, formatCount, formatDuration, formatTime, loadoutSummary, liveView].map(fn => fn.toString()).join("\n")}
 ${FILL_JS}
 const root = document.getElementById("status-root");
 setInterval(async () => {
@@ -101,6 +124,8 @@ setInterval(async () => {
 		fill("worker-rows", view.workers, "No workers connected.");
 		fill("warning-rows", view.warnings, "No warnings.");
 		fill("open-rows", view.open, "No open issues.");
+		fill("pending-rows", view.pending, "No pending runs.");
+		fill("run-rows", view.running, "No runs in progress.");
 	} catch {}
 }, 5000);
 </script>`;
@@ -108,6 +133,7 @@ setInterval(async () => {
 export interface StatusPageOptions {
 	report: StatusReport;
 	context: LiveContext;
+	vscode: boolean;
 }
 
 export function statusPage(opts: StatusPageOptions): string {
@@ -116,7 +142,7 @@ export function statusPage(opts: StatusPageOptions): string {
 	const states = Object.keys(report.issues.counts);
 	return layout(
 		"Status",
-		`${nav("status")}
+		`${nav("status", opts.vscode)}
 <main id="status-root" data-guild="${esc(opts.context.guildId ?? "")}">
 <h1>Status</h1>
 <section id="current" class="status" aria-live="polite"><h2>Current state</h2>
@@ -132,12 +158,19 @@ ${table(["Warnings"], view.warnings, "No warnings.", "warning-rows")}
 <section id="workers"><h2>Workers</h2>
 ${table(["Worker", "Address", "Run", "Phase", "omp", "Connected for"], view.workers, "No workers connected.", "worker-rows")}
 </section>
+<section id="runs"><h2>Runs</h2>
+<h3>Pending</h3>
+${table(["Run", "Repository", "Waiting for"], view.pending, "No pending runs.", "pending-rows")}
+<h3>In progress</h3>
+${table(["Run", "Repository", "Worker", "State", "Elapsed", "Setup", "Last tool", "Cost", "Tokens", "Loadout"], view.running, "No runs in progress.", "run-rows")}
+</section>
 <section id="issues"><h2>Issues</h2>
 ${table(states, states.length ? [states.map(state => formatCount(report.issues.counts[state] ?? 0))] : [], "No issues.")}
 <h3>Open issues</h3>
 ${table(["Issue", "Title", "State", "Job", "Thread"], view.open, "No open issues.", "open-rows")}
 </section>
 ${usageSection(report.usage)}
+${loadoutSection(report.loadouts)}
 </main>
 ${STATUS_PAGE_SCRIPT}`,
 	);

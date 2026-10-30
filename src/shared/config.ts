@@ -8,8 +8,11 @@ const configObject = z.object({
 			guildId: z.string().min(1),
 			allowedUserIds: z.array(z.string()).default([]),
 			allowedRoleIds: z.array(z.string()).default([]),
-			/** The one channel where `/work` commands are used and issue threads live (DSC-33). */
-			workChannelId: z.string().min(1),
+			/**
+			 * The one channel where `/work` commands are used and issue threads live (DSC-33). Required to start the engine,
+			 * not to save: a fresh install stores the bot token first, then picks this from the channel dropdown (WEB-20).
+			 */
+			workChannelId: z.string().min(1).optional(),
 			/** Category new watch channels are created under (DSC-35); unset = top level. */
 			watchCategoryId: z.string().min(1).optional(),
 			/** Ask-only channels: anyone may run `/ask` there. Watch-channel clashes are checked at save (WEB-24). */
@@ -124,6 +127,15 @@ const secretsSchema = z.object({
 
 export type Config = z.infer<typeof configSchema>;
 export type Secrets = z.infer<typeof secretsSchema>;
+/** Settings the engine can start with: the work channel is chosen (DSC-33). */
+export type EngineConfig = Config & { discord: { workChannelId: string } };
+
+export function hasWorkChannel(config: Config): config is EngineConfig {
+	return config.discord.workChannelId !== undefined;
+}
+
+/** ENG-01: why the engine stays `unconfigured` after the first save. */
+export const WORK_CHANNEL_MISSING = "Choose the work channel in Settings (Discord) to start the engine.";
 
 /** Everything an admin enters (§13); stored encrypted in the vault. */
 export interface Settings {
@@ -131,17 +143,34 @@ export interface Settings {
 	secrets: Secrets;
 }
 
+/** One settings error: where it is (`secrets.*` paths start with "secrets") and its `Invalid config: <path>: <message>` text. */
+export interface SettingsIssue {
+	path: (string | number)[];
+	message: string;
+}
+
+/** Its message is the first issue's (§13); `issues` holds every one, for editors that mark each field. */
 export class ConfigError extends Error {
 	override name = "ConfigError";
+	constructor(readonly issues: SettingsIssue[]) {
+		super(issues[0]!.message);
+	}
 }
 
 function parseOrThrow<T>(schema: z.ZodType<T>, value: unknown, prefix: (string | number)[]): T {
 	const result = schema.safeParse(value);
 	if (result.success) return result.data;
-	const issue = result.error.issues[0]!;
-	const parts = [...prefix, ...issue.path.map(p => String(p))];
-	const path = parts.length ? parts.join(".") : "(root)";
-	throw new ConfigError(`Invalid config: ${path}: ${issue.message}`);
+	throw new ConfigError(
+		result.error.issues.map(issue => {
+			const path = [...prefix, ...issue.path.map(p => (typeof p === "number" ? p : String(p)))];
+			return { path, message: `Invalid config: ${path.length ? path.join(".") : "(root)"}: ${issue.message}` };
+		}),
+	);
+}
+
+/** JSON Schema (draft 2020-12) of the config object as an admin writes it: settings with defaults are optional. */
+export function configJsonSchema(): Record<string, unknown> {
+	return z.toJSONSchema(configObject, { io: "input" });
 }
 
 /** Validate an already-parsed config object (everything in §13 except `secrets.*`). */

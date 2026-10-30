@@ -1,0 +1,26 @@
+AgentBot {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+1. Open the web UI.
+{{- if .Values.web.ingress.enabled }}
+   https://{{ .Values.web.ingress.host }}/
+{{- else }}
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "agentbot.webService" . }} 8080:8080
+   then http://127.0.0.1:8080/ (enable web.ingress for remote access: it terminates TLS so the session cookie is Secure).
+{{- end }}
+
+2. On first start the web UI asks for the setup token, which the orchestrator prints once:
+   kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "agentbot.orchestratorService" . }} | grep setupToken
+   Create the admin account, then fill in Settings (Discord, GitHub App, models).
+
+3. Workers: KEDA starts one Job pod per pending run, up to worker.maxReplicas = {{ .Values.worker.maxReplicas }}, and none while idle:
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=worker
+   At most maxConcurrentJobs + maxChatSessions workers are used (default 2 + 2); raise them in Settings to use all
+   {{ .Values.worker.maxReplicas }}. The orchestrator's health warns while they are lower:
+   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "agentbot.orchestratorService" . }} -- bun -e 'console.log(await (await fetch("http://127.0.0.1:8081/readyz")).text())'
+
+{{- if not .Values.secrets.existingSecret }}
+
+The master key and internal tokens are in Secret {{ include "agentbot.secretName" . }}, kept across upgrades and on
+`helm uninstall` (like the state volume {{ include "agentbot.fullname" . }}-state). Back them up together.
+{{- end }}
+KEDA >= 2.19 is recommended: older versions can start one extra worker pod near worker.maxReplicas.

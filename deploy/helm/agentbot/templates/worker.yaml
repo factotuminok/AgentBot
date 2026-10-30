@@ -1,0 +1,105 @@
+{{- /* Workers: KEDA ScaledJob from spike S5's spikes/s5/scaledjob.yaml (architecture §4.4). */ -}}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "agentbot.fullname" . }}-scale
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "worker") | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: token
+      name: {{ include "agentbot.secretName" . }}
+      key: scale-token
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: {{ include "agentbot.fullname" . }}-worker
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "worker") | nindent 4 }}
+spec:
+  pollingInterval: {{ .Values.worker.pollingInterval }}
+  minReplicaCount: 0
+  maxReplicaCount: {{ .Values.worker.maxReplicas }}
+  # successfulJobsHistoryLimit stays at KEDA's default, so ttlSecondsAfterFinished decides when Jobs go (S5).
+  failedJobsHistoryLimit: {{ .Values.worker.failedJobsHistoryLimit }}
+  scalingStrategy:
+    # pendingRuns excludes claimed runs; a started pod that has not claimed yet is not Ready and counts as a pending
+    # Job, so slow worker start-up does not add pods (S5).
+    strategy: accurate
+    pendingPodConditions: ["Ready"]
+  triggers:
+    - type: metrics-api
+      metadata:
+        url: {{ include "agentbot.orchestratorUrl" . }}/internal/scale
+        format: json
+        valueLocation: pendingRuns
+        targetValue: "1"
+        authMode: bearer
+      authenticationRef:
+        name: {{ include "agentbot.fullname" . }}-scale
+  jobTargetRef:
+    # The orchestrator owns retries (RUN-04); a pod with nothing to claim exits 0.
+    backoffLimit: 0
+    # The pod and its emptyDir volumes are deleted a minute after the run (RUN-20). No activeDeadlineSeconds: a run
+    # may wait up to askTimeoutHours for an answer.
+    ttlSecondsAfterFinished: 60
+    template:
+      metadata:
+        labels:
+          {{- include "agentbot.labels" (dict "root" . "component" "worker") | nindent 10 }}
+      spec:
+        restartPolicy: Never
+        # Time for the final checkpoint on eviction (RUN-18).
+        terminationGracePeriodSeconds: 60
+        {{- include "agentbot.podSpec" . | nindent 8 }}
+        {{- with include "agentbot.scheduling" .Values.worker | trim }}{{ . | nindent 8 }}{{ end }}
+        containers:
+          - name: worker
+            image: {{ include "agentbot.workerImage" . }}
+            imagePullPolicy: {{ .Values.image.pullPolicy }}
+            args: ["worker"]
+            env:
+              - name: AGENTBOT_ORCHESTRATOR_URL
+                value: {{ include "agentbot.orchestratorUrl" . }}
+              - name: AGENTBOT_WORKER_TOKEN_FILE
+                value: /run/secrets/agentbot_worker_token
+              - name: AGENTBOT_WORKER_DISK
+                value: {{ include "agentbot.workerDisk" . | quote }}
+            # Ready = "this worker has claimed a run", and stays so until it exits (S5).
+            readinessProbe:
+              exec:
+                command: ["agentbot", "health", "--claimed"]
+              periodSeconds: 1
+              failureThreshold: 1
+              timeoutSeconds: 5
+            livenessProbe:
+              exec:
+                command: ["agentbot", "health"]
+              initialDelaySeconds: 15
+              periodSeconds: 15
+              timeoutSeconds: 5
+              failureThreshold: 3
+            securityContext:
+              {{- toYaml .Values.securityContext | nindent 14 }}
+            resources:
+              {{- toYaml .Values.worker.resources | nindent 14 }}
+            volumeMounts:
+              # The checkout root is $TMPDIR/agentbot-worker (architecture §5).
+              - name: checkout
+                mountPath: /tmp
+              - name: run-local
+                mountPath: /run/agentbot
+              - name: secrets
+                mountPath: /run/secrets
+                readOnly: true
+        volumes:
+          # Backstop for the worker's own checkout-size limit (STO-06), enforced by the kubelet.
+          - name: checkout
+            emptyDir:
+              sizeLimit: {{ .Values.worker.diskLimit }}
+          - name: run-local
+            emptyDir:
+              medium: Memory
+              sizeLimit: {{ .Values.worker.runDirLimit }}
+          {{- include "agentbot.secretVolume" (dict "root" . "keys" (list "worker-token")) | nindent 10 }}

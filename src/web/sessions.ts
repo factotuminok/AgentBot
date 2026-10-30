@@ -1,9 +1,6 @@
 import { randomBytes } from "node:crypto";
 
 export const SESSION_IDLE_MS = 12 * 60 * 60 * 1000;
-export const THROTTLE_MAX_FAILURES = 5;
-export const THROTTLE_WINDOW_MS = 15 * 60 * 1000;
-const THROTTLE_PRUNE_ABOVE = 1024;
 
 /** One-shot message shown on the next page render; `error` renders it as a failure. */
 export interface Flash {
@@ -61,50 +58,6 @@ export function createSessionStore(idleMs = SESSION_IDLE_MS, now: () => number =
 		},
 		deleteOthers(token) {
 			for (const key of sessions.keys()) if (key !== token) sessions.delete(key);
-		},
-	};
-}
-
-export interface LoginThrottle {
-	/** Milliseconds until the IP may try again; 0 when it is not blocked. */
-	retryAfterMs(ip: string): number;
-	fail(ip: string): void;
-	succeed(ip: string): void;
-}
-
-/** Blocks an IP for 15 minutes after 5 failures within 15 minutes (WEB-03); held in web memory only. */
-export function createLoginThrottle(now: () => number = Date.now): LoginThrottle {
-	const entries = new Map<string, { failures: number; firstFailure: number; blockedUntil: number }>();
-
-	function prune(): void {
-		const t = now();
-		for (const [ip, entry] of entries) {
-			if (entry.blockedUntil <= t && t - entry.firstFailure > THROTTLE_WINDOW_MS) entries.delete(ip);
-		}
-	}
-
-	return {
-		retryAfterMs(ip) {
-			const entry = entries.get(ip);
-			return entry ? Math.max(0, entry.blockedUntil - now()) : 0;
-		},
-		fail(ip) {
-			if (entries.size > THROTTLE_PRUNE_ABOVE) prune();
-			const t = now();
-			let entry = entries.get(ip);
-			if (!entry || t - entry.firstFailure > THROTTLE_WINDOW_MS) {
-				entry = { failures: 0, firstFailure: t, blockedUntil: entry?.blockedUntil ?? 0 };
-				entries.set(ip, entry);
-			}
-			entry.failures++;
-			if (entry.failures >= THROTTLE_MAX_FAILURES) {
-				entry.blockedUntil = t + THROTTLE_WINDOW_MS;
-				entry.failures = 0;
-				entry.firstFailure = t;
-			}
-		},
-		succeed(ip) {
-			entries.delete(ip);
 		},
 	};
 }

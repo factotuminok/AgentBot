@@ -217,6 +217,18 @@ describe("credential requests (CRED-03, spike S1)", () => {
 		expect(tokenHits).toHaveLength(1);
 	});
 
+	test("a forced refresh runs at most once per sign-in per minute; otherwise the stored token is the answer (F11)", async () => {
+		await signIn(Date.now() + 3_600_000);
+		const [entry] = await signins.snapshotForRun();
+		const id = entry!.id as number;
+		expect(await signins.handleCredentialRequest({ provider: PROVIDER, credentialId: id, accessToken: "access-v1" })).toMatchObject({ ok: true, accessToken: "access-v2" });
+		// The new token reported as rejected again within the minute: no second token exchange.
+		for (let i = 0; i < 3; i++) {
+			expect(await signins.handleCredentialRequest({ provider: PROVIDER, credentialId: id, accessToken: "access-v2" })).toMatchObject({ ok: true, accessToken: "access-v2" });
+		}
+		expect(tokenHits).toEqual([{ refreshToken: "refresh-v1", status: 200 }]);
+	});
+
 	test("negative control: without the hook a worker hits the token endpoint with only the placeholder, and the chain survives", async () => {
 		await signIn(Date.now() + 3_600_000);
 		const snapshot = expired(await signins.snapshotForRun());

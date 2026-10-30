@@ -28,9 +28,18 @@ jobs:
       - name: Set up Helm
         if: hashFiles('deploy/helm/agentbot/Chart.yaml') != ''
         uses: azure/setup-helm@v4
+        with:
+          version: v3.22.1 # same as .tools/helm for the local tests
       - name: Helm lint
         if: hashFiles('deploy/helm/agentbot/Chart.yaml') != ''
-        run: helm lint deploy/helm/agentbot
+        run: helm lint deploy/helm/agentbot --strict
+      - name: Helm template (default values)
+        if: hashFiles('deploy/helm/agentbot/Chart.yaml') != ''
+        # No cluster here: --api-versions stands in for the KEDA CRD the chart checks for (OPS-08).
+        run: helm template agentbot deploy/helm/agentbot --namespace agentbot --api-versions keda.sh/v1alpha1/ScaledJob >/dev/null
+      - name: Helm chart tests (bun test above skipped them before helm was installed)
+        if: hashFiles('deploy/helm/agentbot/Chart.yaml') != ''
+        run: bun test test/integration/helm.test.ts
       - id: version
         run: |
           base=$(jq -r .version package.json)
@@ -88,3 +97,58 @@ jobs:
             echo "$tag already exists (re-run)"; exit 0
           fi
           git tag "$tag" "$GITHUB_SHA" && git push origin "refs/tags/$tag"
+  kind:
+    # Helm chart install test (architecture §7.3, OPS-07/08): kind + KEDA, the image built from this commit, `helm
+    # install --wait` until orchestrator and web are Ready. test/e2e/k8s/install-smoke.sh is the full local version.
+    needs: test
+    if: needs.test.outputs.image == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IMAGE: localhost/agentbot:ci
+      KEDA_VERSION: 2.21.0
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}
+          build-args: |
+            AGENTBOT_VERSION=${{ needs.test.outputs.version }}
+            AGENTBOT_COMMIT=${{ github.sha }}
+          cache-from: type=gha
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.30.0
+          cluster_name: agentbot-e2e
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.22.1
+      - name: Install KEDA
+        run: |
+          kubectl apply --server-side -f "https://github.com/kedacore/keda/releases/download/v$KEDA_VERSION/keda-$KEDA_VERSION.yaml"
+          for d in keda-operator keda-metrics-apiserver keda-admission; do kubectl -n keda rollout status "deploy/$d" --timeout 300s; done
+      - name: Load the image
+        run: kind load docker-image "$IMAGE" --name agentbot-e2e
+      - name: helm install
+        run: |
+          helm install agentbot deploy/helm/agentbot -n agentbot --create-namespace --wait --timeout 5m \
+            --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" --set image.pullPolicy=Never \
+            --set worker.diskLimit=1Gi --set orchestrator.persistence.size=1Gi --set web.persistence.size=1Gi \
+            --set-json 'worker.resources={"requests":{"cpu":"100m","memory":"256Mi","ephemeral-storage":"100Mi"},"limits":{"memory":"1Gi"}}'
+      - name: Orchestrator and web Ready, ScaledJob Ready
+        run: |
+          kubectl -n agentbot rollout status deploy/agentbot-orchestrator --timeout 120s
+          kubectl -n agentbot rollout status deploy/agentbot-web --timeout 120s
+          kubectl -n agentbot wait --for condition=Ready scaledjob/agentbot-worker --timeout 120s
+          kubectl -n agentbot exec deploy/agentbot-orchestrator -- bun -e 'const r = await fetch("http://127.0.0.1:8081/readyz"); console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1)'
+          kubectl -n agentbot logs deploy/agentbot-orchestrator | grep -q setupToken
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl -n agentbot get all,pvc,networkpolicy,scaledjob -o wide || true
+          kubectl -n agentbot describe pods || true
+          kubectl -n agentbot logs deploy/agentbot-orchestrator --tail 100 || true
+          kubectl -n agentbot get events --sort-by .lastTimestamp || true

@@ -30,8 +30,8 @@ src/
     host/                 agent host from DevForge src/agent: host, serve, session, tools, todos, oom, reap, loadout, scratchTools
   launcher/               rootless Podman client, spawn loop, reaper
 extensions/agentbot-vscode/   bundled VS Code extension (WEB-28, WEB-31)
+compose.yaml
 deploy/
-  compose/compose.yaml
   helm/agentbot/
 scripts/                  init-secrets.sh, omp-latest.ts, dry-run.ts
 test/
@@ -227,6 +227,8 @@ Work:
 
 Each step shows validation errors where they apply.
 
+Done: `test/integration/phase6.test.ts` runs the whole sequence through the served forms, against the orchestrator's admin API as `main.ts` composes it (`src/orchestrator/api/features.ts`, `src/web/pages.ts`), with Discord's REST API, GitHub and the provider sign-in faked. Decisions: the work channel is optional to save and required to start the engine (requirements §20 item 5); a save whose channels cannot be checked succeeds with a warning (item 6). The omp page shows the installed omp version only; update status and the manual check come with phase 10 (UPD).
+
 ### Phase 7: VS Code configuration editor
 
 **Goal:** settings, omp settings, skills and agents editable as files.
@@ -249,6 +251,8 @@ Work:
 - Editing the same setting on the Settings page and in VS Code produces a `.remote` conflict.
 - No terminal, task or extension install works.
 
+Done: `test/integration/workspaceSync.test.ts` covers the first three points against the real admin API (`src/orchestrator/api/workspace.ts`, `src/web/workspace/`). `test/e2e/vscode/` (Containerfile + `smoke.sh`) builds the S4 layout with the bundled extension (`vscode/extension`, `bun run build:vsix`) and runs the web role with an orchestrator. In a browser, an invalid `settings.json` showed the AgentBot error at its line in the Problems panel and the file stayed unapplied. The terminal keybinding, Terminal: Create New Terminal, the tasks commands, Install from VSIX and Install Extension from Location were all blocked. The Marketplace search was empty, a written `.vscode/tasks.json` was deleted, and no shell process ran. Phase 8 reuses the Containerfile's code-server layer. Deviations from S4: code-server's `HOME` is `AGENTBOT_HOME`; the lock-down log goes to the extension's output channel rather than `~/agentbot-lockdown.log`; `state.vscdb.backup` is deleted with `state.vscdb`.
+
 ### Phase 8: Image and Podman launcher
 
 **Goal:** the Podman stack runs the whole system, with one container per run.
@@ -260,6 +264,8 @@ Work:
 - Health commands (`agentbot health`) and per-worker memory and disk limits (NFR-01, NFR-02).
 
 **Exit:** on a clean Podman host, the phase 5 scenario passes with `podman compose up`. During a run `podman ps` shows one worker container per run, and none once the runs end. A rootful socket is refused.
+
+Done (on the rootless Podman 6.1.4 machine, Fedora CoreOS, docker-compose 5.6.0 and podman-compose 1.6.0 as providers): `test/e2e/compose/smoke.sh` brings the stack up healthy in ~17 s, creates the admin through `/setup`, and runs a real worker run without Discord, GitHub or a model (an MCP "Test connection" against an inline stdio server). `podman ps` showed one worker container for it and none afterwards; the launcher image refused the rootful socket with exit 2. `test/e2e/launcher/smoke.sh` covers capacity (3 runs, capacity 2) and the reaper. Measured during the smoke (idle, not a heavy run): orchestrator ~280 MB, web ~25 MB without code-server, launcher ~16 MB, a worker 110–145 MB. **Not yet run:** the phase 5 scenario on a real test guild and repo under compose; it needs a Discord bot token and guild, a GitHub App on a test repo, and a model sign-in. Decisions: compose secrets are `file:` secrets made by `scripts/init-secrets.sh` (docker-compose refuses `external:` secrets), with the worker token also stored as the Podman secret workers receive; all three services run with `keep-id:uid=10001,gid=10001` so 10001 can read its 0400 secret files; worker run-local storage moved under `AGENTBOT_WORKER_RUN_DIR` (tmpfs), checkout and bundles on container storage; until settings are saved, the dispatcher still admits MCP tests (`dispatchLimits`).
 
 ### Phase 9: Kubernetes
 
@@ -275,6 +281,15 @@ Work:
 
 **Exit:** on `kind` with KEDA, 10 issues queued with limits raised to 10 run on 10 pods, and pods drop to 0 afterwards. Health reports the limits and the warning while limits are below capacity. Killing a pod resumes the job on a new one.
 
+Done on kind (Kubernetes 1.34, KEDA 2.21.0, podman provider) with `bun test/e2e/k8s/scenarios.ts`. It uses a derived test image (`test/e2e/k8s/Containerfile`) whose orchestrator runs the real internals with fake Discord and GitHub (`test/e2e/k8s/orchestrator.ts`) and whose workers use the fixture agent host. The chart is unchanged apart from the image values.
+- **A:** 10 issues gave 10 worker pods 7 s after filing, and no extra pods. All 10 plans succeeded, and all pods and Jobs were gone 62 s after the last one (the Job TTL).
+- **B:** with limits 2/2 and capacity 10, `/readyz` showed the limits and the warning "at most 4 workers will be used", and web `/healthz` relayed the limits.
+- **C:** after `kubectl delete pod` mid-implement, the run was marked lost after the 45 s lease. A new pod claimed the resumed run 49 s after the kill and finished it with the first run's commit and its uncommitted file restored.
+
+`test/e2e/k8s/install-smoke.sh` runs the real image: the KEDA-missing failure, the NetworkPolicy checks, secrets kept across `helm upgrade`, and an MCP test run on one Job pod. `test/integration/helm.test.ts` covers the rendering, and `test/integration/k8sharness.test.ts` runs the scenario orchestrator without kind.
+
+Fixed along the way: a lost implement run's re-queued job now resumes from the uploaded checkpoint and session (`implementRun`). Before, it decided resumption from `issue.impl_session`, which a lost run never writes.
+
 ### Phase 10: omp updates, CD and tooling
 
 Work:
@@ -287,6 +302,13 @@ Work:
 - A deliberately broken copy falls back and re-offers the update.
 - CD deploys a tagged build to the test cluster and the Podman host.
 
+Done:
+- **Updates.** `test/integration/ompUpdate.test.ts` covers the first two points with the real dispatcher, the internal API, worker processes, fake Discord, a fake npm registry and a real packed archive. `test/e2e/omp-update/real-install.ts` installed npm's latest omp over the pin on the host and inside the image, packed it (~270 MB archive, ~950 MB unpacked), and started an agent host from the copy up to `registered`.
+- **Not yet observed in a deployed stack:** an approved update reaching a real model-backed run. That needs Discord and a model.
+- **CD.** `.github/workflows/cd.yml` passes actionlint. `deploy/k8s/deploy.sh` and `deploy/podman/deploy.sh` deployed, upgraded and rolled back locally (kind, and rootless Podman on the macOS client and in the Fedora CoreOS VM with the systemd unit), checking the version in both health endpoints (`test/e2e/deploy/smoke.sh`).
+- **Not yet run on GitHub:** the `workflow_run` trigger, GHCR pulls and the self-hosted runner.
+- **dry-run.** `bun run dry-run` planned against a temp repo with a real model, answered a question from stdin, and cleaned up (`test/integration/dryrun.test.ts` uses the fixture host).
+
 ### Phase 11: Hardening and release
 
 Work:
@@ -297,6 +319,10 @@ Work:
 - Documentation: README with install for Podman and Kubernetes, configuration, and upgrade.
 
 **Exit:** all requirements verified (§7). A tagged release is published, then deployed by CD to both targets.
+
+Load test done on kind with `bun test/e2e/k8s/load.ts` (`wiki/load-test.md`). Both scenarios succeeded: 10 concurrent implement runs on one repository, then 10 on 10 repositories, each pushing its own branch and opening a PR. At 10 concurrent runs, NFR-06 setup (claim → agent registered) was 7–9 s p50 and 10–14 s p95. The Discord queue peaked at 11 writes, the oldest 15 s old (10 issues sharing one watch channel). It fixed three bugs: package-manager caches on the run-local tmpfs (ENOSPC), event-loop stalls from SQLite fsyncs (`synchronous=NORMAL`), and false watch suspensions from the cached repository listing.
+
+Chaos tests done on the rootless compose stack with `bun test/e2e/chaos/run.ts` (manual, needs the podman machine). The fake GitHub runs as its own service and the fake Discord persists its state, so both outlive restarts. Three seeded rounds passed (seeds 11, 4242 and 20261030), each taking 4 issues through the phase 5 flow while 15 to 30 random SIGKILLs hit the orchestrator, web, the launcher and workers. Every issue finished with one PR, no duplicated comment, message or push, no unfinished run and no worker left. The limits round passed too: a full 2 MiB checkout and a real kernel OOM kill (512 MiB worker) were each reported for their own run only. The tests found two bugs. Workers had no liveness check on their orchestrator connection: an orchestrator restarted with a new address left them half-open, and every one of their runs was lost. They now ping, and drop silent connections and hung connection attempts (`src/worker/connection.ts`). Disk limits under 1 GiB printed as "0.0 GiB".
 
 ## 5. Verification
 
@@ -313,17 +339,17 @@ DevForge's tests are ported with their modules. Tests that pinned DevForge's wor
 
 | Question | Source | Settle by |
 |---|---|---|
-| Capacity check before thread creation for `/work ask` and `/work plan` | requirements §20 item 1 | phase 5 |
-| `/work cancel` in chat threads | requirements §20 item 2 | phase 5 |
-| Strict schema for revise and fix_ci output | requirements §20 item 3 | phase 5 |
-| Enforcing read-only planning beyond the prompt | requirements §20 item 4 | phase 5 |
-| Releasing workers while waiting for an answer | architecture §11 item 1 | after release, using phase 11 load data |
-| Moving DevForge's on-prem host to this stack | architecture §11 item 2 | phase 10 |
+| Capacity check before thread creation for `/work ask` and `/work plan` | requirements §20 item 1 | settled in phase 5: refused up front |
+| `/work cancel` in chat threads | requirements §20 item 2 | settled in phase 5: stops the live run |
+| Strict schema for revise and fix_ci output | requirements §20 item 3 | settled in phase 5: strict |
+| Enforcing read-only planning beyond the prompt | requirements §20 item 4 | settled in phase 5: prompt only, writes discarded (WS-04) |
+| Releasing workers while waiting for an answer | architecture §11 item 1 | after release: the phase 11 load test showed no worker shortage at capacity 10, so it is not a release blocker |
+| Moving DevForge's on-prem host to this stack | architecture §11 item 2 | settled in phase 10: compose under a systemd user unit, deployed by CD on a self-hosted runner (architecture §7.2, §7.4) |
 | Web replicas | architecture §11 item 3 | not needed for release |
 | omp refresh hook | architecture §11 item 4 | settled by spike S1 (`wiki/spikes/S1.md`) |
-| Per-repo dependency cache | architecture §11 item 5 | phase 11, from NFR-06 data |
-| Agent host in a separate container from the supervisor | architecture §11 item 6 | phase 11 security review |
-| Size of the packed omp copy | architecture §11 item 7 | phase 10 |
+| Per-repo dependency cache | architecture §11 item 5 | settled in phase 11: not needed for release (`wiki/load-test.md`); revisit when a repository's average setup time exceeds ~60 s |
+| Agent host in a separate container from the supervisor | architecture §11 item 6 | settled in phase 11: not a release blocker; the interim fix (claims bound to the worker's network address, security finding F1) shipped, and the split is the first change after release (`wiki/verification.md`, Phase 11 security review) |
+| Size of the packed omp copy | architecture §11 item 7 | settled in phase 10: 269 MB packed, 950 MB unpacked; cache per node only if downloads become a problem |
 
 ## 7. Requirement coverage
 
@@ -341,6 +367,8 @@ DevForge's tests are ported with their modules. Tests that pinned DevForge's wor
 | NFR-04, NFR-05, everything re-verified | 11 |
 
 Withdrawn requirements (WEB-12, WEB-13, WEB-15 to WEB-19, SEC-07 to SEC-11, CRED-04, STO-05) need no work. Where DevForge implements them, the code is not ported.
+
+The evidence and status of every requirement ID, with the open gaps ordered by risk, are in [`wiki/verification.md`](verification.md).
 
 ## 8. Risks
 

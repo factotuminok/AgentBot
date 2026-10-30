@@ -1,4 +1,4 @@
-import type { Config, LabelNames } from "../../shared/config";
+import type { EngineConfig, LabelNames } from "../../shared/config";
 import type { Dispatcher, SteerOptions } from "../dispatch/dispatcher";
 import type { InteractionRouter } from "../discord/interactions";
 import type { ThreadReplies } from "../discord/replies";
@@ -7,14 +7,16 @@ import type { GitHub, GhIssue } from "../github/types";
 import type { AgentLog } from "../store/agentlog";
 import type { Db, IssueRow, JobRow } from "../store/db";
 import type { JobKind } from "./state";
+import type { ChatSlots } from "./chatSlots";
 
 /**
  * Everything one engine instance works with (ENG-02: rebuilt on every settings apply). Ported from DevForge `EngineDeps`
  * (src/engine/jobs.ts) with: `client` → `discord` (the surface, no discord.js), `runtime`/`activeSessions` → `dispatcher`
- * (process-wide, outlives the engine), no `workspace` until phase 4, label names from settings.
+ * (process-wide, outlives the engine), no `workspace` (checkouts live on workers; the dispatcher keeps the mirrors and
+ * pushes results), label names from settings.
  */
 export interface EngineDeps {
-	config: Config;
+	config: EngineConfig;
 	/** Effective label names (GH-08, GH-22). */
 	labels: LabelNames;
 	db: Db;
@@ -27,6 +29,8 @@ export interface EngineDeps {
 	agentLog: AgentLog;
 	/** `<state>/sessions` (ENG-05). */
 	sessionDir: string;
+	/** The `maxChatSessions` budget shared by chats, plans and drafts (CHAT-04, DSC-25); one per engine instance. */
+	chatSlots: ChatSlots;
 	/** Aborted when this engine instance stops: in-flight work detaches from its runs and stops touching Discord/GitHub. */
 	signal: AbortSignal;
 }
@@ -36,8 +40,10 @@ export interface Scheduler {
 	enqueue(issueId: number, kind: JobKind, input?: object): JobRow;
 	/** Starts queued jobs up to `maxConcurrentJobs`, oldest first, one per issue (JOB-02, JOB-03). */
 	tick(): void;
-	/** JOB-05. */
+	/** JOB-05: `stopJobs`, then the issue moves to `cancelled` (unless already terminal) with the reason. */
 	cancelIssue(issueId: number, reason: string): Promise<void>;
+	/** Cancels the issue's queued jobs and aborts its live run; leaves the issue's state alone (GH-14). */
+	stopJobs(issueId: number): Promise<void>;
 	/** True when the issue has a queued or running job. */
 	isBusy(issueId: number): boolean;
 	/**

@@ -13,6 +13,8 @@ export class ArtifactError extends Error {
 	constructor(
 		readonly status: number,
 		message: string,
+		/** The response body: the orchestrator's reason, e.g. why it rejected a bundle. */
+		readonly detail = "",
 	) {
 		super(message);
 		this.name = "ArtifactError";
@@ -96,7 +98,10 @@ export class ArtifactClient {
 	/** Uploads the file at `path` as `artifact`. */
 	async upload(artifact: string, path: string): Promise<void> {
 		const res = await this.#request("PUT", artifact, () => Bun.file(path));
-		if (!res.ok) throw new ArtifactError(res.status, `PUT ${artifact} failed: HTTP ${res.status} ${await res.text().catch(() => "")}`.trim());
+		if (!res.ok) {
+			const detail = (await res.text().catch(() => "")).trim();
+			throw new ArtifactError(res.status, `PUT ${artifact} failed: HTTP ${res.status} ${detail}`.trim(), detail);
+		}
 		await res.body?.cancel().catch(() => {});
 	}
 }

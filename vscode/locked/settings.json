@@ -1,0 +1,25 @@
+{
+	"task.autoDetect": "off",
+	"task.allowAutomaticTasks": "off",
+	"task.problemMatchers.neverPrompt": true,
+	"security.workspace.trust.enabled": false,
+	"security.workspace.trust.startupPrompt": "never",
+	"terminal.integrated.profiles.linux": {
+		"bash": null,
+		"sh": null,
+		"tmux": null,
+		"pwsh": null,
+		"JavaScript Debug Terminal": null
+	},
+	"terminal.integrated.automationProfile.linux": { "path": "/usr/sbin/nologin" },
+	"terminal.integrated.hideOnStartup": "always",
+	"extensions.allowed": { "agentbot.agentbot": true },
+	"extensions.autoUpdate": "off",
+	"extensions.autoCheckUpdates": false,
+	"extensions.ignoreRecommendations": true,
+	"remote.autoForwardPorts": false,
+	"remote.restoreForwardedPorts": false,
+	"chat.disableAIFeatures": true,
+	"telemetry.telemetryLevel": "off",
+	"workbench.startupEditor": "none"
+}

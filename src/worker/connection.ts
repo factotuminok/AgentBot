@@ -11,6 +11,14 @@ import { type DownMessage, MAX_WS_MESSAGE_BYTES, type OrchestratorControl, type 
 
 export const RECONNECT_MIN_MS = 1_000;
 export const RECONNECT_MAX_MS = 15_000;
+/**
+ * Ping interval on an open connection; a connection silent for `KEEPALIVE_DEAD_PINGS` intervals, or an attempt not
+ * open within one, is dropped and retried. Without this a connection whose orchestrator vanished without closing it
+ * (container restarted with a new address, node gone) stays half-open, and an attempt to the old address hangs,
+ * until TCP gives up, minutes after the re-attach grace and the lease ran out.
+ */
+export const KEEPALIVE_MS = 10_000;
+const KEEPALIVE_DEAD_PINGS = 3;
 /** Relay buffer bounds while the orchestrator has not acknowledged (RUN-06). */
 export const OUTBOX_MAX_MESSAGES = 10_000;
 export const OUTBOX_MAX_BYTES = 16 * 1024 * 1024;
@@ -101,6 +109,8 @@ export interface ConnectionOptions {
 	ompVersion: string;
 	reconnectMinMs?: number;
 	reconnectMaxMs?: number;
+	/** Ping interval (`KEEPALIVE_MS`); the connection is dropped and reopened after three intervals without a word. */
+	keepaliveMs?: number;
 	outbox?: RelayOutbox;
 	/** Every control message except `scratch-input`; `assign` has already set the lease. */
 	onControl(msg: OrchestratorControl): void;
@@ -248,22 +258,43 @@ export class WorkerConnection {
 			return;
 		}
 		this.#ws = ws;
-		ws.onopen = () => {
-			if (this.#ws !== ws) return;
-			this.#attempt = 0;
-			this.#onOpen();
-		};
-		ws.onmessage = event => {
-			if (this.#ws !== ws) return;
-			this.#onMessage(typeof event.data === "string" ? event.data : Buffer.from(event.data as ArrayBuffer).toString("utf8"));
-		};
-		ws.onclose = event => {
+		// Ping, pong and terminate are Bun's; the DOM lib's WebSocket type shadows them.
+		const client = ws as unknown as Bun.WebSocket;
+		const intervalMs = this.#opts.keepaliveMs ?? KEEPALIVE_MS;
+		const deadMs = KEEPALIVE_DEAD_PINGS * intervalMs;
+		let heard = Date.now();
+		const dropped = (code: number, reason: string) => {
+			clearInterval(watchdog);
 			if (this.#ws !== ws) return;
 			this.#ws = undefined;
-			if (this.#open) log("warn", "worker connection lost", { code: event.code, reason: event.reason || undefined, run: this.#lease?.runId });
+			if (this.#open) log("warn", "worker connection lost", { code, reason: reason || undefined, run: this.#lease?.runId });
+			else log("info", "worker connection attempt failed", { code, reason: reason || undefined, attempt: this.#attempt, run: this.#lease?.runId });
 			this.#setOpen(false);
 			this.#scheduleReconnect();
 		};
+		// Covers the connection attempt too, within one interval: an attempt to an address that no longer answers hangs
+		// until TCP gives up, and the next one may get a fresh address (Bun caches DNS answers for up to 30 s).
+		const watchdog = setInterval(() => {
+			const open = ws.readyState === WebSocket.OPEN;
+			if (open && Date.now() - heard <= deadMs) return client.ping();
+			if (open || ws.readyState === WebSocket.CONNECTING) client.terminate();
+			dropped(1006, open ? `no answer for ${deadMs} ms` : `not connected after ${intervalMs} ms`);
+		}, intervalMs);
+		ws.onopen = () => {
+			if (this.#ws !== ws) return;
+			this.#attempt = 0;
+			heard = Date.now();
+			this.#onOpen();
+		};
+		client.addEventListener("pong", () => {
+			heard = Date.now();
+		});
+		ws.onmessage = event => {
+			heard = Date.now();
+			if (this.#ws !== ws) return;
+			this.#onMessage(typeof event.data === "string" ? event.data : Buffer.from(event.data as ArrayBuffer).toString("utf8"));
+		};
+		ws.onclose = event => dropped(event.code, event.reason);
 		ws.onerror = () => {
 			// `close` follows and schedules the reconnect.
 		};

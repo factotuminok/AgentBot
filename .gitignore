@@ -7,3 +7,4 @@ web-home/
 master.key
 dist/
 .DS_Store
+/secrets/

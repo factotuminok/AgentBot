@@ -5,6 +5,7 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionUISelectItem,
 } from "@oh-my-pi/pi-coding-agent";
+import type { UiMethod } from "./protocol";
 
 /**
  * UI contexts live in the main process (Discord, console) and, as a proxy over IPC, in the agent process. This module
@@ -88,4 +89,26 @@ export async function selectViaAskDialog(
 	);
 	const answer = result.results[0];
 	return answer?.selectedOptions[0] ?? answer?.customInput;
+}
+
+/** Answers a relayed `ui` request (protocol.ts) with the main-process UI `ui`; `notify` is no question and is called apart. */
+export function callUi(
+	ui: Pick<ExtensionUIContext, "askDialog" | "select" | "input" | "editor" | "confirm">,
+	method: Exclude<UiMethod, "notify">,
+	args: unknown[],
+	dialog: object,
+): Promise<unknown> {
+	const a = args as never[];
+	switch (method) {
+		case "askDialog":
+			return ui.askDialog ? ui.askDialog(a[0], dialog) : Promise.reject(new Error("askDialog unsupported"));
+		case "select":
+			return ui.select(a[0], a[1], dialog);
+		case "input":
+			return ui.input(a[0], a[1], dialog);
+		case "editor":
+			return ui.editor(a[0], a[1], dialog);
+		case "confirm":
+			return ui.confirm(a[0], a[1], dialog);
+	}
 }

@@ -19,7 +19,8 @@ export interface FieldDef {
 const MODEL_HELP =
 	"A model id from omp's model list; its provider needs an API key under Secrets (or a sign-in, from a later release). Blank uses omp's default model.";
 
-const CHANNEL_ID_HELP = "In Discord, turn on Developer Mode (User Settings → Advanced), then right-click the channel → Copy Channel ID.";
+const CHANNEL_ID_HELP =
+	"Once the bot token and guild ID are saved, choose it from the list, which shows what the bot is missing in each channel. Before that, enter its ID: in Discord, turn on Developer Mode (User Settings → Advanced), then right-click the channel → Copy Channel ID.";
 
 function stateLabel(key: string, suffix: string, what: string): FieldDef {
 	return {
@@ -57,21 +58,21 @@ export const CONFIG_FIELDS: FieldDef[] = [
 	},
 	{
 		name: "discord.workChannelId",
-		label: "Work channel ID",
+		label: "Work channel",
 		kind: "text",
 		example: "567890123456789012",
-		help: `The one text channel where /work commands are used. Issues of repositories that are not watched get their threads here. It cannot be an ask-only channel or a watch channel. ${CHANNEL_ID_HELP}`,
+		help: `The one text channel where /work commands are used. Issues of repositories that are not watched get their threads here. It cannot be an ask-only channel or a watch channel. The engine starts once it is chosen; on a fresh install, save the bot token and guild ID first, then choose it here. ${CHANNEL_ID_HELP}`,
 	},
 	{
 		name: "discord.watchCategoryId",
-		label: "Watch category ID",
+		label: "Watch category",
 		kind: "text",
 		example: "678901234567890123",
-		help: "Category that /work watch creates repository channels under. The bot needs Manage Channels there. Right-click the category → Copy Category ID. Blank creates them at the top level.",
+		help: "Category that /work watch and the Repositories page create repository channels under. The bot needs Manage Channels there. Once the bot token and guild ID are saved, choose it from the list; before that, right-click the category → Copy Category ID. Blank creates them at the top level.",
 	},
 	{
 		name: "discord.askChannelIds",
-		label: "Ask-only channel IDs",
+		label: "Ask-only channels",
 		kind: "list",
 		example: "789012345678901234",
 		help: `Channels where anyone who can use the channel may run /ask, a general assistant with no repository. Separate several with commas or spaces. A channel cannot also be the work channel or a watch channel. ${CHANNEL_ID_HELP}`,
@@ -353,6 +354,25 @@ function providerRows(form: FormData): { name: string; key: string; remove: bool
 	return rows;
 }
 
+/** Form names of the channel fields (WEB-20); the ask-only control adds `.add` (a dropdown) and `.remove` (checkboxes). */
+export const CHANNEL_FIELDS = { work: "discord.workChannelId", category: "discord.watchCategoryId", ask: "discord.askChannelIds" } as const;
+
+/**
+ * The submitted text of a config field. Ask-only channels come as one typed list, or as one hidden input per channel
+ * with Remove checkboxes and an Add dropdown (WEB-20); they are merged into one list.
+ */
+function submitted(form: FormData, name: string): string {
+	if (name !== CHANNEL_FIELDS.ask) return field(form, name);
+	const removed = new Set(form.getAll(`${name}.remove`));
+	const ids = form
+		.getAll(name)
+		.flatMap(value => (typeof value === "string" ? value.split(/[\s,]+/) : []))
+		.filter(id => id && !removed.has(id));
+	const added = field(form, `${name}.add`).trim();
+	if (added && !ids.includes(added)) ids.push(added);
+	return ids.join(", ");
+}
+
 /**
  * Builds the admin API save request from the settings form; the orchestrator validates it as a whole (§13).
  * Blank optional fields are omitted so schema defaults apply. Blank secret inputs are omitted, which keeps the stored
@@ -361,7 +381,7 @@ function providerRows(form: FormData): { name: string; key: string; remove: bool
 export function saveRequestFromForm(form: FormData): SettingsSaveRequest {
 	const config: Record<string, unknown> = {};
 	for (const def of CONFIG_FIELDS) {
-		const value = parseField(def.kind, field(form, def.name));
+		const value = parseField(def.kind, submitted(form, def.name));
 		if (value !== undefined) setPath(config, def.name, value);
 	}
 	for (const section of Object.keys(SECTION_LABELS)) config[section] ??= {};
@@ -397,7 +417,7 @@ export function formStateFromView(view: SettingsView): SettingsFormState {
 /** Form state echoing a rejected submission. Secret values are dropped; set/not set reflects what is stored. */
 export function formStateFromSubmission(form: FormData, secrets: SecretsView): SettingsFormState {
 	const config: Record<string, string> = {};
-	for (const def of CONFIG_FIELDS) config[def.name] = field(form, def.name);
+	for (const def of CONFIG_FIELDS) config[def.name] = submitted(form, def.name);
 	return {
 		config,
 		providers: providerRows(form)
@@ -406,6 +426,11 @@ export function formStateFromSubmission(form: FormData, secrets: SecretsView): S
 		discordTokenSet: secrets.discordToken,
 		githubAppPrivateKeySet: secrets.githubAppPrivateKey,
 	};
+}
+
+/** What a settings save reports (ENG-02), on the Settings page and in VS Code after a `settings.json` save (WEB-28). */
+export function settingsSavedText(result: { phase: string; error?: string }): string {
+	return `Settings saved. Engine is ${result.phase}${result.error ? `: ${result.error.replace(/\.$/, "")}` : ""}.`;
 }
 
 export const MIN_PASSWORD_CHARS = 12;

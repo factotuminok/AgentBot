@@ -1,10 +1,12 @@
-import type { WorkerStatus } from "../../shared/adminApi";
+import type { RunStatus, WorkerStatus } from "../../shared/adminApi";
+import type { Loadout } from "../../shared/agent";
 import { existsSync } from "node:fs";
 import type { ServerWebSocket, WebSocketHandler } from "bun";
-import { errorMessage, log, writeLogSink } from "../../shared/log";
+import { addLogSecret, errorMessage, log, removeLogSecret, writeRelayedLogLine } from "../../shared/log";
 import { MCP_TEST_TIMEOUT_MS, type McpServer, parseOmpConfig } from "../../shared/ompconfig";
 import type { ChildMessage, Reply, UiMethod } from "../../shared/protocol";
 import type { RunUsage } from "../../shared/transcript";
+import { callUi } from "../../shared/ui";
 import {
 	type DownMessage,
 	LEASE_MS,
@@ -15,9 +17,14 @@ import {
 	type WorkerControl,
 	type WorkerPhase,
 } from "../../shared/wire";
-import type { Db, RunOutcome, RunOwnerColumn, RunRow } from "../store/db";
+import { type ClaimedRun, type Db, parseJson, type RunOutcome, type RunOwnerColumn, type RunRow } from "../store/db";
+import type { Config } from "../../shared/config";
 import { sessionPath } from "../store/sessions";
-import { changedOutputs, createArtifactHandler } from "./artifacts";
+import { createGitEndpoint } from "../git/endpoint";
+import type { Repos } from "../git/repos";
+import type { OmpRuntimeSource } from "../omp/updates";
+import { changedOutputs, createArtifactHandler, MAX_BUNDLE_BYTES, STATE_FREE_FLOOR_BYTES } from "./artifacts";
+import { createRunRefs, type PreparedCheckout, prepareCheckout, readRepoConfig } from "./checkouts";
 import {
 	type AbortReason,
 	type Dispatcher,
@@ -30,10 +37,10 @@ import {
 	type RunOwner,
 	type RunRequest,
 	type RunResult,
-	type RunUi,
 	type SteerOptions,
 	UI_CALL_CONTEXT,
 	type UiCallContext,
+	writesCode,
 } from "./dispatcher";
 import { claimNextRun, holdsLease, newLeaseToken, sameToken } from "./leases";
 import { type RunRelay, runRelay } from "./relay";
@@ -54,10 +61,20 @@ export interface DispatchLimits {
 	maxConcurrentRuns: number;
 }
 
+/**
+ * The caps for the saved settings' `config`. Without it (settings unsaved, invalid or locked) no job or chat can start,
+ * but MCP connection tests (AGT-21) still run, up to the worker capacity: an admin can test servers before the first save.
+ */
+export function dispatchLimits(config: Pick<Config, "limits" | "workers"> | undefined, workerCapacity: number): DispatchLimits {
+	if (!config) return { maxConcurrentJobs: 0, maxChatSessions: 0, maxConcurrentRuns: workerCapacity };
+	const { maxConcurrentJobs, maxChatSessions } = config.limits;
+	return { maxConcurrentJobs, maxChatSessions, maxConcurrentRuns: config.workers.maxConcurrentRuns ?? workerCapacity };
+}
+
 export interface WorkerDispatcherOptions {
 	db: Db;
 	stateDir: string;
-	/** RUN-01 caps, read whenever a slot may have opened; undefined while settings are locked or unsaved: nothing new becomes pending. */
+	/** RUN-01 caps, read whenever a slot may have opened (`dispatchLimits`); undefined: nothing new becomes pending. */
 	limits(): DispatchLimits | undefined;
 	/** `workers.reattachGraceSeconds` in ms, applied once at start to runs left `assigned` or `running` (RUN-07). */
 	reattachGraceMs: number;
@@ -72,6 +89,20 @@ export interface WorkerDispatcherOptions {
 	/** Lease length (default `LEASE_MS`) and how often expired leases are swept (default 1 s); shorter in tests. */
 	leaseMs?: number;
 	sweepMs?: number;
+	/** Mirrors and runs repos (WS-01, RUN-17 to RUN-20). */
+	repos: Repos;
+	/** In-place omp updates (UPD-07, UPD-08): the copy runs are given, its archive, canary failures; none outside the image. */
+	ompRuntime?: OmpRuntimeSource;
+	/**
+	 * Architecture §6, `AGENTBOT_WORKER_ADDRESS_BINDING`: a worker id stays bound to the network address it first said
+	 * hello from, and an address holds one claim at a time (none for 60 s after its last one ended). Off only where
+	 * workers share a source address (a service mesh, or local worker processes in tests).
+	 */
+	bindWorkerAddresses: boolean;
+	/** `AGENTBOT_WORKER_DISK` (STO-06): checkpoint and result bundles above it are refused; default `MAX_BUNDLE_BYTES`. */
+	workerDiskBytes?: number;
+	/** Free space the state volume keeps: uploads that would go below it are refused; default `STATE_FREE_FLOOR_BYTES`. */
+	stateFreeFloorBytes?: number;
 }
 
 /** `ws.data` of a worker WebSocket; `server.ts` creates it with `socketData` when it upgrades (after the worker-token check). */
@@ -87,6 +118,10 @@ export interface WorkerDispatcher extends Dispatcher {
 	readonly websocket: WebSocketHandler<WorkerSocketData>;
 	/** `/internal/runs/<id>/…`, lease-token authorised. */
 	artifact(req: Request): Promise<Response>;
+	/** `/internal/git/<owner>/<name>.git/…`: read-only git from the mirror of the lease's repo (RUN-17). */
+	git(req: Request): Promise<Response>;
+	/** Settles when the start-up pass is done: refs of finished runs not kept for Retry pruned, unused mirrors deleted (WS-07, WS-01). */
+	maintenance(): Promise<void>;
 	/** Stops timers (RUN-09: never aborts runs). */
 	close(): void;
 }
@@ -96,6 +131,10 @@ const CREDENTIAL_ANSWER_MS = 9_500;
 /** After `assign`, an mcp-test result must arrive within its timeout plus this (worker start, transfer). */
 const MCP_TEST_SLACK_MS = 10_000;
 const ACTIVE_STATES = ["pending", "assigned", "running", "finishing", "lost"] as const;
+/** WS-01: how often unused mirrors are looked for after the one pass at start. */
+const MIRROR_EXPIRY_MS = 24 * 3_600_000;
+/** Architecture §6: how long an address can't claim after a claim from it ended (its worker may still be exiting). */
+const ADDRESS_QUIET_MS = 60_000;
 
 type StoredOutcome = { ok: true; result: RunResult } | { ok: false; error: { name: string; message: string }; usage: RunUsage };
 
@@ -157,6 +196,9 @@ interface Run {
 	registered: boolean;
 	conn: Conn | undefined;
 	usage: RunUsage;
+	/** Tool of the latest progress report and the reported loadout, for the status page (§9.3); lost on restart. */
+	lastTool: string | undefined;
+	loadout: Loadout | undefined;
 	aborted: AbortReason | undefined;
 	/** Steers waiting for `registered`. */
 	queued: Steer[];
@@ -185,6 +227,8 @@ interface McpTask {
 	leaseExpiresAt?: number;
 	timer?: ReturnType<typeof setTimeout>;
 	resolve(result: { ok: boolean; tools: string[]; error?: string }): void;
+	/** A worker picked the test up: its timeout starts now. */
+	onStarted?(): void;
 }
 
 const ZERO_USAGE: RunUsage = { costUsd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -209,26 +253,18 @@ function rowOwner(row: RunRow): RunOwner {
 	return { kind: "draft", draftId: row.draft_id ?? "" };
 }
 
+/** The part of a run request that defines the turn and survives in the `runs` row; the rest are the live engine's closures. */
+type RunTurn = Pick<RunRequest, "profile" | "prompt" | "outputSchema" | "model" | "thinking" | "limits" | "session" | "resume" | "threadId" | "scratchDir">;
+
+function turnOf(req: RunRequest): RunTurn {
+	const { profile, prompt, outputSchema, model, thinking, limits, session, resume, threadId, scratchDir } = req;
+	return { profile, prompt, outputSchema, model, thinking, limits, session, resume, threadId, scratchDir };
+}
+
 function toError(error: { name: string; message: string }): Error {
 	if (error.name === "RunLost") return new RunLost();
 	if (error.name === "NoStructuredOutput") return new NoStructuredOutput();
 	return new Error(error.message);
-}
-
-function callUi(ui: RunUi, method: Exclude<UiMethod, "notify">, args: unknown[], dialog: object): Promise<unknown> {
-	const a = args as never[];
-	switch (method) {
-		case "askDialog":
-			return ui.askDialog ? ui.askDialog(a[0], dialog) : Promise.reject(new Error("askDialog unsupported"));
-		case "select":
-			return ui.select(a[0], a[1], dialog);
-		case "input":
-			return ui.input(a[0], a[1], dialog);
-		case "editor":
-			return ui.editor(a[0], a[1], dialog);
-		case "confirm":
-			return ui.confirm(a[0], a[1], dialog);
-	}
 }
 
 function guard(what: string, fn: () => void, fields: Record<string, unknown> = {}): void {
@@ -260,7 +296,32 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 	const conns = new Map<WorkerSocketData, Conn>();
 	const claimers: Conn[] = [];
 	const relays = new Map<string, RunRelay>();
-	const artifacts = createArtifactHandler({ db, stateDir: opts.stateDir, skills: opts.skills });
+	/** Runs admitted past their caps whose checkout is being prepared (RUN-17): they count as active, not yet `pending`. */
+	const preparing = new Set<Run>();
+	/** When a connection holding a run or mcp test last closed, by address (architecture §6 quiet period). */
+	const released = new Map<string, number>();
+	/** Live lease tokens by run or mcp-test id: masked in every log line while they open anything (F9). */
+	const liveLeases = new Map<string, string>();
+	const leaseLive = (id: string, token: string): void => {
+		liveLeases.set(id, token);
+		addLogSecret(token);
+	};
+	const leaseEnded = (id: string): void => {
+		removeLogSecret(liveLeases.get(id));
+		liveLeases.delete(id);
+	};
+	const refs = createRunRefs(db, opts.repos);
+	const artifacts = createArtifactHandler({
+		db,
+		stateDir: opts.stateDir,
+		skills: opts.skills,
+		repos: opts.repos,
+		refs,
+		ompRuntime: opts.ompRuntime,
+		bundleLimitBytes: Math.min(MAX_BUNDLE_BYTES, opts.workerDiskBytes ?? MAX_BUNDLE_BYTES),
+		freeFloorBytes: opts.stateFreeFloorBytes ?? STATE_FREE_FLOOR_BYTES,
+	});
+	const gitEndpoint = createGitEndpoint({ repos: opts.repos, authorize: token => db.runForLease(token)?.repo ?? undefined });
 
 	const relayOf = (id: string): RunRelay => {
 		let relay = relays.get(id);
@@ -304,6 +365,8 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			registered: false,
 			conn: undefined,
 			usage: ZERO_USAGE,
+			lastTool: undefined,
+			loadout: undefined,
 			aborted: undefined,
 			queued: [],
 			sent: new Map(),
@@ -386,6 +449,8 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				for (const q of db.questionsForRun(id)) db.deleteQuestion(id, q.request_id);
 			})();
 			artifacts.release(id);
+			leaseEnded(id);
+			refs.settle(id, dbOutcome).catch(err => log("warn", "settling the run's refs failed", { run: id, error: errorMessage(err) }));
 		}
 		const index = waiting.indexOf(run);
 		if (index >= 0) waiting.splice(index, 1);
@@ -423,9 +488,67 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			if (row.job_id) job++;
 			else chat++;
 		}
+		for (const run of preparing) {
+			if (run.category === "job") job++;
+			else chat++;
+		}
 		let mcp = 0;
 		for (const task of tasks.values()) if (task.state === "pending" || task.state === "assigned") mcp++;
 		return { job, chat, total: job + chat + mcp };
+	}
+
+	/** The run becomes claimable: its `runs` row is inserted as `pending`, with its checkout when it has one. */
+	function insertPending(entry: Run, prepared: PreparedCheckout | undefined): void {
+		const req = entry.req!;
+		const [column, ownerId] = ownerColumn(entry.owner);
+		try {
+			const row = db.insertRun({
+				kind: req.kind,
+				jobId: column === "job_id" ? ownerId : undefined,
+				chatThreadId: column === "chat_thread_id" ? ownerId : undefined,
+				planThreadId: column === "plan_thread_id" ? ownerId : undefined,
+				draftId: column === "draft_id" ? ownerId : undefined,
+				threadId: req.threadId,
+				repo: prepared?.repo,
+				startRef: prepared?.startRef,
+				startCommit: prepared?.startCommit,
+				setupCommand: prepared?.setupCommand,
+				continuesRunId: prepared?.continuesRunId,
+				sessionKey: req.session,
+				scratchDir: req.scratchDir,
+				request: JSON.stringify(turnOf(req)),
+			});
+			entry.id = row.id;
+			byId.set(row.id, entry);
+			log("info", "run pending", {
+				run: row.id,
+				owner: entry.key,
+				kind: req.kind,
+				...(prepared ? { repo: prepared.repo, start: prepared.startRef, commit: prepared.startCommit, continues: prepared.continuesRunId } : {}),
+			});
+		} catch (err) {
+			finishRun(entry, errorOutcome(entry, err), "failed");
+		}
+	}
+
+	/** RUN-17: fetch the mirror and fix the start commit before the run becomes `pending`; the slot is held meanwhile. */
+	async function prepare(entry: Run): Promise<void> {
+		let prepared: PreparedCheckout | undefined;
+		let failure: unknown;
+		try {
+			prepared = await prepareCheckout(opts.repos, db, entry.req!);
+		} catch (err) {
+			failure = err;
+		}
+		preparing.delete(entry);
+		// Aborted (or otherwise ended) while the mirror was fetched: its slot is free again.
+		if (entry.outcome) return admit();
+		if (prepared) insertPending(entry, prepared);
+		else {
+			log("warn", "run checkout preparation failed", { owner: entry.key, repo: entry.req?.checkout?.repo, error: errorMessage(failure) });
+			finishRun(entry, errorOutcome(entry, failure), "failed");
+		}
+		admit();
 	}
 
 	/** Moves waiting runs and mcp tests to `pending` as far as the caps allow, oldest first. */
@@ -447,27 +570,12 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 					continue;
 				}
 				waiting.splice(i, 1);
-				const req = entry.req!;
-				const [column, ownerId] = ownerColumn(entry.owner);
-				try {
-					const row = db.insertRun({
-						kind: req.kind,
-						jobId: column === "job_id" ? ownerId : undefined,
-						chatThreadId: column === "chat_thread_id" ? ownerId : undefined,
-						planThreadId: column === "plan_thread_id" ? ownerId : undefined,
-						draftId: column === "draft_id" ? ownerId : undefined,
-						threadId: req.threadId,
-						sessionKey: req.session,
-						scratchDir: req.scratchDir,
-					});
-					entry.id = row.id;
-					byId.set(row.id, entry);
-					counts[entry.category]++;
-					counts.total++;
-					log("info", "run pending", { run: row.id, owner: entry.key, kind: req.kind });
-				} catch (err) {
-					finishRun(entry, errorOutcome(entry, err), "failed");
-				}
+				counts[entry.category]++;
+				counts.total++;
+				if (entry.req!.checkout) {
+					preparing.add(entry);
+					prepare(entry).catch(err => log("error", "run admission failed", { owner: entry.key, error: errorMessage(err) }));
+				} else insertPending(entry, undefined);
 			}
 		}
 		match();
@@ -490,11 +598,15 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			const conn = claimers.shift()!;
 			clearTimeout(conn.claimTimer);
 			if (!conn.open || !conn.workerId) continue;
+			if (addressBusy(conn)) {
+				send(conn, { t: "nothing" });
+				continue;
+			}
 			if (task && (!row || task.createdAt <= Date.parse(row.created_at))) {
 				assignTask(conn, task);
 				continue;
 			}
-			const claimed = claimNextRun(db, conn.workerId, leaseMs);
+			const claimed = claimNextRun(db, conn.workerId, leaseMs, conn.address);
 			if (!claimed) {
 				send(conn, { t: "nothing" });
 				continue;
@@ -503,19 +615,32 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		}
 	}
 
+	/**
+	 * Architecture §6: another connection from `conn`'s address holds a run or mcp test, or one claimed from it ended
+	 * less than `ADDRESS_QUIET_MS` ago. The runs table keeps the address, so this holds across a restart.
+	 */
+	function addressBusy(conn: Conn): boolean {
+		if (!opts.bindWorkerAddresses) return false;
+		for (const other of conns.values()) if (other !== conn && other.address === conn.address && other.runId) return true;
+		const since = Date.now() - ADDRESS_QUIET_MS;
+		if ((released.get(conn.address) ?? 0) > since) return true;
+		return db.addressHoldsRun(conn.address, new Date(since));
+	}
+
 	function bind(conn: Conn, run: Run): void {
 		if (run.conn && run.conn !== conn) run.conn.runId = undefined;
 		run.conn = conn;
 		conn.runId = run.id;
 	}
 
-	async function assignRun(conn: Conn, row: RunRow): Promise<void> {
+	async function assignRun(conn: Conn, row: ClaimedRun): Promise<void> {
 		const run = byId.get(row.id)!;
 		bind(conn, run);
 		log("info", "run claimed", { run: row.id, worker: conn.workerId });
 		let spec: RunSpec;
 		try {
-			spec = await buildRunSpec(row.id, run.req!, opts.spec);
+			const previous = row.continues_run_id ? db.getRun(row.continues_run_id) : null;
+			spec = await buildRunSpec(row, run.req!, opts.spec, previous !== null && refs.restoreKind(previous) !== undefined, opts.ompRuntime?.forRun(row.id));
 		} catch (err) {
 			log("error", "run spec failed", { run: row.id, error: errorMessage(err) });
 			const holder = run.conn;
@@ -525,7 +650,8 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		}
 		const now = db.getRun(row.id);
 		if (run.outcome || now?.lease_token !== row.lease_token || now?.state !== "assigned") return;
-		send(run.conn, { t: "assign", runId: row.id, token: row.lease_token!, kind: "run", spec });
+		leaseLive(row.id, row.leaseToken);
+		send(run.conn, { t: "assign", runId: row.id, token: row.leaseToken, kind: "run", spec });
 	}
 
 	function assignTask(conn: Conn, task: McpTask): void {
@@ -536,10 +662,12 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		task.state = "assigned";
 		task.workerId = conn.workerId;
 		task.token = newLeaseToken();
+		leaseLive(task.id, task.token);
 		task.conn = conn;
 		task.leaseExpiresAt = Date.now() + leaseMs;
 		conn.runId = task.id;
 		sendTaskAssign(task);
+		guard("mcp test start sink", () => task.onStarted?.());
 		task.timer = setTimeout(
 			() => settleTask(task, { ok: false, tools: [], error: `no answer from the worker within ${(MCP_TEST_TIMEOUT_MS + MCP_TEST_SLACK_MS) / 1000} s` }),
 			MCP_TEST_TIMEOUT_MS + MCP_TEST_SLACK_MS,
@@ -562,6 +690,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		task.state = "done";
 		clearTimeout(task.timer);
 		tasks.delete(task.id);
+		leaseEnded(task.id);
 		if (wasWaiting) waiting.splice(waiting.indexOf(task), 1);
 		send(task.conn, { t: "lease-invalid", runId: task.id });
 		task.resolve(result);
@@ -573,6 +702,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 	function sweep(): void {
 		const { requeued, lost } = db.expireLeases();
 		for (const row of requeued) {
+			leaseEnded(row.id);
 			const run = byId.get(row.id);
 			if (run?.conn) {
 				run.conn.runId = undefined;
@@ -599,6 +729,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				settleTask(task, { ok: false, tools: [], error: new RunLost().message });
 			}
 		}
+		for (const [address, at] of released) if (at <= now - ADDRESS_QUIET_MS) released.delete(address);
 		if (requeued.length > 0 || waiting.length > 0) admit();
 	}
 
@@ -646,8 +777,12 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		run.aborted = reason;
 		const state = rowState(run);
 		log("info", "run abort requested", { run: run.id, owner: run.key, reason, state });
+		if (state === "assigned" && !run.conn?.open) {
+			// RUN-05: its worker is away and may have started the run meanwhile: finished when it re-announces, or at lease expiry.
+			return;
+		}
 		if (!run.id || state === "pending" || state === "assigned") {
-			// Nothing ran yet: finish now; a worker holding the lease is told to stop (now, or when it re-announces).
+			// Nothing ran yet: finish now; the worker holding the lease is told to stop.
 			const holder = run.conn;
 			finishRun(run, abortedOutcome(run, reason), "aborted");
 			if (run.id) send(holder, { t: "lease-invalid", runId: run.id });
@@ -728,6 +863,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		switch (msg.t) {
 			case "progress":
 				run.usage = msg.usage;
+				if (msg.tool) run.lastTool = msg.tool;
 				guard("progress sink", () => hooks?.onProgress?.({ tool: msg.tool, intent: msg.intent, usage: msg.usage, elapsedMs: msg.elapsedMs }), fields);
 				return;
 			case "transcript":
@@ -737,13 +873,17 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				guard("todo sink", () => hooks?.onTodos?.(msg.todos), fields);
 				return;
 			case "loadout":
+				run.loadout = msg.loadout;
 				guard("loadout sink", () => hooks?.onLoadout?.(msg.loadout), fields);
 				return;
 			case "usage":
 				run.usage = msg.usage;
 				return;
 			case "log":
-				writeLogSink(msg.line);
+				// F9: one JSON object per line, attributed here; anything else could forge entries and is dropped.
+				if (!writeRelayedLogLine(msg.line, { component: "agent-host", ...(run.id ? { run: run.id } : {}) })) {
+					log("warn", "relayed agent host log line dropped: not one JSON object on one line", { run: run.id, bytes: msg.line.length });
+				}
 				return;
 			case "session_file":
 				// The worker uploaded the session before relaying this (RUN-18); the host waits for this reply.
@@ -801,6 +941,14 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				const r = msg.result;
 				const row = db.getRun(run.id!);
 				const outputs = row?.scratch_dir ? await changedOutputs(row) : undefined;
+				// RUN-19: the worker uploaded the result bundle before relaying this; none means no new commits.
+				let code: RunResult["code"];
+				try {
+					if (row?.repo && writesCode(row.kind)) code = { runId: row.id, commits: await refs.resultCommits(row) };
+				} catch (err) {
+					finishRun(run, errorOutcome(run, new Error(`The run's result could not be read: ${errorMessage(err)}`)), "failed");
+					return;
+				}
 				const result: RunResult = {
 					output: r.output,
 					usage: r.usage,
@@ -808,6 +956,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 					oomKills: r.oomKills,
 					hasSession: sessionExists(run),
 					...(outputs ? { outputs } : {}),
+					...(code ? { code } : {}),
 				};
 				run.usage = r.usage;
 				finishRun(run, { ok: true, result }, r.aborted ? "aborted" : "succeeded");
@@ -839,6 +988,15 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 
 	function onHello(conn: Conn, msg: Extract<WorkerControl, { t: "hello" }>): void {
 		if (conn.workerId) return;
+		if (opts.bindWorkerAddresses) {
+			const bound = db.bindWorkerAddress(msg.workerId, conn.address);
+			if (bound !== conn.address) {
+				// Architecture §6: a worker id belongs to the address it first came from; nobody else may take it over.
+				log("warn", "worker id used from another address; refused", { worker: msg.workerId, address: conn.address, bound });
+				conn.ws.close(1008, "worker id bound to another address");
+				return;
+			}
+		}
 		for (const other of conns.values()) {
 			if (other !== conn && other.workerId === msg.workerId) {
 				log("warn", "worker reconnected; closing its previous connection", { worker: msg.workerId });
@@ -869,7 +1027,14 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		}
 		const run = ensureRun(row);
 		bind(conn, run);
+		leaseLive(runId, token);
 		log("info", "worker re-attached", { worker: msg.workerId, run: runId });
+		if (run.aborted && rowState(run) === "assigned") {
+			// RUN-05: an abort requested while its worker was away.
+			finishRun(run, abortedOutcome(run, run.aborted), "aborted");
+			send(conn, { t: "lease-invalid", runId });
+			return;
+		}
 		resend(run);
 		if (run.registered) for (const s of run.queued.splice(0)) sendSteer(run, s);
 	}
@@ -880,6 +1045,11 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		if (previous !== null) {
 			// One claim per worker id, ever (architecture §6); an assignment lost in a reconnect goes back to pending at lease expiry (RUN-02).
 			log("warn", "second claim refused", { worker: workerId, claimed: previous });
+			send(conn, { t: "nothing" });
+			return;
+		}
+		if (addressBusy(conn)) {
+			log("warn", "claim refused: this address already holds a claim", { worker: workerId, address: conn.address });
 			send(conn, { t: "nothing" });
 			return;
 		}
@@ -966,6 +1136,12 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				db.updateRun(msg.runId, { omp_version: msg.ompVersion });
 				return;
 			}
+			case "omp-runtime-failed": {
+				if (!heldRun(conn, msg.runId)) return;
+				const { t: _t, ...report } = msg;
+				guard("omp runtime canary report", () => opts.ompRuntime?.canaryFailed(report), { run: msg.runId, copy: msg.copy });
+				return;
+			}
 			case "setup-output":
 				log("info", "setup command finished", { run: msg.runId, exitCode: msg.exitCode, tail: msg.tail });
 				return;
@@ -1007,6 +1183,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 	function onClose(conn: Conn): void {
 		if (conn.closed) return;
 		conn.closed = true;
+		if (conn.runId) released.set(conn.address, Date.now());
 		conn.open = false;
 		conns.delete(conn.ws.data);
 		clearTimeout(conn.claimTimer);
@@ -1059,13 +1236,27 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 
 	// ── Start: RUN-07 ────────────────────────────────────────────────────────────────────────
 
-	for (const row of db.runsInState("pending")) dropOrphan(row);
+	// NFR-03: a run still pending has no worker and its request (closures included) was only in memory, so its row is
+	// finished; its turn is kept for the reattach grace so the owner's engine, re-attaching on start, re-issues the same turn.
+	const reissue = new Map<string, RunTurn>();
+	for (const row of db.runsInState("pending")) {
+		const turn = row.request ? parseJson<RunTurn>(row.request) : undefined;
+		if (turn) reissue.set(ownerKey(rowOwner(row)), turn);
+		dropOrphan(row);
+	}
+	const reissueExpiry = setTimeout(() => reissue.clear(), opts.reattachGraceMs);
 	for (const row of db.runsInState("lost", "finishing")) {
 		const run = ensureRun(row);
 		finishRun(run, { ok: false, error: { name: "RunLost", message: new RunLost().message }, usage: ZERO_USAGE }, "lost");
 	}
 	db.graceLeases(opts.reattachGraceMs);
 	const sweeper = setInterval(() => guard("lease sweep", sweep), opts.sweepMs ?? 1000);
+	// WS-07, RUN-20: refs of runs that are finished and not kept for Retry go at start; WS-01: unused mirrors go daily.
+	const maintenance = (async () => {
+		await refs.prune();
+		await refs.expireMirrors();
+	})().catch(err => log("warn", "start-up run ref maintenance failed", { error: errorMessage(err) }));
+	const mirrorExpiry = setInterval(() => void refs.expireMirrors(), MIRROR_EXPIRY_MS);
 
 	// ── Dispatcher API ──────────────────────────────────────────────────────────────────────
 
@@ -1075,8 +1266,9 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			reject(new RunDetached());
 			return promise;
 		}
-		// The newest caller's request carries the live engine's closures (create_issue).
-		run.req = req;
+		// The newest caller's request carries the live engine's closures (create_issue); the turn stays the one requested
+		// (an engine re-attaching after a restart asks with no turn of its own).
+		run.req = run.req ? { ...req, ...turnOf(run.req) } : req;
 		const previous = run.caller;
 		if (previous) {
 			previous.cleanup();
@@ -1125,18 +1317,28 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			}
 			if (run) return attach(run, req, hooks, signal);
 			if (signal?.aborted) return Promise.reject(new RunDetached());
-			const reason = unrunnableReason(req);
+			const kept = reissue.get(key);
+			reissue.delete(key);
+			const turnReq: RunRequest = kept ? { ...req, ...kept } : req;
+			if (kept) log("info", "pending run re-issued after restart", { owner: key });
+			const reason = unrunnableReason(turnReq);
 			if (reason) return Promise.reject(new Error(reason));
-			const fresh = newRun(req.owner, req);
+			const fresh = newRun(req.owner, turnReq);
 			runs.set(key, fresh);
 			waiting.push(fresh);
-			const result = attach(fresh, req, hooks, signal);
+			const result = attach(fresh, turnReq, hooks, signal);
 			admit();
 			return result;
+		},
+		hasRun(owner) {
+			if (runs.has(ownerKey(owner)) || reissue.has(ownerKey(owner))) return true;
+			const [column, ownerId] = ownerColumn(owner);
+			return db.currentRun(column, ownerId) !== null;
 		},
 		hasUnfinishedRun(owner) {
 			const run = runs.get(ownerKey(owner));
 			if (run) return !run.outcome;
+			if (reissue.has(ownerKey(owner))) return true;
 			const [column, ownerId] = ownerColumn(owner);
 			const row = db.currentRun(column, ownerId);
 			return row !== null && row.state !== "finished";
@@ -1170,12 +1372,44 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				return { ok: false, tools: [], error: errorMessage(err) };
 			}
 			const { promise, resolve } = Promise.withResolvers<{ ok: boolean; tools: string[]; error?: string }>();
-			const task: McpTask = { type: "mcp", id: `mcp-${crypto.randomUUID()}`, name: spec.name, server, createdAt: Date.now(), state: "waiting", resolve };
+			const task: McpTask = {
+				type: "mcp",
+				id: `mcp-${crypto.randomUUID()}`,
+				name: spec.name,
+				server,
+				createdAt: Date.now(),
+				state: "waiting",
+				resolve,
+				...(testOpts?.onStarted ? { onStarted: testOpts.onStarted } : {}),
+			};
 			tasks.set(task.id, task);
 			waiting.push(task);
 			guard("waiting sink", () => testOpts?.onWaitingForWorker?.());
 			admit();
 			return promise;
+		},
+		activeRuns() {
+			return db.runsInState("pending", "assigned", "running", "finishing").map(row => {
+				const run = byId.get(row.id);
+				const claimed = row.state !== "pending" && row.claimed_at ? row.claimed_at : undefined;
+				const status: RunStatus = {
+					id: row.id,
+					kind: row.kind,
+					state: row.state as RunStatus["state"],
+					owner: ownerKey(rowOwner(row)),
+					createdAt: row.created_at,
+					usage: run?.usage ?? ZERO_USAGE,
+				};
+				if (row.repo) status.repo = row.repo;
+				if (row.thread_id) status.threadId = row.thread_id;
+				if (row.worker_id && row.state !== "pending") status.workerId = row.worker_id;
+				if (claimed) status.claimedAt = claimed;
+				if (row.started_at) status.startedAt = row.started_at;
+				if (claimed && row.started_at) status.setupMs = Math.max(0, Date.parse(row.started_at) - Date.parse(claimed));
+				if (run?.lastTool) status.lastTool = run.lastTool;
+				if (run?.loadout) status.loadout = run.loadout;
+				return status;
+			});
 		},
 		workers() {
 			const list: WorkerStatus[] = [];
@@ -1201,8 +1435,33 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		socketData: address => ({ address }),
 		websocket,
 		artifact: req => artifacts.handle(req),
+		git: req => gitEndpoint(req),
+		async pushResult(runId, branch, token) {
+			const row = db.getRun(runId);
+			if (!row?.repo || !row.has_result) throw new Error(`run ${runId} keeps no result to push`);
+			const outcome = await opts.repos.push(row.repo, runId, branch, token);
+			log(outcome.pushed ? "info" : "warn", outcome.pushed ? "run result pushed" : "run result push rejected: the branch moved", {
+				run: runId,
+				repo: row.repo,
+				branch,
+				...(outcome.pushed ? { sha: outcome.sha } : {}),
+			});
+			return outcome;
+		},
+		async discardResult(runId) {
+			const row = db.getRun(runId);
+			if (row) await refs.release(row, ["result"]);
+		},
+		releaseIssue: issueId => refs.releaseIssue(issueId),
+		async repoConfig(checkout) {
+			const { baseBranch, setupCommand } = await readRepoConfig(opts.repos, checkout);
+			return { baseBranch, ...(setupCommand ? { setupCommand } : {}) };
+		},
+		maintenance: () => maintenance,
 		close() {
 			clearInterval(sweeper);
+			clearInterval(mirrorExpiry);
+			clearTimeout(reissueExpiry);
 			for (const conn of claimers.splice(0)) clearTimeout(conn.claimTimer);
 			for (const task of tasks.values()) clearTimeout(task.timer);
 		},

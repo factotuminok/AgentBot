@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createAdminApi } from "../../src/orchestrator/api/admin";
 import { type InternalApi, startInternalApi } from "../../src/orchestrator/api/server";
 import {
 	type RunHandle,
@@ -13,10 +14,14 @@ import {
 	uiCallContext,
 } from "../../src/orchestrator/dispatch/dispatcher";
 import { createWorkerDispatcher, type DispatchLimits, type WorkerDispatcher } from "../../src/orchestrator/dispatch/workers";
+import { createController } from "../../src/orchestrator/engine/controller";
+import { createRepos } from "../../src/orchestrator/git/repos";
+import { openAgentLog } from "../../src/orchestrator/store/agentlog";
 import { type Db, dbPath, openDb } from "../../src/orchestrator/store/db";
+import { openVault } from "../../src/orchestrator/store/vault";
 import type { ChildMessage } from "../../src/shared/protocol";
 import type { RunUsage } from "../../src/shared/transcript";
-import { type DownMessage, runArtifactPath, type UpMessage, WORKER_WS_PATH } from "../../src/shared/wire";
+import { type DownMessage, GIT_PATH_PREFIX, runArtifactPath, type UpMessage, WORKER_WS_PATH } from "../../src/shared/wire";
 
 /**
  * The dispatcher against scripted WebSocket clients acting as workers (no worker process): claims, the relay in both
@@ -25,6 +30,7 @@ import { type DownMessage, runArtifactPath, type UpMessage, WORKER_WS_PATH } fro
 
 const WORKER_TOKEN = "worker-token";
 const SCALE_TOKEN = "scale-token";
+const WEB_TOKEN = "web-token";
 const USAGE: RunUsage = { costUsd: 0.25, input: 100, output: 20, cacheRead: 0, cacheWrite: 0 };
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -51,7 +57,7 @@ interface Orchestrator {
 interface Setup {
 	stateDir: string;
 	limits: { value: DispatchLimits | undefined };
-	start(opts?: { graceMs?: number }): Promise<Orchestrator>;
+	start(opts?: { graceMs?: number; bindWorkerAddresses?: boolean }): Promise<Orchestrator>;
 }
 
 async function setup(): Promise<Setup> {
@@ -80,7 +86,14 @@ async function setup(): Promise<Setup> {
 				claimWaitMs: 1500,
 				leaseMs: 600,
 				sweepMs: 25,
+				repos: createRepos({ stateDir }),
+				// Every fake worker connects from 127.0.0.1; only the architecture §6 test turns this on.
+				bindWorkerAddresses: opts.bindWorkerAddresses ?? false,
 			});
+			// The real admin API (SEC-14: only the web token gets past it); the controller is never started here.
+			const vault = await openVault(db);
+			const controller = createController({ stateDir, db, vault, agentLog: await openAgentLog({ dir: join(stateDir, "logs", "agent") }), dispatcher });
+			const admin = createAdminApi({ db, vault, controller, dispatcher, version: "0.0.0-test", workerCapacity: 4, webToken: WEB_TOKEN, setupToken: undefined });
 			const api = startInternalApi({
 				host: "127.0.0.1",
 				port: 0,
@@ -91,7 +104,7 @@ async function setup(): Promise<Setup> {
 				phase: () => "running",
 				config: () => undefined,
 				dispatcher,
-				admin: { handle: async () => new Response("admin") },
+				admin,
 				workers: dispatcher,
 				workerToken: WORKER_TOKEN,
 				scaleToken: SCALE_TOKEN,
@@ -578,11 +591,18 @@ describe("worker dispatcher", () => {
 
 		// The chat slot is taken, but an mcp test only needs a run slot.
 		let mcpWaiting = 0;
-		const tested = o.dispatcher.mcpTest({ name: "echo", server: { command: "echo" } }, { onWaitingForWorker: () => void mcpWaiting++ });
+		let mcpStarted = 0;
+		const tested = o.dispatcher.mcpTest(
+			{ name: "echo", server: { command: "echo" } },
+			{ onWaitingForWorker: () => void mcpWaiting++, onStarted: () => void mcpStarted++ },
+		);
 		expect(mcpWaiting).toBe(1);
 		expect(o.dispatcher.counts().pending).toBe(1);
+		// AGT-21: the test's timeout starts only when a worker picks it up.
+		expect(mcpStarted).toBe(0);
 		const tester = await FakeWorker.connect(o.api.url, "worker-mcp");
 		const mcpAssign = await tester.claim();
+		expect(mcpStarted).toBe(1);
 		expect(mcpAssign).toMatchObject({ kind: "mcp-test", mcp: { name: "echo", server: { command: "echo" }, timeoutMs: 20_000 } });
 		tester.send({ t: "mcp-test-result", runId: mcpAssign.runId, ok: true, tools: ["echo_say"] });
 		expect(await tested).toEqual({ ok: true, tools: ["echo_say"] });
@@ -630,6 +650,39 @@ describe("worker dispatcher", () => {
 		expect(o.db.getRun(runId)?.outcome).toBe("aborted");
 	});
 
+	test("abort of an assigned run whose worker is away: delivered on reconnect, or finished at lease expiry (RUN-05)", async () => {
+		const s = await setup();
+		const o = await s.start();
+		await chatThread(o.db, "t1");
+		await chatThread(o.db, "t2");
+		const back = recorder();
+		const gone = recorder();
+		const pBack = o.dispatcher.runAgent(askRequest("t1"), back.hooks);
+		const pGone = o.dispatcher.runAgent(askRequest("t2"), gone.hooks);
+		const w1 = await FakeWorker.connect(o.api.url, "worker-1");
+		const a1 = await w1.claim();
+		const w2 = await FakeWorker.connect(o.api.url, "worker-2");
+		const a2 = await w2.claim();
+		expect(o.db.getRun(a1.runId)?.state).toBe("assigned");
+		w1.close();
+		w2.close();
+		await until(() => o.dispatcher.workers().length === 0, "both workers away");
+		await back.handles[0]!.abort("user");
+		await gone.handles[0]!.abort("user");
+		// Nothing finishes while the abort cannot be delivered.
+		expect(o.db.getRun(a1.runId)?.state).toBe("assigned");
+
+		// The worker that comes back with its lease is told to stop the run; the run ends aborted.
+		const again = await FakeWorker.connect(o.api.url, "worker-1", { runId: a1.runId, token: a1.token });
+		await again.next(m => (m.t === "lease-invalid" && m.runId === a1.runId) || (m.t === "relay" && m.runId === a1.runId && m.msg.t === "abort"), "the abort on reconnect");
+		expect((await pBack).aborted).toBe("user");
+		expect(o.db.getRun(a1.runId)?.outcome).toBe("aborted");
+
+		// The one that never returns is finished at lease expiry as aborted, not lost or pending again.
+		expect((await pGone).aborted).toBe("user");
+		expect(o.db.getRun(a2.runId)).toMatchObject({ state: "finished", outcome: "aborted" });
+	});
+
 	test("one claim per worker id, ever; an assignment lost in a reconnect goes back to pending at lease expiry (architecture §6, RUN-02)", async () => {
 		const s = await setup();
 		const o = await s.start();
@@ -653,6 +706,46 @@ describe("worker dispatcher", () => {
 		expect((await other.claim()).runId).toBe(first.runId);
 	});
 
+	test("one claim per address, also across a restart; a worker id stays with its first address (architecture §6)", async () => {
+		const s = await setup();
+		const first = await s.start({ bindWorkerAddresses: true, graceMs: 3000 });
+		await chatThread(first.db, "t1");
+		await chatThread(first.db, "t2");
+		void first.dispatcher.runAgent(askRequest("t1"), recorder().hooks).catch(() => {});
+		void first.dispatcher.runAgent(askRequest("t2"), recorder().hooks).catch(() => {});
+		const w = await FakeWorker.connect(first.api.url, "worker-1");
+		const claimed = await w.claim();
+		expect(first.db.getRun(claimed.runId)?.worker_address).toBeTruthy();
+		// Started: whether its lease is still live, lost or just finished, the address keeps counting as busy.
+		w.relay(claimed.runId, { t: "registered" });
+		await until(() => first.db.getRun(claimed.runId)?.state !== "assigned", "running");
+		// Code inside that worker, with the worker token and a fresh id, gets nothing; the other run stays pending.
+		const intruder = await FakeWorker.connect(first.api.url, "intruder-1");
+		intruder.send({ t: "claim" });
+		await intruder.next(m => m.t === "nothing", "nothing");
+		expect(intruder.inbox.some(m => m.t === "assign")).toBe(false);
+		expect(first.dispatcher.pendingRuns()).toBe(1);
+		await first.stop();
+
+		// After a restart the runs table still knows the address holds a run.
+		const second = await s.start({ bindWorkerAddresses: true, graceMs: 3000 });
+		await chatThread(second.db, "t3");
+		void second.dispatcher.runAgent(askRequest("t3"), recorder().hooks).catch(() => {});
+		const again = await FakeWorker.connect(second.api.url, "intruder-2");
+		again.send({ t: "claim" });
+		await again.next(m => m.t === "nothing", "nothing after the restart");
+		expect(second.dispatcher.pendingRuns()).toBe(1);
+
+		// A worker id first seen elsewhere is refused from this address.
+		second.db.bindWorkerAddress("worker-elsewhere", "10.0.0.9");
+		const taken = await FakeWorker.connect(second.api.url, "worker-elsewhere");
+		await until(() => taken.isClosed, "the hello refused");
+		expect(second.dispatcher.workers().some(c => c.id === "worker-elsewhere")).toBe(false);
+		// Its own id is still welcome from the address it came from.
+		await FakeWorker.connect(second.api.url, "worker-1");
+		await until(() => second.dispatcher.workers().some(c => c.id === "worker-1"), "worker-1 connected");
+	});
+
 	test("unrunnable kinds fail clearly; oversized messages are dropped (RUN-16); unknown leases are refused", async () => {
 		const s = await setup();
 		const o = await s.start();
@@ -660,7 +753,7 @@ describe("worker dispatcher", () => {
 		const job = o.db.insertJob(issue.id, "plan");
 		expect(
 			o.dispatcher.runAgent(
-				{ ...askRequest("x"), owner: { kind: "job", jobId: job.id }, kind: "plan", profile: "plan", repo: "o/r", session: "issue-1-plan" },
+				{ ...askRequest("x"), owner: { kind: "job", jobId: job.id }, kind: "plan", profile: "plan", session: "issue-1-plan" },
 				recorder().hooks,
 			),
 		).rejects.toThrow("checkout");
@@ -694,5 +787,17 @@ describe("worker dispatcher", () => {
 		expect(await status(runArtifactPath(a.runId, "skills"), WORKER_TOKEN)).toBe(401);
 		expect(await status(runArtifactPath(a.runId, "skills"), SCALE_TOKEN)).toBe(401);
 		expect(await openSocket(url, SCALE_TOKEN)).toBeUndefined();
+
+		// The web token only on /internal/admin/*; no other token there.
+		const git = `${GIT_PATH_PREFIX}acme/app.git/info/refs?service=git-upload-pack`;
+		expect(await status("/internal/admin/state", WEB_TOKEN)).toBe(200);
+		for (const token of [WORKER_TOKEN, SCALE_TOKEN, a.token]) expect(await status("/internal/admin/state", token)).toBe(401);
+		expect(await status(WORKER_WS_PATH, WEB_TOKEN)).toBe(401);
+		expect(await openSocket(url, WEB_TOKEN)).toBeUndefined();
+		expect(await status("/internal/scale", WEB_TOKEN)).toBe(401);
+		expect(await status(runArtifactPath(a.runId, "skills"), WEB_TOKEN)).toBe(401);
+		// The git endpoint takes only a lease token of a run on that repository (git.test.ts covers the lease side).
+		for (const token of [WEB_TOKEN, WORKER_TOKEN, SCALE_TOKEN, a.token]) expect(await status(git, token)).toBe(401);
+		expect(await openSocket(url, a.token)).toBeUndefined();
 	});
 });

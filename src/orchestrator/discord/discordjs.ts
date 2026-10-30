@@ -43,9 +43,10 @@ import {
 } from "./surface";
 
 /**
- * The only module that imports discord.js: `DiscordConnection` over a discord.js `Client`. Writes go to Discord's REST
- * API through the outbound queue (DSC-32); discord.js is told to reject, not wait, when a queued route is rate-limited,
- * so the queue owns the retry-after. Interaction responses and reads are not queued.
+ * `DiscordConnection` over a discord.js `Client`. discord.js is imported only here and in `rest.ts` (the REST-only client
+ * the admin API uses whether or not the engine runs). Writes go to Discord's REST API through the outbound queue
+ * (DSC-32); discord.js is told to reject, not wait, when a queued route is rate-limited, so the queue owns the
+ * retry-after. Interaction responses and reads are not queued.
  */
 
 /** Discord answers an interaction within 3 s or fails it; slower handlers are deferred automatically. */
@@ -69,8 +70,8 @@ function allowedMentions(msg: OutMessage) {
 	return { parse: [], users: msg.mentions?.users ?? [], roles: msg.mentions?.roles ?? [] };
 }
 
-/** REST body and files of a message create or edit. */
-function restMessage(msg: OutMessage, extra: Record<string, unknown> = {}) {
+/** REST body and files of a message create or edit (also used by `rest.ts`). */
+export function restMessage(msg: OutMessage, extra: Record<string, unknown> = {}) {
 	const files = msg.files?.map((file, index) => ({ key: `files[${index}]`, name: file.name, data: file.data }));
 	return {
 		body: {
@@ -112,6 +113,19 @@ function channelKind(type: ChannelType): ChannelKind {
 		default:
 			return "other";
 	}
+}
+
+/** The surface's view of a REST channel object (also used by `rest.ts`). */
+export function channelInfo(channel: APIChannel): ChannelInfo {
+	const info: ChannelInfo = {
+		id: channel.id,
+		name: "name" in channel && channel.name ? channel.name : "",
+		kind: channelKind(channel.type),
+		parentId: "parent_id" in channel ? (channel.parent_id ?? null) : null,
+	};
+	if ("topic" in channel && channel.topic) info.topic = channel.topic;
+	if ("thread_metadata" in channel && channel.thread_metadata) info.archived = channel.thread_metadata.archived;
+	return info;
 }
 
 function actorOf(user: { id: string; username: string; bot: boolean }, member: GuildMember | APIInteractionGuildMember | null | undefined): Actor {
@@ -437,16 +451,7 @@ export function createDiscordJsConnection(opts: DiscordJsOptions = {}): DiscordC
 		},
 		async channel(id) {
 			const channel = await getChannel(id);
-			if (!channel) return null;
-			const info: ChannelInfo = {
-				id: channel.id,
-				name: "name" in channel && channel.name ? channel.name : "",
-				kind: channelKind(channel.type),
-				parentId: "parent_id" in channel ? (channel.parent_id ?? null) : null,
-			};
-			if ("topic" in channel && channel.topic) info.topic = channel.topic;
-			if ("thread_metadata" in channel && channel.thread_metadata) info.archived = channel.thread_metadata.archived;
-			return info;
+			return channel ? channelInfo(channel) : null;
 		},
 		createTextChannel(guildId, o) {
 			return write("high", `guild:${guildId}`, async () => {

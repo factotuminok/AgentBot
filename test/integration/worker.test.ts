@@ -7,7 +7,7 @@ import type { ChildMessage } from "../../src/shared/protocol";
 import { emptyOmpConfig } from "../../src/shared/ompconfig";
 import { LOG_LINE_LIMIT } from "../../src/shared/transcript";
 import { type DownMessage, type RelayUp, type RunSpec, type UpMessage, WORKER_WS_PATH, type WorkerControl } from "../../src/shared/wire";
-import { limitChildMessage, type OutboxEntry, RelayOutbox } from "../../src/worker/connection";
+import { limitChildMessage, type OutboxEntry, RelayOutbox, WorkerConnection } from "../../src/worker/connection";
 import { runWorkerHealth } from "../../src/worker/health";
 import { runWorkerOnce, type WorkerOptions, type WorkerOutcome } from "../../src/worker/main";
 import { listOutputFiles } from "../../src/worker/runner";
@@ -157,6 +157,95 @@ class StubOrchestrator {
 	}
 }
 
+interface ProxySide {
+	pipe: { frozen: boolean };
+	client: boolean;
+	other?: Bun.Socket<ProxySide>;
+	/** Bytes for this socket that it could not take yet. */
+	out: Uint8Array[];
+	/** Bytes from the client before the upstream socket connected. */
+	early: Uint8Array[];
+}
+
+function flushSide(socket: Bun.Socket<ProxySide>): void {
+	const out = socket.data.out;
+	while (out.length > 0) {
+		const chunk = out[0]!;
+		const written = Math.max(0, socket.write(chunk));
+		if (written < chunk.length) {
+			out[0] = chunk.subarray(written);
+			return;
+		}
+		out.shift();
+	}
+}
+
+/**
+ * A TCP proxy to 127.0.0.1:`port`. `freeze` stops forwarding on every open pipe, both ways, and leaves it open; with
+ * `hold`, new pipes start frozen.
+ */
+class TcpProxy {
+	hold = false;
+	readonly #pipes: { frozen: boolean }[] = [];
+	readonly #sockets = new Set<Bun.Socket<ProxySide>>();
+	readonly #listener: Bun.TCPSocketListener<ProxySide>;
+
+	constructor(port: number) {
+		const sockets = this.#sockets;
+		const handlers: Bun.SocketHandler<ProxySide> = {
+			data(socket, data) {
+				if (socket.data.pipe.frozen) return;
+				const other = socket.data.other;
+				if (!other) return void socket.data.early.push(new Uint8Array(data));
+				other.data.out.push(new Uint8Array(data));
+				flushSide(other);
+			},
+			drain: flushSide,
+			close(socket) {
+				sockets.delete(socket);
+				// The worker hanging up still reaches the orchestrator; nothing from a frozen orchestrator reaches the worker.
+				if (socket.data.client || !socket.data.pipe.frozen) socket.data.other?.end();
+			},
+		};
+		this.#listener = Bun.listen<ProxySide>({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				...handlers,
+				open: client => {
+					const pipe = { frozen: this.hold };
+					this.#pipes.push(pipe);
+					client.data = { pipe, client: true, out: [], early: [] };
+					sockets.add(client);
+					void Bun.connect<ProxySide>({ hostname: "127.0.0.1", port, data: { pipe, client: false, other: client, out: [], early: [] }, socket: handlers }).then(upstream => {
+						sockets.add(upstream);
+						client.data.other = upstream;
+						upstream.data.out.push(...client.data.early.splice(0));
+						flushSide(upstream);
+					});
+				},
+			},
+		});
+		cleanups.push(() => {
+			this.#listener.stop(true);
+			for (const socket of this.#sockets) socket.end();
+		});
+	}
+
+	get url(): string {
+		return `http://127.0.0.1:${this.#listener.port}`;
+	}
+
+	/** Connections accepted so far. */
+	get attempts(): number {
+		return this.#pipes.length;
+	}
+
+	freeze(): void {
+		for (const pipe of this.#pipes) pipe.frozen = true;
+	}
+}
+
 function askSpec(prompt: string, extra: Partial<RunSpec> = {}): RunSpec {
 	return {
 		runId: RUN_ID,
@@ -177,19 +266,24 @@ function askSpec(prompt: string, extra: Partial<RunSpec> = {}): RunSpec {
 
 interface Started {
 	root: string;
-	base: string;
+	runLocal: string;
+	/** Parent of the run-local root, where `agentbot health` looks. */
+	runBase: string;
 	result: Promise<WorkerOutcome>;
 }
 
+/** Checkout and run-local roots in separate temp dirs, as in the image (container storage and the run-local tmpfs). */
 function startWorker(stub: StubOrchestrator, overrides: Partial<WorkerOptions> = {}): Started {
-	const base = tempDir("agentbot-worker-test-");
-	const root = workerRoot(base);
+	const root = workerRoot(tempDir("agentbot-worker-test-"));
+	const runBase = tempDir("agentbot-worker-run-test-");
+	const runLocal = workerRoot(runBase);
 	const result = runWorkerOnce({
 		orchestratorUrl: stub.url,
 		workerToken: WORKER_TOKEN,
 		workerId: "worker-test",
 		claimTimeoutMs: 5_000,
 		root,
+		runLocal,
 		identity: { version: "0.0.0-test", hash: "abc" },
 		ompVersion: "18.12.1",
 		hostEntry: FIXTURE_HOST,
@@ -198,7 +292,7 @@ function startWorker(stub: StubOrchestrator, overrides: Partial<WorkerOptions> =
 		reconnectMaxMs: 200,
 		...overrides,
 	});
-	return { root, base, result };
+	return { root, runLocal, runBase, result };
 }
 
 function assign(spec: RunSpec): DownMessage {
@@ -212,10 +306,11 @@ describe("worker run", () => {
 		stub.files.set("scratch/inputs/in.txt", "input");
 		stub.files.set("session", '{"type":"session"}\n');
 		stub.assignment = assign(askSpec("happy", { resumeSession: true, scratch: { inputs: ["in.txt"] } }));
-		const { root, result } = startWorker(stub);
+		const { root, runLocal, result } = startWorker(stub);
 
 		expect(await result).toBe("run");
 		expect(existsSync(root)).toBe(false);
+		expect(existsSync(runLocal)).toBe(false);
 
 		const hello = stub.controls("hello")[0]!;
 		expect(hello).toMatchObject({ workerId: "worker-test", identity: { version: "0.0.0-test", hash: "abc" }, ompVersion: "18.12.1" });
@@ -240,7 +335,7 @@ describe("worker run", () => {
 
 		const done = stub.relayed("done")[0]!;
 		const output = done.result.output as { runtime: { agentDir: string; ompDir: string; providerKeys: Record<string, string> }; data: Record<string, unknown> };
-		expect(output.runtime).toEqual({ agentDir: join(root, "auth"), ompDir: join(root, "omp"), providerKeys: { fixture: "key" } });
+		expect(output.runtime).toEqual({ agentDir: join(runLocal, "auth"), ompDir: join(root, "omp"), providerKeys: { fixture: "key" } });
 		expect(output.data).toMatchObject({ runId: RUN_ID, cwd: join(root, "scratch"), scratchRoot: join(root, "scratch"), resumeFile: join(root, "sessions", "resume.jsonl"), profile: "ask", prompt: "happy" });
 		expect(done.result.oomKills).toBe(2);
 	});
@@ -250,17 +345,20 @@ describe("worker run", () => {
 		stub.files.set("skills", await new Bun.Archive({ "skills/probe/SKILL.md": "skill", "agents/helper.md": "agent" }).blob());
 		stub.files.set("scratch/inputs/late.txt", "late input");
 		stub.assignment = assign(askSpec("steerable"));
-		const { root, base, result } = startWorker(stub);
+		const { root, runLocal, runBase, result } = startWorker(stub);
 		await waitFor(() => stub.relayed("registered").length > 0);
 
 		expect(readFileSync(join(root, "omp", "skills", "probe", "SKILL.md"), "utf8")).toBe("skill");
 		expect(readFileSync(join(root, "omp", "agents", "helper.md"), "utf8")).toBe("agent");
-		expect(statSync(join(root, "auth")).mode & 0o777).toBe(0o700);
-		expect(existsSync(join(root, "auth", "agent.db"))).toBe(true);
+		// The credentials and the status file are run-local; nothing of them on the checkout root (CRED-02).
+		expect(statSync(join(runLocal, "auth")).mode & 0o777).toBe(0o700);
+		expect(existsSync(join(runLocal, "auth", "agent.db"))).toBe(true);
+		expect(existsSync(join(runLocal, "status.json"))).toBe(true);
+		expect(existsSync(join(root, "auth"))).toBe(false);
 
 		// Health while running (architecture §4.5).
 		const lines: string[] = [];
-		expect(runWorkerHealth(["--claimed"], base, line => lines.push(line))).toBe(0);
+		expect(runWorkerHealth(["--claimed"], runBase, line => lines.push(line))).toBe(0);
 		expect(JSON.parse(lines[0]!)).toEqual({ status: "ok", version: "0.0.0-test", phase: "running", runId: RUN_ID, connected: true });
 
 		stub.send({ t: "scratch-input", runId: RUN_ID, name: "late.txt" });
@@ -275,6 +373,7 @@ describe("worker run", () => {
 		expect(done.result.aborted).toBe("user");
 		expect(stub.acks().at(-1)).toEqual({ t: "ack", runId: RUN_ID, seq: abortSeq });
 		expect(existsSync(root)).toBe(false);
+		expect(existsSync(runLocal)).toBe(false);
 	});
 
 	test("reconnects mid-run: re-announces the lease, resends unacknowledged relays and drops duplicates", async () => {
@@ -308,6 +407,46 @@ describe("worker run", () => {
 
 		expect(await result).toBe("run");
 		expect(stub.relayed("done")[0]!.result.output).toEqual(["first", "second", "third"]);
+	});
+
+	test("a silent connection and a hung reconnect attempt are dropped; the next attempt re-announces the lease (NFR-03)", async () => {
+		// The orchestrator container restarted with a new address: the worker's socket to the old one never closes, and
+		// an attempt to the old address hangs. A TCP proxy in front of the stub stands in for both: a frozen pipe
+		// forwards nothing, either way, and stays open.
+		const stub = new StubOrchestrator();
+		stub.assignment = { t: "assign", runId: RUN_ID, token: LEASE, kind: "run", spec: askSpec("steerable") };
+		const proxy = new TcpProxy(stub.server.port!);
+		const changes: boolean[] = [];
+		const conn = new WorkerConnection({
+			orchestratorUrl: proxy.url,
+			workerToken: WORKER_TOKEN,
+			workerId: "worker-test",
+			identity: { version: "0.0.0-test", hash: "abc" },
+			ompVersion: "18.12.1",
+			reconnectMinMs: 30,
+			reconnectMaxMs: 200,
+			keepaliveMs: 100,
+			onControl: () => {},
+			onRelay: async () => {},
+			onScratchInput: async () => {},
+			onConnectedChange: connected => changes.push(connected),
+		});
+		cleanups.push(() => conn.stop(0));
+		conn.start();
+		conn.claim();
+		await waitFor(() => conn.lease);
+		// Real sockets, so real time: five ping intervals with the pongs coming back must not drop the connection.
+		await Bun.sleep(500);
+		expect(stub.connections).toBe(1);
+
+		proxy.freeze();
+		proxy.hold = true;
+		await waitFor(() => proxy.attempts === 2, 3_000);
+		proxy.hold = false;
+		await waitFor(() => stub.controls("hello").length === 2, 3_000);
+		expect(proxy.attempts).toBe(3);
+		expect(stub.controls("hello")[1]!.lease).toEqual({ runId: RUN_ID, token: LEASE });
+		expect(changes).toEqual([true, false, true]);
 	});
 
 	test("an ignored abort kills the host after the abort timeout; the run ends as aborted by the user", async () => {
@@ -406,14 +545,6 @@ describe("worker run", () => {
 		expect(await result).toBe("run");
 		expect(stub.relayed("done")).toHaveLength(0);
 		expect(existsSync(root)).toBe(false);
-	});
-
-	test("a run that needs a checkout fails clearly", async () => {
-		const stub = new StubOrchestrator();
-		stub.assignment = assign({ ...askSpec("happy"), kind: "implement", profile: "implement" });
-		const { result } = startWorker(stub);
-		expect(await result).toBe("run");
-		expect(stub.relayed("failed")[0]!.message).toContain("needs a repository checkout");
 	});
 
 	test("runs an mcp-test and reports its tools", async () => {

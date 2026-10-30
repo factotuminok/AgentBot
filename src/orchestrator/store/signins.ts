@@ -1,7 +1,7 @@
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { type AuthStorage, discoverAuthStorage } from "@oh-my-pi/pi-coding-agent";
-import { errorMessage, log } from "../../shared/log";
+import { addLogSecret, errorMessage, log, removeLogSecret } from "../../shared/log";
 import type { CredentialSnapshot } from "../../shared/wire";
 
 /**
@@ -20,6 +20,12 @@ export const FRESH_FOR_MS = 5 * 60_000;
  * earlier. A refresh still running then keeps going, stores its result, and the worker's next request joins it.
  */
 export const ANSWER_WITHIN_MS = 8_000;
+/**
+ * A refresh the stored token's expiry doesn't call for (a worker reports the stored, still fresh token as rejected) runs
+ * at most this often per sign-in; otherwise the stored token is the answer. A hijacked run connection could otherwise
+ * churn a rotating refresh-token chain until the provider revokes the grant for every run.
+ */
+export const FORCED_REFRESH_INTERVAL_MS = 60_000;
 
 /** A worker's `credential-request` (wire.ts): the orchestrator's row id from the snapshot and the worker's token. */
 export interface CredentialRequest {
@@ -53,15 +59,32 @@ export function signinsDir(stateDir: string): string {
 }
 
 export async function openSignins(stateDir: string, opts: SigninsOptions = {}): Promise<Signins> {
+	return openSigninStore(signinsDir(stateDir), opts);
+}
+
+/** The sign-in store of any omp agent dir: the orchestrator's (`openSignins`), or a developer's own for `scripts/dry-run.ts`. */
+export async function openSigninStore(agentDir: string, opts: SigninsOptions = {}): Promise<Signins> {
 	const answerWithinMs = opts.answerWithinMs ?? ANSWER_WITHIN_MS;
-	const agentDir = signinsDir(stateDir);
 	await mkdir(agentDir, { recursive: true, mode: 0o700 });
 	await chmod(agentDir, 0o700);
 	// `cwd` is the agent dir so omp reads no project config from the process's working directory.
 	const authStorage = await discoverAuthStorage(agentDir, { cwd: agentDir });
+	/** When each sign-in's last forced refresh started, and the refreshes for runs still running (until they settle). */
+	const forcedAt = new Map<number, number>();
+	const flights = new Map<number, Promise<CredentialAnswer>>();
+	/** F9: each sign-in's current access token is masked in logs; the one it replaced is not any more. */
+	const maskedAccess = new Map<number, string>();
+	function maskAccess(id: number, access: string): void {
+		const previous = maskedAccess.get(id);
+		if (previous === access) return;
+		removeLogSecret(previous);
+		maskedAccess.set(id, access);
+		addLogSecret(access);
+	}
 
-	async function refresh(id: number, provider: string, signal?: AbortSignal) {
-		const entry = await authStorage.oauth.refresh(id, signal);
+	async function refresh(id: number, provider: string) {
+		const entry = await authStorage.oauth.refresh(id);
+		if (entry.credential.type === "oauth") maskAccess(id, entry.credential.access);
 		log("info", "model sign-in refreshed", { provider, credentialId: id });
 		return entry;
 	}
@@ -82,12 +105,10 @@ export async function openSignins(stateDir: string, opts: SigninsOptions = {}): 
 					}),
 				),
 			);
-			return authStorage.credentials.snapshot().credentials.map(entry => ({
-				id: entry.id,
-				provider: entry.provider,
-				credential: entry.credential,
-				identityKey: entry.identityKey,
-			}));
+			return authStorage.credentials.snapshot().credentials.map(entry => {
+				if (entry.credential.type === "oauth") maskAccess(entry.id, entry.credential.access);
+				return { id: entry.id, provider: entry.provider, credential: entry.credential, identityKey: entry.identityKey };
+			});
 		},
 
 		async handleCredentialRequest(req) {
@@ -96,17 +117,39 @@ export async function openSignins(stateDir: string, opts: SigninsOptions = {}): 
 			if (!row) return { ok: false, error: `revoked: sign-in for ${req.provider} was removed` };
 			if (row.credential.type !== "oauth") return { ok: false, error: `revoked: ${req.provider} credential ${id} is not an OAuth sign-in` };
 			const stored = row.credential;
-			if (stored.access !== req.accessToken && stored.expires > Date.now() + FRESH_FOR_MS) {
-				return { ok: true, accessToken: stored.access, expiresAt: stored.expires };
+			const now = Date.now();
+			if (stored.expires > now + FRESH_FOR_MS) {
+				if (stored.access !== req.accessToken) return { ok: true, accessToken: stored.access, expiresAt: stored.expires };
+				// A refresh already running for another run is joined below; a new forced one waits out its interval.
+				if (!flights.has(id)) {
+					if (now - (forcedAt.get(id) ?? Number.NEGATIVE_INFINITY) < FORCED_REFRESH_INTERVAL_MS) {
+						log("warn", "forced model sign-in refresh refused: at most one per minute", { provider: req.provider, credentialId: id });
+						return { ok: true, accessToken: stored.access, expiresAt: stored.expires };
+					}
+					forcedAt.set(id, now);
+				}
 			}
+			let flight = flights.get(id);
+			if (!flight) {
+				// Not aborted at the deadline: a late result is stored, and requests meanwhile join it.
+				flight = refresh(id, req.provider)
+					.then(({ credential }): CredentialAnswer =>
+						credential.type === "oauth"
+							? { ok: true, accessToken: credential.access, expiresAt: credential.expires }
+							: { ok: false, error: `revoked: ${req.provider} credential ${id} is not an OAuth sign-in` },
+					)
+					.finally(() => flights.delete(id));
+				flights.set(id, flight);
+			}
+			const deadline = Promise.withResolvers<never>();
+			const timer = setTimeout(() => deadline.reject(new Error(`the sign-in refresh took longer than ${answerWithinMs} ms`)), answerWithinMs);
 			try {
-				// omp single-flights per row: concurrent requests share one token exchange.
-				const entry = await refresh(id, req.provider, AbortSignal.timeout(answerWithinMs));
-				if (entry.credential.type !== "oauth") return { ok: false, error: `revoked: ${req.provider} credential ${id} is not an OAuth sign-in` };
-				return { ok: true, accessToken: entry.credential.access, expiresAt: entry.credential.expires };
+				return await Promise.race([flight, deadline.promise]);
 			} catch (err) {
 				log("warn", "model sign-in refresh for a run failed", { provider: req.provider, credentialId: id, error: errorMessage(err) });
 				return { ok: false, error: errorMessage(err) };
+			} finally {
+				clearTimeout(timer);
 			}
 		},
 

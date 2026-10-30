@@ -1,0 +1,4 @@
+*
+!package.json
+!src/
+!test/e2e/launcher/

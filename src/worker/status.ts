@@ -1,12 +1,13 @@
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadEnv } from "../shared/env";
 import type { WorkerPhase } from "../shared/wire";
 
 /**
  * The worker's status file, read by `agentbot health` (architecture §4.5). Each worker process keeps it in its own
- * run-local root, `<tmpdir>/agentbot-worker/<pid>/status.json`, so the health command finds it without being told
- * where the worker runs; the file goes with the rest of the run-local root at the end of the run (RUN-20).
+ * run-local root, `<run dir>/<pid>/status.json`, so the health command finds it without being told where the worker
+ * runs; the file goes with the rest of the run-local root at the end of the run (RUN-20).
  */
 
 export interface WorkerStatus {
@@ -22,12 +23,20 @@ export interface WorkerStatus {
 
 export const STATUS_FILE = "status.json";
 
-/** Parent of every worker's run-local root on this host. */
+/** Parent of every worker's checkout root on this host: container storage (architecture §5, "worker checkout"). */
 export function workerBaseDir(): string {
 	return join(tmpdir(), "agentbot-worker");
 }
 
-/** This process's run-local root. */
+/**
+ * Parent of every worker's run-local root (architecture §5, "run-local"): `AGENTBOT_WORKER_RUN_DIR`, which the image
+ * points at the launcher's tmpfs or the pod's memory `emptyDir`; outside the image the same parent as the checkout root.
+ */
+export function workerRunBaseDir(runDir: string | undefined = loadEnv().workerRunDir): string {
+	return runDir ?? workerBaseDir();
+}
+
+/** This process's root under `base`. */
 export function workerRoot(base: string = workerBaseDir(), pid: number = process.pid): string {
 	return join(base, String(pid));
 }
@@ -74,7 +83,7 @@ function alive(pid: number): boolean {
 }
 
 /** The status of the live worker under `base` (the most recently updated one, if several run on this host). */
-export function readWorkerStatus(base: string = workerBaseDir()): WorkerStatus | undefined {
+export function readWorkerStatus(base: string = workerRunBaseDir()): WorkerStatus | undefined {
 	let entries: string[];
 	try {
 		entries = readdirSync(base);

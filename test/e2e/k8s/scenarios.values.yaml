@@ -1,0 +1,27 @@
+# Values for the Kubernetes scenarios (test/e2e/k8s/scenarios.ts) on the shared kind cluster: the scenario image
+# (test/e2e/k8s/Containerfile), 10 worker pods at most, and requests small enough for 10 workers, the orchestrator and
+# web on an 8 GiB / 5 CPU Podman machine. Everything else is the chart's defaults.
+image:
+  repository: localhost/agentbot-k8s-e2e
+  tag: dev
+  pullPolicy: Never
+orchestrator:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 1Gi }
+  persistence:
+    size: 1Gi
+web:
+  vscode: false
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 1Gi }
+  persistence:
+    size: 1Gi
+worker:
+  maxReplicas: 10
+  diskLimit: 1Gi
+  runDirLimit: 64Mi
+  resources:
+    requests: { cpu: 20m, memory: 96Mi, ephemeral-storage: 50Mi }
+    limits: { memory: 512Mi }

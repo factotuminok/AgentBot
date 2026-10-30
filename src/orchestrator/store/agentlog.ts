@@ -1,4 +1,4 @@
-import { errorMessage, log } from "../../shared/log";
+import { errorMessage, log, redactSecrets } from "../../shared/log";
 import { type LogSegment, openRollingFiles } from "../../shared/rollinglog";
 import { type TranscriptEvent, truncateEvent } from "../../shared/transcript";
 
@@ -79,7 +79,11 @@ export async function openAgentLog(opts: AgentLogOptions): Promise<AgentLog> {
 			let entry: AgentLogEntry;
 			try {
 				entry = { seq: ++seq, ts: new Date().toISOString(), ...run, ...truncateEvent(event) } as AgentLogEntry;
-				files.append(JSON.stringify(entry));
+				// F9: a token an agent printed (or a tool argument carrying one) is masked in the file, the tail and the stream.
+				const raw = JSON.stringify(entry);
+				const text = redactSecrets(raw);
+				if (text !== raw) entry = JSON.parse(text) as AgentLogEntry;
+				files.append(text);
 			} catch (err) {
 				log("error", "agent log append failed", { run: run.run, error: errorMessage(err) });
 				return;

@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { dbPath, openDb } from "../../src/orchestrator/store/db";
+import { Database } from "bun:sqlite";
+import { dbPath, hashLeaseToken, openDb } from "../../src/orchestrator/store/db";
 
 const LEASE_MS = 45_000;
 const later = (ms: number) => new Date(Date.now() + ms);
@@ -18,12 +19,50 @@ describe("runs", () => {
 		expect(a.state).toBe("assigned");
 		expect(a.worker_id).toBe("worker-a");
 		expect(a.lease_token).toBeTruthy();
-		expect(db.runForLease(a.lease_token!)?.id).toBe(first.id);
+		expect(db.runForLease(a.leaseToken)?.id).toBe(first.id);
 
 		const b = db.claimRun("worker-b", LEASE_MS)!;
 		expect(b.id).toBe(second.id);
-		expect(b.lease_token).not.toBe(a.lease_token);
+		expect(b.leaseToken).not.toBe(a.leaseToken);
+		// SEC-14: only the sha256 of the token is stored.
+		expect(a.lease_token).toBe(hashLeaseToken(a.leaseToken));
+		expect(db.getRun(a.id)!.lease_token).not.toBe(a.leaseToken);
 		expect(db.claimRun("worker-c", LEASE_MS)).toBeNull();
+	});
+
+	test("a lease token stored raw by an older version is hashed at open and still authorises (SEC-14)", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "agentbot-db-"));
+		try {
+			const first = openDb(dbPath(dir));
+			const run = first.insertRun({ kind: "draft", draftId: "d1" });
+			first.claimRun("w1", LEASE_MS);
+			first.close();
+			// What an older version left behind: the plain token in the column.
+			const raw = new Database(dbPath(dir));
+			raw.run("UPDATE runs SET lease_token = ? WHERE id = ?", ["plain-old-token", run.id]);
+			raw.close();
+			const db = openDb(dbPath(dir));
+			expect(db.getRun(run.id)!.lease_token).toBe(hashLeaseToken("plain-old-token"));
+			expect(db.runForLease("plain-old-token")?.id).toBe(run.id);
+			expect(db.runForLease(hashLeaseToken("plain-old-token"))).toBeNull();
+			expect(db.renewLease(run.id, "plain-old-token", LEASE_MS)).not.toBeNull();
+			db.close();
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the store is WAL with synchronous=NORMAL: only checkpoints fsync, not every commit (phase 11 load test)", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "agentbot-db-"));
+		try {
+			const db = openDb(dbPath(dir));
+			expect(db.raw.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode).toBe("wal");
+			// 1 = NORMAL (2 = FULL, SQLite's default, fsynced the WAL at every commit).
+			expect(db.raw.query<{ synchronous: number }, []>("PRAGMA synchronous").get()?.synchronous).toBe(1);
+			db.close();
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("two connections to the same file never claim the same run", async () => {
@@ -49,10 +88,10 @@ describe("runs", () => {
 		const assigned = db.insertRun({ kind: "draft", draftId: "d1" });
 		const running = db.insertRun({ kind: "draft", draftId: "d2" });
 		const fresh = db.insertRun({ kind: "draft", draftId: "d3" });
-		const lease1 = db.claimRun("w1", LEASE_MS)!.lease_token!;
-		const lease2 = db.claimRun("w2", LEASE_MS)!.lease_token!;
+		const lease1 = db.claimRun("w1", LEASE_MS)!.leaseToken;
+		const lease2 = db.claimRun("w2", LEASE_MS)!.leaseToken;
 		expect(db.transitionRun(running.id, ["assigned"], "running")?.started_at).toBeTruthy();
-		const lease3 = db.claimRun("w3", 5 * LEASE_MS)!.lease_token!;
+		const lease3 = db.claimRun("w3", 5 * LEASE_MS)!.leaseToken;
 
 		expect(db.expireLeases()).toEqual({ requeued: [], lost: [] });
 		const expired = db.expireLeases(later(LEASE_MS + 1000));
@@ -74,9 +113,9 @@ describe("runs", () => {
 	test("a heartbeat keeps the lease alive; a wrong token does not", () => {
 		const db = openDb(":memory:");
 		const run = db.insertRun({ kind: "draft", draftId: "d1" });
-		const { lease_token } = db.claimRun("w", 1000)!;
+		const { leaseToken } = db.claimRun("w", 1000)!;
 		expect(db.renewLease(run.id, "not-the-token", LEASE_MS)).toBeNull();
-		expect(db.renewLease(run.id, lease_token!, LEASE_MS)).not.toBeNull();
+		expect(db.renewLease(run.id, leaseToken, LEASE_MS)).not.toBeNull();
 		expect(db.expireLeases(later(5000))).toEqual({ requeued: [], lost: [] });
 	});
 

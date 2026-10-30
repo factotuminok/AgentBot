@@ -1,0 +1,27 @@
+# Values for the load test (test/e2e/k8s/load.ts) on the shared kind cluster: the scenario image
+# (test/e2e/k8s/Containerfile), capacity 10, and room for 10 seeded repositories (state volume) and a `bun install` per
+# run (checkout disk, worker memory) on an 8 GiB / 5 CPU Podman machine. Requests stay small so that all 10 workers fit;
+# the chart's default run-local tmpfs (256Mi) is kept, since `setupCommand` caches land there ($HOME).
+image:
+  repository: localhost/agentbot-k8s-e2e
+  tag: dev
+  pullPolicy: Never
+orchestrator:
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 1Gi }
+  persistence:
+    size: 8Gi
+web:
+  vscode: false
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 1Gi }
+  persistence:
+    size: 1Gi
+worker:
+  maxReplicas: 10
+  diskLimit: 2Gi
+  resources:
+    requests: { cpu: 50m, memory: 128Mi, ephemeral-storage: 200Mi }
+    limits: { memory: 1536Mi }

@@ -1,0 +1,12 @@
+{{- /*
+OPS-08: fail with a clear message when the cluster has no KEDA ScaledJob API. Checked on install, upgrade and `helm
+template` (which has no cluster: pass --api-versions keda.sh/v1alpha1/ScaledJob or set keda.skipCrdCheck=true), not by
+`helm lint`, which renders without a release. The Kubernetes version (>= 1.27) is Chart.yaml's kubeVersion.
+*/ -}}
+{{- if and (or .Release.IsInstall .Release.IsUpgrade) (not .Values.keda.skipCrdCheck) (not (.Capabilities.APIVersions.Has "keda.sh/v1alpha1/ScaledJob")) }}
+{{- fail "KEDA is not installed: this cluster has no keda.sh/v1alpha1 ScaledJob API, which AgentBot's workers need. Install KEDA >= 2.12 (>= 2.19 recommended) first, see https://keda.sh/docs/latest/deploy/. To render the chart without a cluster, set keda.skipCrdCheck=true or pass --api-versions keda.sh/v1alpha1/ScaledJob." }}
+{{- end }}
+{{- $_ := include "agentbot.workerDisk" . }}
+{{- if lt (int .Values.worker.maxReplicas) 1 }}
+{{- fail "worker.maxReplicas must be at least 1" }}
+{{- end }}

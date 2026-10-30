@@ -1,4 +1,5 @@
 import type { APIApplicationCommandOptionChoice, APIModalInteractionResponseCallbackData, RESTPostAPIApplicationCommandsJSONBody } from "discord-api-types/v10";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { errorMessage, log } from "../../src/shared/log";
 import { createOutboundQueue, type OutboundQueue, type QueueClock } from "../../src/orchestrator/discord/queue";
 import {
@@ -39,6 +40,25 @@ export class FakeDiscordError extends Error {
 	) {
 		super(message);
 	}
+}
+
+/** A simulated rate-limit response (`FakeDiscordOptions.simulate`): the queue blocks the bucket for `retryAfterMs` and retries. */
+export class FakeRateLimitError extends Error {
+	override name = "FakeRateLimitError";
+	constructor(readonly retryAfterMs: number) {
+		super(`rate limited for ${retryAfterMs} ms`);
+	}
+}
+
+/**
+ * Discord's REST behaviour for load tests: every write takes `latencyMs`, and each bucket (channel) allows `perWindow`
+ * writes per `windowMs`; a write over that fails with `FakeRateLimitError` (retry-after = the rest of the window), which
+ * the outbound queue honours like discord.js's rate-limit errors. Off by default: writes run at once.
+ */
+export interface SimulatedRest {
+	latencyMs?: number;
+	perWindow: number;
+	windowMs: number;
 }
 
 export interface FakeChannel extends ChannelInfo {
@@ -91,6 +111,13 @@ export interface FakeDiscordOptions {
 	channels?: { id?: string; name: string; kind?: ChannelKind; parentId?: string | null; topic?: string }[];
 	/** Clock of the outbound queue (rate-limit waits). */
 	clock?: QueueClock;
+	simulate?: SimulatedRest;
+	/**
+	 * Keeps channels, messages and nicknames in this JSON file: loaded at creation, rewritten (atomically, synchronously)
+	 * after every write, interaction update and user message, so a process killed and started again sees the same
+	 * Discord (test/e2e/chaos). Attached files keep their names only.
+	 */
+	persistFile?: string;
 }
 
 export interface FakeDiscord extends DiscordConnection {
@@ -128,8 +155,12 @@ export interface FakeDiscord extends DiscordConnection {
 	emitAutocomplete(e: { command: "work" | "ask"; subcommand?: string | null; focused: { name: string; value: string }; actor: Actor; channelId: string }): Promise<Emitted>;
 	emitComponent(e: { message: MsgRef; customId: string; values?: string[]; actor: Actor }): Promise<Emitted>;
 	emitModal(e: { customId: string; fields: Record<string, string>; message?: MsgRef | null; actor: Actor; channelId?: string }): Promise<Emitted>;
-	/** Posts a user message (stored) and delivers it, unless the author is a bot or the channel is outside a guild (DSC-08). */
-	emitMessage(e: { channelId: string; content: string; attachments?: InAttachment[]; actor: Actor }): Promise<Emitted>;
+	/**
+	 * Posts a user message (stored) and delivers it, unless the author is a bot or the channel is outside a guild (DSC-08).
+	 * `unfiltered` delivers it anyway, as if the adapter's filter were missing, with `guildId` overriding the channel's
+	 * (null = a direct message): it shows that the bot applies DSC-08 itself.
+	 */
+	emitMessage(e: { channelId: string; content: string; attachments?: InAttachment[]; actor: Actor; unfiltered?: boolean; guildId?: string | null }): Promise<Emitted>;
 	/** Pauses / resumes the outbound queue, so writes pile up and priorities and coalescing show. */
 	pause(): void;
 	resume(): void;
@@ -137,6 +168,10 @@ export interface FakeDiscord extends DiscordConnection {
 	rateLimit(channelId: string | null, ms: number): void;
 	/** Resolves once the outbound queue is empty and pending callbacks ran. */
 	settled(): Promise<void>;
+	/** Writes performed and simulated rate-limit responses (`simulate`) so far. */
+	restStats(): { writes: number; rateLimited: number };
+	/** Turns the REST simulation on (or off with `undefined`) from now on; see `FakeDiscordOptions.simulate`. */
+	simulateRest(simulate: SimulatedRest | undefined): void;
 }
 
 export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
@@ -151,7 +186,13 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 	const denied = new Set<string>();
 	const eventHandlers = new Set<(event: InboundEvent) => void | Promise<void>>();
 	const readyHandlers = new Set<() => void | Promise<void>>();
-	const queue = createOutboundQueue({ clock: opts.clock });
+	let simulate = opts.simulate;
+	const queue = createOutboundQueue({
+		clock: opts.clock,
+		rateLimitOf: err => (err instanceof FakeRateLimitError ? { retryAfterMs: err.retryAfterMs, global: false } : undefined),
+	});
+	const windows = new Map<string, { start: number; count: number }>();
+	const rest = { writes: 0, rateLimited: 0 };
 	let loginError = opts.loginError;
 	let loggedIn = false;
 	let destroyed = false;
@@ -172,6 +213,31 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 		return channel;
 	}
 	for (const c of opts.channels ?? []) addChannel(c);
+
+	interface Snapshot {
+		nextId: number;
+		channels: FakeChannel[];
+		messages: FakeMessage[];
+		nicknames: [string, string][];
+	}
+	function persist(): void {
+		if (!opts.persistFile) return;
+		const snapshot: Snapshot = {
+			nextId,
+			channels: [...channelStore.values()],
+			messages: [...messageStore.values()].map(m => ({ ...m, files: m.files.map(f => ({ name: f.name, data: "" })) })),
+			nicknames: [...nicknames],
+		};
+		writeFileSync(`${opts.persistFile}.tmp`, JSON.stringify(snapshot));
+		renameSync(`${opts.persistFile}.tmp`, opts.persistFile);
+	}
+	if (opts.persistFile && existsSync(opts.persistFile)) {
+		const snapshot = JSON.parse(readFileSync(opts.persistFile, "utf8")) as Snapshot;
+		nextId = snapshot.nextId;
+		for (const c of snapshot.channels) channelStore.set(c.id, c);
+		for (const m of snapshot.messages) messageStore.set(m.id, m);
+		for (const [guild, nickname] of snapshot.nicknames) nicknames.set(guild, nickname);
+	}
 
 	function channelOf(id: string): FakeChannel {
 		const channel = channelStore.get(id);
@@ -212,8 +278,35 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 		message.edits++;
 	}
 
+	/** One simulated REST call on `bucket` (`simulate`): its latency, then the bucket's window. */
+	async function simulated(bucket: string, simulate: SimulatedRest): Promise<void> {
+		if (simulate.latencyMs) await Bun.sleep(simulate.latencyMs);
+		const now = Date.now();
+		let window = windows.get(bucket);
+		if (!window || now - window.start >= simulate.windowMs) {
+			window = { start: now, count: 0 };
+			windows.set(bucket, window);
+		}
+		if (window.count >= simulate.perWindow) {
+			rest.rateLimited++;
+			throw new FakeRateLimitError(window.start + simulate.windowMs - now);
+		}
+		window.count++;
+	}
+
 	function write<T>(priority: Priority, bucket: string, run: () => T, coalesce?: string): Promise<T> {
-		return queue.push({ priority, bucket, coalesce, run: async () => run() }) as Promise<T>;
+		return queue.push({
+			priority,
+			bucket,
+			coalesce,
+			run: async () => {
+				if (simulate) await simulated(bucket, simulate);
+				rest.writes++;
+				const result = run();
+				persist();
+				return result;
+			},
+		}) as Promise<T>;
 	}
 
 	function where(channelId: string): Where {
@@ -259,6 +352,7 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 				if (!target) throw new Error("update needs a message");
 				ack("update");
 				applyEdit(messageOf(target), msg);
+				persist();
 				responses.push({ type: "update", msg });
 			},
 			async deferUpdate() {
@@ -518,9 +612,11 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 		async emitMessage(e) {
 			const m = store(e.channelId, { content: e.content }, e.actor.userId);
 			m.attachments = e.attachments ?? [];
+			persist();
 			const ref = { channelId: e.channelId, messageId: m.id };
 			const w = where(e.channelId);
-			if (e.actor.isBot || w.guildId === null) return { responses: [], ref };
+			if (e.guildId !== undefined) w.guildId = e.guildId;
+			if (!e.unfiltered && (e.actor.isBot || w.guildId === null)) return { responses: [], ref };
 			const event: MessageEvent = { type: "message", ref, content: e.content, attachments: m.attachments, actor: e.actor, where: w };
 			await deliver(event);
 			return { responses: [], ref };
@@ -534,6 +630,11 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 				await new Promise<void>(resolve => setTimeout(resolve, 0));
 				if (queue.stats().length === 0) return;
 			}
+		},
+		restStats: () => ({ ...rest }),
+		simulateRest(next) {
+			simulate = next;
+			windows.clear();
 		},
 	};
 	return fake;

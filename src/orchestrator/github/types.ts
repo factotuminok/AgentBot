@@ -133,6 +133,7 @@ export interface GitHub {
 	/** Ignores 404 (label not present). */
 	removeLabel(repo: string, n: number, label: string): Promise<void>;
 	createIssue(repo: string, title: string, body: string, labels?: string[]): Promise<{ number: number; url: string }>;
+	/** Opens the PR, or returns the open PR from `head` to `base` when one already exists (a job resumed after opening it, JOB-09). */
 	createPull(repo: string, p: { head: string; base: string; title: string; body: string }): Promise<{ number: number; url: string }>;
 	getPull(repo: string, n: number): Promise<{ state: "open" | "closed"; merged: boolean; headSha: string; url: string }>;
 	listReviews(repo: string, pr: number): Promise<GhReview[]>;

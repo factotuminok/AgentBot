@@ -58,6 +58,29 @@ export interface AdminClient {
 	status(window: UsageWindow): Promise<StatusReport>;
 	/** Never throws: an unreachable orchestrator or a body that isn't a health body reads as unreachable. */
 	health(): Promise<OrchestratorHealth>;
+	/** Any admin endpoint with a JSON body and answer (feature pages). Errors as for the typed calls. */
+	call<T>(method: string, path: string, init?: CallInit): Promise<T>;
+	/**
+	 * Any admin endpoint, answer unread (streams, downloads, uploads). An unreachable orchestrator or a refused web token
+	 * throws `OrchestratorUnavailable`; every other status is returned for the caller to read.
+	 */
+	fetch(method: string, path: string, init?: RawInit): Promise<Response>;
+}
+
+export interface CallInit {
+	body?: unknown;
+	/** The acting admin's username, for the orchestrator's log (WEB-29). */
+	admin?: string;
+	timeoutMs?: number;
+}
+
+export interface RawInit {
+	body?: BodyInit;
+	headers?: Record<string, string>;
+	admin?: string;
+	/** Ends a long-lived request (an event stream); no timeout applies when it is given. */
+	signal?: AbortSignal;
+	timeoutMs?: number;
 }
 
 export interface AdminClientOptions {
@@ -107,7 +130,7 @@ export function createAdminClient(opts: AdminClientOptions): AdminClient {
 	const saveTimeoutMs = opts.saveTimeoutMs ?? 120_000;
 	const healthTimeoutMs = opts.healthTimeoutMs ?? 3_000;
 
-	async function call<T>(method: string, path: string, init: { body?: unknown; admin?: string; timeoutMs?: number } = {}): Promise<T> {
+	async function call<T>(method: string, path: string, init: CallInit = {}): Promise<T> {
 		const headers: Record<string, string> = { Authorization: `Bearer ${opts.token}`, Accept: "application/json" };
 		if (init.body !== undefined) headers["Content-Type"] = "application/json";
 		// Header values must be ASCII; the orchestrator decodes this with decodeURIComponent.
@@ -159,6 +182,27 @@ export function createAdminClient(opts: AdminClientOptions): AdminClient {
 			} catch {
 				return { reachable: false, phase: null, limits: null };
 			}
+		},
+		call,
+		async fetch(method, path, init = {}) {
+			const headers: Record<string, string> = { Authorization: `Bearer ${opts.token}`, ...init.headers };
+			if (init.admin !== undefined) headers["X-Agentbot-Admin"] = encodeURIComponent(init.admin);
+			let res: Response;
+			try {
+				res = await fetch(`${opts.baseUrl}${ADMIN_PREFIX}${path}`, {
+					method,
+					headers,
+					body: init.body,
+					signal: init.signal ?? AbortSignal.timeout(init.timeoutMs ?? timeoutMs),
+				});
+			} catch (err) {
+				throw new OrchestratorUnavailable(errorMessage(err));
+			}
+			if (res.status === 401) {
+				await res.body?.cancel();
+				throw new OrchestratorUnavailable("the orchestrator rejected the web API token (AGENTBOT_WEB_API_TOKEN_FILE)");
+			}
+			return res;
 		},
 	};
 }

@@ -1,6 +1,7 @@
 import { PermissionFlagsBits } from "discord-api-types/v10";
 import { errorMessage, log } from "../../shared/log";
-import { MissingPermission } from "../discord/surface";
+import type { Config } from "../../shared/config";
+import { type DiscordSurface, MissingPermission } from "../discord/surface";
 import type { AvailableRepo } from "../github/types";
 import type { EngineDeps } from "./deps";
 
@@ -9,7 +10,8 @@ import type { EngineDeps } from "./deps";
  * Polling of a watched repository is the poller's (GH-10, GH-27); this module only records watches and manages channels.
  */
 
-export type WatchDeps = Pick<EngineDeps, "db" | "discord" | "config" | "labels">;
+/** The engine's deps, or the admin API's REST-backed equivalents (WEB-32): only the surface calls watching needs, and no work channel. */
+export type WatchDeps = Pick<EngineDeps, "db" | "labels"> & { config: Config; discord: Pick<DiscordSurface, "channel" | "createTextChannel" | "setChannel" | "send"> };
 
 export interface WatchOutcome {
 	channelId: string;

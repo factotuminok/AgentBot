@@ -1,0 +1,161 @@
+# AgentBot Helm chart (architecture §7.3, requirements OPS-07, OPS-08).
+# Prerequisites: Kubernetes >= 1.27 and KEDA >= 2.12 (>= 2.19 recommended: older versions can start one extra worker pod
+# near worker.maxReplicas, spike S5). No ReadWriteMany storage is needed.
+
+# The one AgentBot image; the role is the container argument. The tag defaults to the chart's appVersion.
+image:
+  repository: ghcr.io/factotuminok/agentbot
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Master key and the web, worker and scale tokens (architecture §6). By default the chart generates a Secret on first
+# install and keeps its values on every upgrade (it reads them back with `lookup`); the Secret is kept on uninstall,
+# like the state volume, because the settings vault cannot be opened without the master key.
+# existingSecret: the name of a Secret you create instead, with the keys master-key (at least 32 characters),
+# web-api-token, worker-token and scale-token.
+secrets:
+  existingSecret: ""
+
+# Every pod runs as agentbot (10001:10001), non-root, with no privilege escalation and no capabilities (STO-02).
+podSecurityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+orchestrator:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  # The state volume (RWO): database, mirrors, sessions, logs, omp sign-ins (architecture §5).
+  persistence:
+    size: 20Gi
+    storageClass: ""
+    # An existing PVC to use instead of creating one.
+    existingClaim: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+web:
+  # AGENTBOT_WEB_VSCODE: the in-browser VS Code editor for the config workspace (requirements WEB-28).
+  vscode: true
+  # AGENTBOT_WEB_TRUSTED_PROXIES: addresses/CIDRs of the ingress controller pods (e.g. the pod network). Login attempts
+  # are then counted per right-most untrusted X-Forwarded-For entry instead of per controller pod (WEB-03).
+  trustedProxies: []
+  resources:
+    requests:
+      cpu: 100m
+      memory: 768Mi
+    limits:
+      memory: 2Gi
+  # The web home volume (RWO): config workspace copy, queued saves, code-server user data.
+  persistence:
+    size: 5Gi
+    storageClass: ""
+    existingClaim: ""
+  # The Ingress terminates TLS so that the session cookie is Secure (WEB-05). An empty tls.secretName uses the
+  # ingress controller's default certificate.
+  ingress:
+    enabled: false
+    className: ""
+    host: agentbot.example.com
+    annotations: {}
+    tls:
+      secretName: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+worker:
+  # Most worker pods at once (the ScaledJob's maxReplicaCount), also the orchestrator's AGENTBOT_WORKER_CAPACITY. To use
+  # them all, raise maxConcurrentJobs + maxChatSessions in Settings (RUN-11); the health warning says so until then.
+  maxReplicas: 10
+  # AGENTBOT_WORKER_ADDRESS_BINDING: one claim per worker pod address, worker ids bound to their first address
+  # (architecture §6). Set false only under a service mesh that rewrites workers' source addresses.
+  addressBinding: true
+  # A derived worker image with target-repo toolchains, built FROM the same AgentBot version (architecture §7.1).
+  # Empty repository = the AgentBot image above; empty tag = image.tag.
+  image:
+    repository: ""
+    tag: ""
+  # Checkout space per worker (STO-06): the checkout emptyDir's sizeLimit and AGENTBOT_WORKER_DISK. Ki, Mi, Gi or Ti.
+  diskLimit: 20Gi
+  # Memory-backed run-local emptyDir (status file, run-private auth store, omp's home); counts against the memory limit.
+  runDirLimit: 256Mi
+  # KEDA polling interval in seconds (architecture §4.4).
+  pollingInterval: 5
+  failedJobsHistoryLimit: 5
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1536Mi
+      ephemeral-storage: 20Gi
+    limits:
+      memory: 4Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+keda:
+  # The chart fails when the cluster has no keda.sh/v1alpha1 ScaledJob API (OPS-08). Set true only to render the
+  # chart without a cluster, e.g. `helm template` in CI (or pass --api-versions keda.sh/v1alpha1/ScaledJob).
+  skipCrdCheck: false
+
+# NetworkPolicies (SEC-15, security review F5). Ingress: orchestrator:8081 only from web, workers and KEDA; web:8080 only
+# from the ingress controller; nothing to workers. Egress: web reaches only DNS and the orchestrator; workers reach DNS,
+# the orchestrator and the internet except link-local addresses (cloud metadata: 169.254.169.254, fd00:ec2::254) and
+# worker.clusterCIDRs; the orchestrator's egress stays open. Helm merges selector maps with these defaults: to replace
+# a default label, set it to null (e.g. --set networkPolicy.keda.podSelector.matchLabels.app=null). Lists are replaced.
+networkPolicy:
+  enabled: true
+  # Who may reach the orchestrator's /internal/scale besides web and workers: the KEDA operator.
+  keda:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: keda
+    podSelector:
+      matchLabels:
+        app: keda-operator
+  web:
+    # Allow every source to web:8080, for clusters without an ingress controller (e.g. a LoadBalancer Service in
+    # front). kubectl port-forward is never affected by NetworkPolicies.
+    allowAll: false
+    # Who may reach web:8080: the ingress controller.
+    ingressController:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+  # Where web and workers resolve names (port 53, UDP and TCP): NetworkPolicy peers. The default is CoreDNS/kube-dns in
+  # kube-system. With NodeLocal DNSCache, add its address (link-local, so otherwise blocked for workers):
+  #   - ipBlock: { cidr: 169.254.20.10/32 }
+  dns:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+  worker:
+    # Ranges workers may not reach besides link-local: the cluster's pod and Service CIDRs. The default is every private
+    # range (RFC 1918, CGNAT 100.64.0.0/10 as used by EKS custom networking, IPv6 ULA), which contains them on nearly
+    # every cluster and also keeps workers off other private services. If workers need a private package registry or
+    # proxy, replace the list with your cluster's own CIDRs (e.g. kind: [10.244.0.0/16, 10.96.0.0/12]). IPv4 and IPv6
+    # entries may be mixed. The orchestrator stays reachable (its own rule).
+    clusterCIDRs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"]

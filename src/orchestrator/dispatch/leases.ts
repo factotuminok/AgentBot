@@ -1,9 +1,10 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { Db, RunRow, RunState } from "../store/db";
+import { type ClaimedRun, type Db, hashLeaseToken, type RunRow, type RunState } from "../store/db";
 
 /**
  * Claims and leases (RUN-02, RUN-07, architecture §6). A worker claims once in its life: the claim is recorded per worker
- * id, so a worker whose run is going, or done, cannot claim a second one on any connection.
+ * id, so a worker whose run is going, or done, cannot claim a second one on any connection. The claiming connection's
+ * address is stored with the run, so the dispatcher can refuse a second claim from the same address under a new id.
  */
 
 /** States in which a lease is live. */
@@ -21,25 +22,25 @@ export function newLeaseToken(): string {
 }
 
 /**
- * Atomically claims the oldest pending run for `workerId` with a lease of `leaseMs`, recording the worker's one claim.
- * Null when nothing is pending or the worker has claimed before.
+ * Atomically claims the oldest pending run for `workerId` with a lease of `leaseMs`, recording the worker's one claim
+ * and the `address` it claimed from. Null when nothing is pending or the worker has claimed before.
  */
-export function claimNextRun(db: Db, workerId: string, leaseMs: number): RunRow | null {
+export function claimNextRun(db: Db, workerId: string, leaseMs: number, address?: string): ClaimedRun | null {
 	return db.raw.transaction(() => {
 		if (db.workerClaim(workerId) !== null) return null;
-		const row = db.claimRun(workerId, leaseMs);
+		const row = db.claimRun(workerId, leaseMs, address);
 		if (row) db.recordWorkerClaim(workerId, row.id);
 		return row;
 	})();
 }
 
-/** True when `token` is the live lease of `row` held by `workerId`. */
+/** True when `token` is the live lease of `row` held by `workerId` (the row stores the token's hash). */
 export function holdsLease(row: RunRow | null, workerId: string | undefined, token: string): row is RunRow {
 	return (
 		row !== null &&
 		row.lease_token !== null &&
 		LEASED_STATES.includes(row.state) &&
 		(workerId === undefined || row.worker_id === workerId) &&
-		sameToken(token, row.lease_token)
+		sameToken(hashLeaseToken(token), row.lease_token)
 	);
 }

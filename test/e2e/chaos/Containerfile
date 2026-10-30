@@ -1,0 +1,14 @@
+# Chaos stack image (test/e2e/chaos/run.ts), built from the repository root on top of the release image:
+#   podman build -f test/e2e/chaos/Containerfile --ignorefile test/e2e/chaos/Containerfile.containerignore -t localhost/agentbot-chaos:dev .
+# The Kubernetes scenario image's fakes and entry point (test/e2e/k8s/Containerfile), reached through `agentbot` itself:
+# the launcher starts workers with the entry point `agentbot worker`, so `/usr/local/bin/agentbot` dispatches
+# `orchestrator`, `worker` and `github` to the test programs and everything else to the real CLI.
+ARG BASE_IMAGE=localhost/agentbot:dev
+FROM ${BASE_IMAGE}
+USER 0:0
+COPY test/ /app/test/
+COPY --chmod=0755 test/e2e/k8s/entrypoint.sh /usr/local/bin/agentbot-k8s-e2e
+COPY --chmod=0755 test/e2e/chaos/agentbot.sh /usr/local/bin/agentbot
+# The fake GitHub's volume inherits this ownership when Podman creates it.
+RUN install -d -o 10001 -g 10001 -m 0700 /e2e-github
+USER 10001:10001

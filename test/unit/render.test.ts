@@ -121,7 +121,12 @@ test("OOM warning appears before Testing and in follow-ups only when processes w
 	expect(done(2).indexOf("Local verification incomplete")).toBeLessThan(done(2).indexOf("**Testing:**"));
 	expect(done(0)).not.toContain("Local verification incomplete");
 
-	const followUp = (kind: "revise" | "fix_ci", pushed: boolean, oomKills: number) => followUpMessage({ agentName, kind, prNumber: 7, pushed, summary: "sum", checks: "ci", oomKills });
+	const followUp = (kind: "revise" | "fix_ci", pushed: boolean, oomKills: number) =>
+		followUpMessage(
+			kind === "revise"
+				? { agentName, kind, prNumber: 7, pushed, summary: "sum", oomKills }
+				: { agentName, kind, prNumber: 7, pushed, summary: "sum", checks: "ci", attempt: 2, maxAttempts: 3, oomKills },
+		);
 	for (const [kind, pushed] of [["revise", true], ["revise", false], ["fix_ci", true], ["fix_ci", false]] as const) {
 		const warned = followUp(kind, pushed, 1);
 		expect(warned).toContain("Local verification incomplete");

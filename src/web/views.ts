@@ -1,5 +1,8 @@
 import type { AdminState } from "../shared/adminApi";
+import { CHANNELS_UNCONFIGURED, type ChannelListing } from "../shared/adminChannels";
+import { CHANNEL_EXTRAS, channelFieldHtml } from "./channelFields";
 import {
+	CHANNEL_FIELDS,
 	CONFIG_FIELDS,
 	configDefault,
 	MAX_USERNAME_CHARS,
@@ -147,7 +150,7 @@ export function layout(title: string, body: string): string {
 </html>`;
 }
 
-export type SitePageId = "status" | "settings" | "status-json" | "healthz";
+export type SitePageId = "status" | "logs" | "settings" | "repos" | "models" | "omp" | "skills" | "vscode" | "status-json" | "healthz";
 export type NavPage = "home" | SitePageId;
 
 export interface SitePage {
@@ -156,24 +159,38 @@ export interface SitePage {
 	href: string;
 }
 
-/** Every page, in order. The home cards and the ☰ menu are both built from this list (WEB-10). */
-export const SITE_PAGES: readonly SitePage[] = [
+/** Every page, in order. The home cards and the ☰ menu are both built from this list (WEB-10), through `sitePages`. */
+const SITE_PAGES: readonly SitePage[] = [
 	{ id: "status", title: "Status", href: "/status" },
+	{ id: "logs", title: "Logs", href: "/logs" },
 	{ id: "settings", title: "Settings", href: "/admin" },
+	{ id: "repos", title: "Repositories", href: "/admin/repos" },
+	{ id: "models", title: "Model accounts", href: "/admin/models" },
+	{ id: "omp", title: "omp and MCP", href: "/admin/omp" },
+	{ id: "skills", title: "Skills and agents", href: "/admin/skills" },
+	{ id: "vscode", title: "VS Code", href: "/admin/vscode/" },
 	{ id: "status-json", title: "Status JSON", href: "/status.json" },
 	{ id: "healthz", title: "Health check", href: "/healthz" },
 ];
 
 const HOME_PAGE = { id: "home", title: "Home", href: "/" } as const;
 
+/** The site pages; VS Code only when it is on (`AGENTBOT_WEB_VSCODE`). */
+export function sitePages(vscode: boolean): readonly SitePage[] {
+	return vscode ? SITE_PAGES : SITE_PAGES.filter(page => page.id !== "vscode");
+}
+
 /** The one anchor renderer for cards and menu entries; marks the page being viewed. */
 export function pageLink(page: SitePage | typeof HOME_PAGE, current?: NavPage): string {
 	return `<a href="${esc(page.href)}"${page.id === current ? ' aria-current="page"' : ""}>${esc(page.title)}</a>`;
 }
 
-/** Navigation shared by the logged-in pages: a ☰ button that discloses every page, the theme selector and Log out. */
-export function nav(current: NavPage): string {
-	const items = [HOME_PAGE, ...SITE_PAGES].map(page => `<li>${pageLink(page, current)}</li>`).join("\n");
+/**
+ * Navigation shared by the logged-in pages: a ☰ button that discloses every page, the theme selector and Log out.
+ * `vscode`: VS Code is on, so the menu lists it.
+ */
+export function nav(current: NavPage, vscode: boolean): string {
+	const items = [HOME_PAGE, ...sitePages(vscode)].map(page => `<li>${pageLink(page, current)}</li>`).join("\n");
 	return `<nav><strong>AgentBot</strong>
 <button type="button" class="menu-toggle" aria-expanded="false" aria-controls="site-menu"><span aria-hidden="true">☰</span> Menu</button>
 <div id="site-menu" class="menu" hidden>
@@ -280,8 +297,8 @@ export function errorPage(message: string): string {
 }
 
 /** A logged-in page whose data could not be loaded because the orchestrator is unavailable. */
-export function unavailablePage(current: NavPage, title: string, reason: string): string {
-	return layout(title, `${nav(current)}<h1>${esc(title)}</h1>${messages(`${ORCHESTRATOR_UNAVAILABLE}: ${reason}`)}`);
+export function unavailablePage(current: NavPage, vscode: boolean, title: string, reason: string): string {
+	return layout(title, `${nav(current, vscode)}<h1>${esc(title)}</h1>${messages(`${ORCHESTRATOR_UNAVAILABLE}: ${reason}`)}`);
 }
 
 function secretStatus(set: boolean): string {
@@ -315,12 +332,16 @@ const FORM_HELP = {
 	confirm: { text: "The new password again, to catch typos." },
 } satisfies Record<string, Help>;
 
-function settingsForm(state: SettingsFormState): string {
+/** Channel fields are typed ids, dropdowns or a listing error (WEB-20 to WEB-23); `channels` says which. */
+function settingsForm(state: SettingsFormState, channels: ChannelListing): string {
+	const channelFields: string[] = Object.values(CHANNEL_FIELDS);
 	const sections: string[] = [];
 	for (const [section, legend] of Object.entries(SECTION_LABELS)) {
 		const fields = CONFIG_FIELDS.filter(def => def.name.startsWith(`${section}.`)).map(def => {
 			const hint = def.kind === "list" ? ' placeholder="comma or space separated"' : def.kind === "number" ? ' inputmode="decimal"' : "";
-			return textInput(def.name, def.label, state.config[def.name] ?? "", hint, { text: def.help, example: def.example, fallback: configDefault(def) });
+			const help = { text: def.help, example: def.example, fallback: configDefault(def) };
+			const typed = textInput(def.name, def.label, state.config[def.name] ?? "", hint, help);
+			return channelFields.includes(def.name) ? channelFieldHtml(def.name, state.config, channels, labelWithHelp(def.name, def.label, help), typed) : typed;
 		});
 		sections.push(`<fieldset><legend>${esc(legend)}</legend>${fields.join("\n")}</fieldset>`);
 	}
@@ -376,16 +397,20 @@ export interface AdminPageOptions {
 	username: string;
 	/** Undefined when the settings cannot be shown (vault locked); `settingsError` says why. */
 	settings?: SettingsFormState;
+	/** The Discord channel listing for the channel fields; omitted, they are typed ids (WEB-23). */
+	channels?: ChannelListing;
 	flash?: Flash;
 	settingsError?: string;
 	accountError?: string;
+	/** VS Code is on (menu entry). */
+	vscode: boolean;
 }
 
 export function adminPage(opts: AdminPageOptions): string {
 	const { state } = opts;
 	return layout(
 		"Settings",
-		`${nav("settings")}
+		`${nav("settings", opts.vscode)}
 <h1>Settings</h1>
 ${messages(undefined, opts.flash)}
 <section class="status" aria-live="polite">
@@ -395,7 +420,8 @@ ${messages(undefined, opts.flash)}
 </section>
 <h2>Settings</h2>
 ${messages(opts.settingsError)}
-${opts.settings ? settingsForm(opts.settings) : ""}
+${opts.settings ? settingsForm(opts.settings, opts.channels ?? { state: "unconfigured", message: CHANNELS_UNCONFIGURED }) : ""}
+${opts.settings && opts.channels && opts.channels.state !== "unconfigured" ? CHANNEL_EXTRAS : ""}
 <h2>Account</h2>
 ${messages(opts.accountError)}
 <form method="post" action="/admin/account">

@@ -147,7 +147,7 @@ Any non-terminal state also accepts `cancelled`.
   | `fixMinutes` | 45 |
   | `maxCostUsdPerJob` | $15 |
 
-  Exceeding a limit MUST fail the job with a message that names the limit.
+  `maxCostUsdPerJob` bounds the job's total cost (JOB-04), including the CI fix runs of an implement job and a run re-executed after a restart or a lost worker: each agent run gets what the job's earlier runs left, and a job with nothing left fails before starting another run. Exceeding a limit MUST fail the job with a message that names the limit.
 
 ### 4.1 Restart and resume
 
@@ -288,13 +288,13 @@ Any non-terminal state also accepts `cancelled`.
   | plan | `{summary, planMarkdown, complexity}` |
   | request plan (`/work plan`) | plan schema plus `title` (imperative, < 80 characters) |
   | implement | `{prTitle, prBody, testing}` |
-  | revise, fix_ci | `{summary}` |
+  | revise, fix_ci | `{summary}` (no other properties) |
   | chat | `{answer}` |
   | draft | `{title, body}`, with body sections Summary, Context (file paths), Acceptance criteria and Open questions |
 
   A yield counts only when it succeeds. If the session ends without a yield, the system MUST send one nudge. If there is still no yield, the run MUST fail with "finished without calling yield".
 - **AGT-13** The prompts MUST tell the agent the rules for its kind:
-  - plan, chat and draft are read-only;
+  - plan, chat and draft are read-only. This is enforced by the prompt only: anything such a run writes stays in its private checkout and is discarded with it, and nothing is pushed (WS-04);
   - implement commits, references the issue, and MUST NOT push or change remotes or credentials;
   - fix_ci fixes the root cause and MUST NOT disable checks;
   - an exit code of 137 or "Killed" means out of memory, and the agent MUST NOT re-run the command and MUST report it;
@@ -309,7 +309,7 @@ Any non-terminal state also accepts `cancelled`.
   | Chat | 20 min (not configurable) |
   | Draft | 10 min |
 
-  Cost is limited to `maxCostUsdPerJob` for every kind.
+  Cost is limited to `maxCostUsdPerJob` for every kind: what is left of the job's budget for job runs (JOB-07), the full amount per turn for chat, `/work plan` and draft runs.
 - **AGT-15** Steering text MUST reach the live session as `[Discord @user]: <text>`. A steer sent before the session is ready MUST be refused with "not ready". Each steer MUST be recorded in the transcript.
 
 ### 6.4 To-do list
@@ -385,12 +385,12 @@ Any non-terminal state also accepts `cancelled`.
 |---|---|
 | `/work start repo issue` | If the issue is tracked, reply with its thread and state. If it is closed, ask to reopen it. Otherwise add the trigger label, start tracking it at once (without waiting for a poll), open its thread (DSC-34) and reply with the link. |
 | `/work issue repo request` (≤ 4000 characters) | Draft the issue with the read-only `draft` profile on a worker (10 min), with live progress in the command's reply. File the issue with the trigger label and the quoted request appended. Start tracking it at once, then show ✅ with the issue number, link and planning thread. |
-| `/work plan repo prompt` (≤ 4000 characters) | Post a starter message `📋 **Plan** — <request>` in the channel where the command ran, start a thread from it, and run planning on the request (§7.6). |
-| `/work ask repo prompt` | Post a starter message in the channel where the command ran and start a one-day thread for a repo chat (§8.1). |
+| `/work plan repo prompt` (≤ 4000 characters) | Refuse ephemerally when chat capacity is full (DSC-25), before posting anything. Otherwise post a starter message `📋 **Plan** — <request>` in the channel where the command ran, start a thread from it, and run planning on the request (§7.6). |
+| `/work ask repo prompt` | Refuse ephemerally when chat capacity is full (CHAT-04), before posting anything. Otherwise post a starter message in the channel where the command ran and start a one-day thread for a repo chat (§8.1). |
 | `/work watch repo` | Watch a repository: create its permanent channel and start looking for labelled issues there (DSC-35). |
 | `/work unwatch [repo]` | Stop watching (DSC-36). In a watch channel the repository defaults to that channel's. |
 | `/work status` | Ephemeral list of watched repositories with their channels, open issues (repo#n, state, current job, thread), active chats and plans, or "Nothing active." |
-| `/work cancel` | In an issue thread, cancel the issue. In a plan thread, stop or reject the plan. Anywhere else, reply "Use inside an issue or plan thread". |
+| `/work cancel` | In an issue thread, cancel the issue. In a plan thread, stop or reject the plan. In a `/work ask` or `/ask` thread, stop the live run (CHAT-05), or say that nothing is running. Anywhere else, reply "Use inside an issue, plan or chat thread". |
 | `/ask prompt [file file2 file3]` | Ask-only chat (§8.2). |
 
 - **DSC-09** The `repo` option of every `/work` subcommand MUST autocomplete from the available repositories that are not archived (GH-25), filtered by what the user has typed, with watched repositories first. Discord shows at most 25 suggestions. The submitted value MUST be checked against the available repositories, and anything else refused.
@@ -460,7 +460,7 @@ Any non-terminal state also accepts `cancelled`.
 
 ### 7.6 `/work plan`
 
-- **DSC-25** Planning MUST run on its own worker with a private checkout of the base branch, the `plan` profile, `planMinutes` and the cost limit. Concurrent plan runs MUST be capped at `maxChatSessions`.
+- **DSC-25** Planning MUST run on its own worker with a private checkout of the base branch, the `plan` profile, `planMinutes` and the cost limit. Concurrent plan runs MUST be capped at `maxChatSessions`, shared with chats and `/work issue` drafts; a full budget refuses `/work plan` before any thread is created.
 - **DSC-26** The result MUST be posted as "Plan ready for your review" with `plan-rev<n>.md` and four buttons. Only the latest rev's buttons MUST act; transitions are compare-and-set.
 
   | Button | Effect |
@@ -499,7 +499,7 @@ Any non-terminal state also accepts `cancelled`.
 - **CHAT-03** A reply in the thread MUST steer the live run, or resume the same omp session in a new run on a new worker.
 - **CHAT-04** Admission MUST be refused when:
   - the thread already has a run starting;
-  - `limits.maxChatSessions` (default 2) chats are already active;
+  - `limits.maxChatSessions` (default 2) chats, plans and drafts are already active; a new `/work ask` or `/ask` is then refused before any thread is created;
   - DSC-06 applies.
 - **CHAT-05** A stop MUST post "Stopped." When a limit is hit, the system MUST post which limit stopped the run and that sending another message continues it. Failures MUST post the error and invite a retry.
 - **CHAT-06** Every 60 s, ask chats idle longer than `limits.chatIdleMinutes` (default 30) with no active run MUST have their scratch directory removed. The session is kept so that the conversation can resume. Repo chats keep nothing between runs except the session.
@@ -533,7 +533,7 @@ Any non-terminal state also accepts `cancelled`.
 
 - **WEB-01** There MUST be no configuration files. All settings are entered in the web UI.
 - **WEB-02** On first start the system MUST log a one-time setup token (18 random bytes, base64url). `/setup` MUST exist only until the admin account is created. It MUST require the token (compared in constant time) and accept a username of 1–64 characters and a password of at least 12 characters, entered twice.
-- **WEB-03** Login MUST return the same failure for an unknown username and a wrong password, and MUST always pay the scrypt cost. After 5 failures in 15 minutes, an IP MUST be blocked for 15 minutes (HTTP 429 with the remaining time).
+- **WEB-03** Login MUST return the same failure for an unknown username and a wrong password, and MUST always pay the scrypt cost. After 5 failures in 15 minutes, an IP MUST be blocked for 15 minutes (HTTP 429 with the remaining time). Checks from one IP MUST run one at a time (a parallel attempt gets 429 with `Retry-After: 1`), so parallel posts can't get around the count. The IP is the connection's peer; when the peer is in `AGENTBOT_WEB_TRUSTED_PROXIES`, it is the right-most `X-Forwarded-For` entry that is not a trusted proxy. The orchestrator's `/login` and `/credentials` additionally allow 50 failed password checks per 15 minutes in total, one at a time, because every caller there holds the same web token (architecture §6).
 - **WEB-04** Changing credentials MUST require the current password and MUST end all other sessions.
 
 ### 9.2 Sessions and request security
@@ -549,6 +549,8 @@ Any non-terminal state also accepts `cancelled`.
   - `X-Content-Type-Options: nosniff`;
   - `Referrer-Policy: same-origin`;
   - `Cache-Control: no-store`.
+
+  Exemption: responses proxied from code-server under `/admin/vscode/` keep code-server's own `Content-Security-Policy` and `Cache-Control`, and get the other two headers. This CSP would break the workbench, which frames its webviews and loads its own scripts, and its static files are meant to be cached. The `/admin/vscode` redirect is built by the web server and sends all four.
 - **WEB-07** A POST or WebSocket upgrade whose `Origin` (or `Referer`) host is not the request host, or that has neither header, MUST be rejected with HTTP 403.
 - **WEB-08** Logout, and a login that expires, MUST close that login's code-server WebSockets. A sweep MUST run every 30 s.
 - **WEB-09** An unauthenticated HTML request MUST redirect to `/login`, or to `/setup` before setup. An unauthenticated JSON request MUST get HTTP 401 `{"error":"unauthorized"}`. Unhandled errors MUST return HTTP 500 without details.
@@ -586,22 +588,22 @@ Any non-terminal state also accepts `cancelled`.
 
   It MUST open the config workspace (WEB-25). The bundled AgentBot extension (WEB-28) MUST be installed at image build into a root-owned extensions directory that holds only it, so nothing else can be installed or removed; code-server loads it at every start. The extension marketplace MUST be disabled with `EXTENSIONS_GALLERY='{}'` and `extensions.allowed`, so no other extension can be installed. Only the bundled extension and the built-in JSON, YAML and Markdown support (plus the default themes) are present: every other built-in extension, including the debuggers, task providers, git and npm extensions, MUST be deleted from the image, because code-server has no per-extension disable flag.
 - **WEB-25** The config workspace MUST contain:
-  - `settings.json`: every setting in §13. Each secret appears only as `"<set>"` or `"<not set>"`.
-  - `omp.json`: omp setting overrides and MCP servers. Credential settings and MCP env and header values appear only as `"<set>"` or `"<not set>"`.
+  - `settings.json`: every setting in §13. Each secret appears only as `"<set>"` or `"<not set>"`. It appears once settings have been saved for the first time (on the Settings page).
+  - `omp.json`: omp setting overrides and MCP servers. Credential settings and MCP env and header values appear only as `"<set>"` or `"<not set>"`. In an MCP server URL, the user info and every query value appear as `<set>`; in stdio `args`, the argument after a flag named like a credential (`--api-key`, `--token`, `--secret`, `--password`, `--auth`, …) and the value of `--flag=value` for such a flag appear as `<set>`. Sent back unchanged, a masked URL or argument keeps the stored value; a credential typed there in clear, or a placeholder that doesn't match the stored value at that position, is refused, pointing to the omp page (and to headers or env where the server allows them).
   - `skills/<name>/SKILL.md` with any supporting files, and `agents/<name>.md`.
   - `README.md`, explaining how saving and conflicts work.
   - `.vscode/settings.json`, which maps JSON Schemas generated from the orchestrator's own validation rules to `settings.json` and `omp.json`, so VS Code validates and completes while typing.
 
   The admin account and model sign-ins are not in the workspace; they stay on their pages.
 - **WEB-26** The web process MUST watch the workspace and send each saved file to the orchestrator within 1 s, with the revision it was based on. The orchestrator MUST validate the file with the same rules as the web pages, and apply it only if it is valid:
-  - **`settings.json`:** the §13 rules, GH-02 and WEB-24. A valid file is applied exactly like a Settings page save (ENG-02); runs are not aborted. A `"<set>"` placeholder keeps the stored secret. A real value in a secret field MUST be rejected with "Set secrets on the Settings page".
-  - **`omp.json`:** AGT-20 to AGT-22, with the same placeholder rule ("Set credentials on the omp page"). Changes apply to runs that start afterwards (AGT-23).
-  - **`skills/` and `agents/`:** the AGT-25 rules, with at most 5 MiB per skill folder and no symlinks. Creating, changing or deleting a file or folder creates, changes or deletes that skill or agent. Changes apply to sessions that start afterwards (AGT-26).
+  - **`settings.json`:** the §13 rules, GH-02 and WEB-24. A valid file is applied exactly like a Settings page save (ENG-02); runs are not aborted. A `"<set>"` placeholder keeps the stored secret; `"<not set>"` or a missing entry means no value (a provider key is deleted). A real value in a secret field MUST be rejected with "Set secrets on the Settings page". Unknown keys are rejected, so a typo is reported instead of silently dropped. The stored file is re-rendered (defaults filled in, schema key order), and the web process replaces its copy with it.
+  - **`omp.json`:** AGT-20 to AGT-22, with the same placeholder rule ("Set credentials on the omp page") and the same rejection of unknown keys. Changes apply to runs that start afterwards (AGT-23).
+  - **`skills/` and `agents/`:** the AGT-25 rules, with at most 5 MiB per skill folder and no symlinks. The frontmatter `name` MUST equal the skill's folder name or the agent's file name. Creating, changing or deleting a file or folder creates, changes or deletes that skill or agent. A supporting file needs the skill's `SKILL.md` first; `SKILL.md` alone cannot be deleted (delete the folder). Changes apply to sessions that start afterwards (AGT-26).
 
-  A file that fails validation changes nothing in the orchestrator, and the local file keeps the edit.
+  A file that fails validation changes nothing in the orchestrator, and the local file keeps the edit. A file's revision is the sha256 of its content as the orchestrator renders it, so changes made on the web pages change it without bookkeeping.
 - **WEB-27** The orchestrator is the source of truth for the workspace:
   - **Remote changes.** Changes made elsewhere (the web pages, or another editor) MUST reach the workspace within 5 s. A remote change overwrites a local file only if the local file still equals its last-synced content.
-  - **Conflicts.** If the local file was changed, or a save was based on an older revision, web MUST write the orchestrator's version next to it as `<file>.remote` and report a conflict. Nothing is applied until the admin saves a merged file or accepts the server version.
+  - **Conflicts.** If the local file was changed, or a save was based on an older revision, web MUST write the orchestrator's version next to it as `<file>.remote` (empty when the file was deleted there) and report a conflict. Nothing is applied until the admin saves the file again (that save counts as the merge) or accepts the server version.
   - **Orchestrator unreachable.** Saves MUST be queued on the web home volume, so that a web restart does not lose them, and sent once the orchestrator is back.
 - **WEB-28** The bundled AgentBot extension MUST show:
   - the sync status in the status bar: synced, saving, rejected, conflict, or orchestrator unavailable;
@@ -653,7 +655,7 @@ Any non-terminal state also accepts `cancelled`.
 - **WEB-23** Before the bot token and guild id are stored, each channel field MUST say "Save the Discord bot token and guild id to choose channels" instead of a dropdown.
   - If listing fails, the fields MUST show the error inline with a **Retry** button, and the rest of the page MUST stay usable. Errors include an invalid token, Discord being unreachable, and the bot not being a member of the guild. For the last one, the message MUST include the bot's invite link. That link grants the WEB-21 channel permissions plus Change Nickname (DSC-29) and Manage Channels (DSC-38).
   - The list MUST be cached for at most 60 s, and a **Refresh** button MUST reload it, so that new channels and permission changes appear without a restart.
-- **WEB-24** On save, the orchestrator MUST check every configured channel against the live guild. A channel that no longer exists, is not a text channel, or that the bot cannot view MUST make the save fail with a message naming the field and the channel. A work or ask-only channel that is a watch channel MUST also fail the save. Missing permissions other than View Channel MUST NOT block the save; they are shown as a warning with the result of the save. A configured channel that has disappeared MUST be shown in its field as "unknown channel <id>" so that it can be replaced.
+- **WEB-24** On save, the orchestrator MUST check every configured channel against the live guild. A channel that no longer exists, is not a text channel, or that the bot cannot view MUST make the save fail with a message naming the field and the channel. A work or ask-only channel that is a watch channel MUST also fail the save. Missing permissions other than View Channel MUST NOT block the save; they are shown as a warning with the result of the save. A configured channel that has disappeared MUST be shown in its field as "unknown channel <id>" so that it can be replaced. When the guild cannot be listed at save time (wrong bot token, bot not in the guild, Discord unreachable), the save MUST still succeed, with the warning "The Discord channels were not checked: <reason>", so that a wrong token can be corrected.
 
 ## 10. Observability
 
@@ -728,7 +730,7 @@ Any non-terminal state also accepts `cancelled`.
   - `setup` when no admin exists;
   - `locked` when the vault is locked;
   - `error` when the settings cannot be read;
-  - `unconfigured` when no settings have been saved;
+  - `unconfigured` when no settings have been saved, or when they have no work channel yet (`discord.workChannelId`), with the message "Choose the work channel in Settings (Discord) to start the engine.";
   - otherwise `starting`, then `running` or `error`, keeping the error message.
 
   Applying and stopping MUST be serialised. Runs on workers MUST NOT be aborted. Their worker connections are held by the internal API, not the engine, and stay open. Events that arrive while the engine is not `running` MUST be queued and applied once it is.
@@ -758,7 +760,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 |---|---|---|
 | `discord.guildId` | required string | none |
 | `discord.allowedUserIds`, `allowedRoleIds` | string lists; at least one non-empty | `[]` |
-| `discord.workChannelId` | required; a text channel chosen from the channel dropdown (§9.7), not an ask-only channel or a watch channel; DSC-33 | none |
+| `discord.workChannelId` | a text channel chosen from the channel dropdown (§9.7), not an ask-only channel or a watch channel; DSC-33. Not needed to save, so a fresh install can store the bot token first and then choose it; the engine stays `unconfigured` until it is set (ENG-02) | none |
 | `discord.watchCategoryId` | optional; a category for watch channels (DSC-35) | none (channels are created at the top level) |
 | `discord.askChannelIds` | string list chosen from the channel dropdown (§9.7); no duplicates, not the work channel or a watch channel | `[]` |
 | `github.appId` | positive integer, required | none |
@@ -789,6 +791,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 | `AGENTBOT_STATE_DIR` | state volume root (`<state>`), orchestrator only | `./state` (image: `/state`) |
 | `AGENTBOT_OMP_DIR` | skills and agents root, orchestrator only | `<state>/omp` |
 | `AGENTBOT_WEB_HOST` / `AGENTBOT_WEB_PORT` | web listener | `127.0.0.1` / `8080` (image host `0.0.0.0`) |
+| `AGENTBOT_WEB_TRUSTED_PROXIES` | web only: comma-separated CIDRs (or addresses) of reverse proxies in front of web. A request whose peer is in the list is attributed to the right-most `X-Forwarded-For` entry that is not, for the login throttle (WEB-03). Without it `X-Forwarded-For` is ignored. | none |
 | `AGENTBOT_MASTER_KEY_FILE` | path to the mounted master key file; orchestrator only; optional | none |
 | `AGENTBOT_INTERNAL_HOST` / `AGENTBOT_INTERNAL_PORT` | orchestrator internal API listener | `0.0.0.0` / `8081` |
 | `AGENTBOT_WEB_API_TOKEN_FILE`, `AGENTBOT_WORKER_TOKEN_FILE`, `AGENTBOT_SCALE_TOKEN_FILE` | mounted internal tokens (SEC-14), each only in the components that use it | none |
@@ -798,11 +801,17 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 | `AGENTBOT_ROLE` / command argument | `orchestrator`, `web`, `worker` or `launcher` | none |
 | `AGENTBOT_ORCHESTRATOR_URL` | internal API URL for web and workers | `http://orchestrator:8081` |
 | `AGENTBOT_WORKER_CLAIM_TIMEOUT` | how long a new worker waits for a run before exiting | `15s` |
+| `AGENTBOT_WORKER_ADDRESS_BINDING` | orchestrator only: one claim at a time per worker network address, and each worker id bound to the address it first connected from (architecture §6). Turn `off` only where workers share a source address (a service mesh that rewrites it). | `on` |
+| `AGENTBOT_WORKER_RUN_DIR` | worker: parent of the run-local root (status file, run-private auth store, omp's `HOME` and agent dir, `TMPDIR`; architecture §5). The launcher mounts a tmpfs there, Helm a memory `emptyDir`. | `$TMPDIR/agentbot-worker` (image: `/run/agentbot`) |
 | `AGENTBOT_WORKER_CAPACITY` | orchestrator and launcher: how many workers can run at once. Helm sets it to `worker.maxReplicas`; compose sets it on both services. | `4` (compose), `10` (Helm) |
-| `AGENTBOT_WORKER_IMAGE` | launcher only: a derived worker image with target-repo toolchains | the AgentBot image |
-| `AGENTBOT_WORKER_MEMORY` / `AGENTBOT_WORKER_DISK` | launcher only: per-worker memory limit and checkout space | `4g` / `20g` |
-| `AGENTBOT_PODMAN_SOCKET` | launcher only: rootless Podman API socket | `/run/podman/podman.sock` (mounted from `$XDG_RUNTIME_DIR/podman/podman.sock`) |
-| `AGENTBOT_LAUNCHER_ALLOW_ROOTFUL` | launcher only: accept a rootful socket (LCH-01); logs a warning at every start | unset |
+| `AGENTBOT_IMAGE` | launcher only: the AgentBot image the stack runs; compose sets it to the services' `image:` | required unless `AGENTBOT_WORKER_IMAGE` is set |
+| `AGENTBOT_WORKER_IMAGE` | launcher only: a derived worker image with target-repo toolchains (pulled on the host beforehand) | `AGENTBOT_IMAGE` |
+| `AGENTBOT_WORKER_NETWORK` | launcher only: the network workers join (a fixed `name:` in compose: `<AGENTBOT_NETWORK>-workers`, which only the orchestrator shares) | required |
+| `AGENTBOT_WORKER_SECRET` | launcher only: name of the Podman secret holding the worker token | `agentbot_worker_token` |
+| `AGENTBOT_WORKER_MEMORY` / `AGENTBOT_WORKER_DISK` | per-worker memory limit and checkout space; set by the launcher (Podman) or the chart (Helm). The orchestrator also reads `AGENTBOT_WORKER_DISK`: it refuses checkpoint and result bundles larger than it (or 2 GiB, whichever is smaller). | `4g` / `20g` |
+| `AGENTBOT_WORKER_CPUS` | launcher only: CPU quota per worker container, in CPUs as `podman run --cpus` (0.01 to 1024, fractions allowed). Helm sets CPU through `worker.resources`. | `2` |
+| `AGENTBOT_PODMAN_SOCKET` | launcher only: rootless Podman API socket | `/run/podman/podman.sock` (mounted from `$XDG_RUNTIME_DIR/podman/podman.sock`, or `AGENTBOT_HOST_PODMAN_SOCKET` in compose) |
+| `AGENTBOT_LAUNCHER_ALLOW_ROOTFUL` | launcher only: accept a rootful Podman socket (LCH-01); logs a warning at every start | unset |
 | `AGENTBOT_VERSION`, `AGENTBOT_COMMIT`, `AGENTBOT_BUILD_DATE` | build info on the home page | `package.json` version |
 
 ## 14. Persistence
@@ -817,10 +826,10 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
   - watches (repository id, `owner/name`, channel id, created by (Discord user id or admin username), state `watching`, `unwatched` or `suspended`, `lastError`; DSC-35 to DSC-37) and their poll cursors;
   - seen feedback (repo, PR, item id);
   - agent runs (usage);
-  - runs (state, kind, owner, worker id, lease token and expiry, loss count, omp version used, start commit, whether a kept result or checkpoint exists; architecture §4.1);
+  - runs (state, kind, owner, worker id, lease token and expiry, loss count, omp version used, repository, start ref and commit, `setupCommand`, the earlier run it continues, whether a kept result or checkpoint exists; architecture §4.1, RUN-17);
   - outgoing relay messages to workers that have not been acknowledged yet (architecture RUN-06);
   - open questions (run, Discord message ids, options; RUN-08);
-  - a key-value store (vault, log cap, omp update state, loadouts, label names last applied (GH-23), the revision of each config workspace file (WEB-26), and per run owner the Discord ids of the thread, status message and to-do message with the latest progress snapshot and to-do list (architecture RUN-14)).
+  - a key-value store (vault, log cap, omp update state, loadouts, label names last applied (GH-23), and per run owner the Discord ids of the thread, status message and to-do message with the latest progress snapshot and to-do list (architecture RUN-14)). Config workspace revisions are content hashes (WEB-26) and need no storage.
 
   Model sign-ins live in omp's own SQLite store `<state>/omp-agent/agent.db`, next to the main database (CRED-01). The packed omp runtime copies and their failed markers live in `<state>/omp-runtime/` (architecture §8).
 - **DB-03** All persistent state MUST live in the orchestrator's **state** volume (`<state>`, RWO): the database, the model sign-in store, the mirrors and their runs repos with the temporary refs, session files, ask scratch files, skills and agents, omp runtime copies, and the orchestrator and agent logs. The web pod has its own **web home** volume (RWO) for the `agentbot` user's `$HOME`: the synced copy of the config workspace (WEB-25), queued saves (WEB-27) and code-server data. Workers keep nothing: their checkout and run-local storage are deleted with them (architecture §5, RUN-20). No volume is shared between components.
@@ -844,7 +853,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
   - three long-running services, `orchestrator`, `web` and `launcher`, with the launcher starting one worker container per run through the rootless Podman socket (architecture LCH-01 to LCH-04);
   - only web publishes a port: `127.0.0.1:8080`;
   - named volumes `agentbot-state` and `agentbot-web`;
-  - Podman secrets mounted per service;
+  - secrets mounted per service (files, plus the worker token as a Podman secret for workers; architecture §7.2);
   - `restart: unless-stopped` and a health check per service.
 
   Docker Engine is not supported for this stack, because the launcher refuses a rootful socket.
@@ -891,9 +900,14 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 
 ## 20. Open questions
 
-These follow from the requirements as written and probably need a deliberate decision before implementation.
+None open. The four questions listed here before phase 5 were settled as follows, and the requirements above say so:
 
-1. `/work ask` and `/work plan` create the thread before they check capacity (CHAT-04, DSC-25). A full system therefore refuses inside the new thread instead of refusing up front.
-2. `/work cancel` works only in issue and plan threads. Chats stop only at a limit or when their worker is lost (architecture RUN-04).
-3. The revise and fix_ci output schema (AGT-12) should reject extra properties like the other schemas do.
-4. The `plan` profile grants `bash` (AGT-08), so read-only planning (AGT-13) is enforced only by the prompt.
+1. `/work ask` and `/work plan` check chat capacity before they post anything, and a full system refuses ephemerally (CHAT-04, DSC-25).
+2. `/work cancel` in a `/work ask` or `/ask` thread stops the live run (§7.2, CHAT-05).
+3. The revise and fix_ci output schema rejects extra properties, like the other schemas (AGT-12).
+4. Read-only planning stays enforced by the prompt only: anything a read-only run writes stays in its private checkout and is discarded with it, and nothing is pushed (AGT-13, WS-04).
+
+Settled in phase 6:
+
+5. The work channel is not needed to save settings, only to start the engine (§13, ENG-02). Otherwise a fresh install would have to type a channel ID before the bot token is stored, and could never choose it from the dropdown (WEB-20, WEB-23).
+6. A save whose channels cannot be checked because the guild cannot be listed succeeds with a warning (WEB-24).

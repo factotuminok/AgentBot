@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agentbot.orchestratorService" . }}
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "orchestrator") | nindent 4 }}
+spec:
+  # Never two gateways or two SQLite writers (architecture §7.3).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "agentbot.selectorLabels" (dict "root" . "component" "orchestrator") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "agentbot.labels" (dict "root" . "component" "orchestrator") | nindent 8 }}
+    spec:
+      {{- include "agentbot.podSpec" . | nindent 6 }}
+      {{- with include "agentbot.scheduling" .Values.orchestrator | trim }}{{ . | nindent 6 }}{{ end }}
+      containers:
+        - name: orchestrator
+          image: {{ include "agentbot.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["orchestrator"]
+          env:
+            - name: AGENTBOT_MASTER_KEY_FILE
+              value: /run/secrets/agentbot_master_key
+            - name: AGENTBOT_WEB_API_TOKEN_FILE
+              value: /run/secrets/agentbot_web_api_token
+            - name: AGENTBOT_WORKER_TOKEN_FILE
+              value: /run/secrets/agentbot_worker_token
+            - name: AGENTBOT_SCALE_TOKEN_FILE
+              value: /run/secrets/agentbot_scale_token
+            - name: AGENTBOT_WORKER_CAPACITY
+              value: {{ .Values.worker.maxReplicas | quote }}
+            # Checkpoint and result bundles larger than a worker's checkout limit are refused (STO-06).
+            - name: AGENTBOT_WORKER_DISK
+              value: {{ include "agentbot.workerDisk" . | quote }}
+            {{- if not .Values.worker.addressBinding }}
+            - name: AGENTBOT_WORKER_ADDRESS_BINDING
+              value: "off"
+            {{- end }}
+          ports:
+            - name: internal
+              containerPort: 8081
+          # Both succeed in every engine phase (§4.5), so a configuration error does not crash-loop.
+          startupProbe:
+            httpGet: { path: /livez, port: internal }
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /readyz, port: internal }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /livez, port: internal }
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.orchestrator.resources | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: /state
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-state" (include "agentbot.fullname" .)) .Values.orchestrator.persistence.existingClaim }}
+        {{- include "agentbot.secretVolume" (dict "root" . "keys" (list "master-key" "web-api-token" "worker-token" "scale-token")) | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agentbot.orchestratorService" . }}
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "orchestrator") | nindent 4 }}
+spec:
+  # Never published outside the cluster (SEC-15).
+  type: ClusterIP
+  selector:
+    {{- include "agentbot.selectorLabels" (dict "root" . "component" "orchestrator") | nindent 4 }}
+  ports:
+    - name: internal
+      port: 8081
+      targetPort: internal

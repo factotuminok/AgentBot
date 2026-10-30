@@ -76,6 +76,39 @@ describe("usageReport", () => {
 		]);
 		expect(jobs[1]!.avgDurationMs).toBeGreaterThanOrEqual(0);
 	});
+
+	test("setup time: claim and agent start are recorded; per repository over the window, slowest average first (NFR-06)", () => {
+		const db = openDb(":memory:");
+		// Recording: the claim stamps claimed_at, `registered` (→ running) stamps started_at.
+		const recorded = db.insertRun({ kind: "draft", draftId: "d0", repo: "o/a" });
+		const claimed = db.claimRun("worker-1", 60_000)!;
+		expect(claimed.id).toBe(recorded.id);
+		expect(claimed.claimed_at).not.toBeNull();
+		expect(claimed.started_at).toBeNull();
+		const started = db.transitionRun(recorded.id, ["assigned"], "running")!;
+		expect(Date.parse(started.started_at!)).toBeGreaterThanOrEqual(Date.parse(claimed.claimed_at!));
+
+		const at = (msAgo: number) => new Date(NOW.getTime() - msAgo).toISOString();
+		const setupRun = (id: string, repo: string | undefined, setupMs: number, startedMsAgo: number) => {
+			const row = db.insertRun({ kind: repo ? "draft" : "ask", draftId: id, ...(repo ? { repo } : {}) });
+			db.raw.run("UPDATE runs SET claimed_at = ?, started_at = ? WHERE id = ?", [at(startedMsAgo + setupMs), at(startedMsAgo), row.id]);
+		};
+		db.raw.run("DELETE FROM runs");
+		setupRun("d1", "o/fast", 10_000, 3_600_000);
+		setupRun("d2", "o/slow", 300_000, 3_600_000);
+		setupRun("d3", "o/slow", 100_000, 7_200_000);
+		setupRun("d4", undefined, 4_000, 3_600_000);
+		setupRun("d5", "o/fast", 900_000, 3 * 86_400_000); // outside 24h
+		// Never started (still setting up): not counted.
+		db.insertRun({ kind: "draft", draftId: "d6", repo: "o/fast" });
+
+		expect(usageReport(db, "24h", NOW).setup).toEqual([
+			{ repo: "o/slow", runs: 2, avgMs: 200_000, maxMs: 300_000 },
+			{ repo: "o/fast", runs: 1, avgMs: 10_000, maxMs: 10_000 },
+			{ repo: "ask", runs: 1, avgMs: 4_000, maxMs: 4_000 },
+		]);
+		expect(usageReport(db, "7d", NOW).setup[0]).toEqual({ repo: "o/fast", runs: 2, avgMs: 455_000, maxMs: 900_000 });
+	});
 });
 
 test("parseUsageWindow falls back to 7d for unknown values", () => {

@@ -35,13 +35,16 @@ async function main(): Promise<void> {
 			return;
 		}
 		case "health": {
-			// The worker's probe; the launcher's arrives with the launcher (phase 8).
+			// One probe command for both roles that use it: a launcher container has the launcher's status file.
+			const { hasLauncherStatus, runLauncherHealth } = await import("./launcher/status");
+			if (process.env.AGENTBOT_ROLE === "launcher" || hasLauncherStatus()) process.exit(runLauncherHealth());
 			const { runWorkerHealth } = await import("./worker/health");
 			process.exit(runWorkerHealth(process.argv.slice(3)));
 		}
-		case "launcher":
-			log("error", `the ${arg} command is not built yet`, { command: arg });
-			process.exit(2);
+		case "launcher": {
+			const { runLauncher } = await import("./launcher/main");
+			await runLauncher();
+		}
 	}
 }
 

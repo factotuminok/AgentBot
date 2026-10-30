@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agentbot.webService" . }}
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "web") | nindent 4 }}
+spec:
+  replicas: 1
+  # The web home is a ReadWriteOnce volume: a rolling update could not attach it to a second pod on another node.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "agentbot.selectorLabels" (dict "root" . "component" "web") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "agentbot.labels" (dict "root" . "component" "web") | nindent 8 }}
+    spec:
+      {{- include "agentbot.podSpec" . | nindent 6 }}
+      {{- with include "agentbot.scheduling" .Values.web | trim }}{{ . | nindent 6 }}{{ end }}
+      containers:
+        - name: web
+          image: {{ include "agentbot.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["web"]
+          env:
+            - name: AGENTBOT_WEB_API_TOKEN_FILE
+              value: /run/secrets/agentbot_web_api_token
+            - name: AGENTBOT_ORCHESTRATOR_URL
+              value: {{ include "agentbot.orchestratorUrl" . }}
+            - name: AGENTBOT_WEB_VSCODE
+              value: {{ ternary "on" "off" .Values.web.vscode | quote }}
+            {{- with .Values.web.trustedProxies }}
+            - name: AGENTBOT_WEB_TRUSTED_PROXIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+          # /healthz never fails because of the orchestrator (§4.5).
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+          volumeMounts:
+            - name: home
+              mountPath: /home/agentbot
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-web-home" (include "agentbot.fullname" .)) .Values.web.persistence.existingClaim }}
+        {{- include "agentbot.secretVolume" (dict "root" . "keys" (list "web-api-token")) | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agentbot.webService" . }}
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "web") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "agentbot.selectorLabels" (dict "root" . "component" "web") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+{{- if .Values.web.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "agentbot.webService" . }}
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "web") | nindent 4 }}
+  {{- with .Values.web.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.web.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  # Always TLS: the session cookie is Secure only over HTTPS (WEB-05, X-Forwarded-Proto from the controller).
+  tls:
+    - hosts:
+        - {{ required "web.ingress.host is required when the Ingress is enabled" .Values.web.ingress.host | quote }}
+      {{- with .Values.web.ingress.tls.secretName }}
+      secretName: {{ . }}
+      {{- end }}
+  rules:
+    - host: {{ .Values.web.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "agentbot.webService" . }}
+                port:
+                  name: http
+{{- end }}

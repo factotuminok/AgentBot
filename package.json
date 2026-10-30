@@ -9,7 +9,9 @@
   "scripts": {
     "start": "bun run src/cli.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:vsix": "bun scripts/build-vsix.ts",
+    "dry-run": "bun scripts/dry-run.ts"
   },
   "dependencies": {
     "@oh-my-pi/pi-coding-agent": "18.12.1",

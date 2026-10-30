@@ -3,7 +3,7 @@ import { lstat, readdir, rm } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { errorMessage, log } from "../../shared/log";
 import { TERMINAL_STATES } from "../engine/state";
-import type { Db, PlanRow } from "./db";
+import type { Db, DraftRow, PlanRow } from "./db";
 
 /**
  * omp session files the orchestrator keeps between runs (JOB-10, ENG-05), ported from DevForge `src/sessions.ts`.
@@ -143,11 +143,23 @@ export async function removePlanSession(deps: SessionDeps, plan: PlanRow): Promi
 	}
 }
 
-/** Engine start (ENG-03 step 4, ENG-05): done/cancelled issues and rejected plans that still store a session. Never throws. */
+/** Deletes an ended (`done`/`failed`) `/work issue` draft's session and clears `session_file`. No-op otherwise. Never throws. */
+export async function removeDraftSession(deps: SessionDeps, draft: DraftRow): Promise<void> {
+	try {
+		if ((draft.state !== "done" && draft.state !== "failed") || !draft.session_file) return;
+		const { kept } = await removeSessions(deps.sessionDir, [draft.session_file], { repo: draft.repo, draft: draft.id });
+		if (kept.length === 0) deps.db.updateDraft(draft.id, { session_file: null });
+	} catch (err) {
+		log("warn", "draft session removal failed", { draft: draft.id, error: errorMessage(err) });
+	}
+}
+
+/** Engine start (ENG-03 step 4, ENG-05): done/cancelled issues, rejected plans and ended drafts that still store a session. Never throws. */
 export async function sweepSessions(deps: SessionDeps): Promise<void> {
 	try {
 		for (const issue of deps.db.closedIssuesWithSessions()) await removeIssueSessions(deps, issue.id);
 		for (const plan of deps.db.plansInState("rejected")) if (plan.session_file) await removePlanSession(deps, plan);
+		for (const draft of deps.db.draftsInState("done", "failed")) if (draft.session_file) await removeDraftSession(deps, draft);
 	} catch (err) {
 		log("warn", "session sweep failed", { error: errorMessage(err) });
 	}

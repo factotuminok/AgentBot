@@ -5,10 +5,11 @@ import { createInteractionRouter } from "../../src/orchestrator/discord/interact
 import { createThreadReplies } from "../../src/orchestrator/discord/replies";
 import { createFakeDispatcher, type FakeDispatcher } from "../../src/orchestrator/dispatch/fake";
 import type { EngineDeps } from "../../src/orchestrator/engine/deps";
+import { createChatSlots } from "../../src/orchestrator/engine/chatSlots";
 import { createGitHub } from "../../src/orchestrator/github/app";
 import { openAgentLog } from "../../src/orchestrator/store/agentlog";
 import { type Db, openDb } from "../../src/orchestrator/store/db";
-import { parseConfig, resolveLabelNames } from "../../src/shared/config";
+import { hasWorkChannel, parseConfig, resolveLabelNames } from "../../src/shared/config";
 import { createFakeDiscord, type FakeDiscord } from "./discord";
 import { type FakeGitHub, startFakeGitHub } from "./github";
 
@@ -39,6 +40,7 @@ export async function createEngineHarness(opts: { config?: Record<string, unknow
 		github: { appId: 1 },
 		...opts.config,
 	});
+	if (!hasWorkChannel(config)) throw new Error("the engine harness needs a work channel");
 	const labels = resolveLabelNames(config);
 	const gh = startFakeGitHub();
 	const github = await createGitHub({ appId: gh.appId, privateKey: gh.privateKey, baseUrl: gh.url, labels, throttle: false });
@@ -57,6 +59,7 @@ export async function createEngineHarness(opts: { config?: Record<string, unknow
 		interactions: createInteractionRouter(),
 		agentLog: await openAgentLog({ dir: join(stateDir, "logs", "agent") }),
 		sessionDir: join(stateDir, "sessions"),
+		chatSlots: createChatSlots(config.limits.maxChatSessions),
 		signal: controller.signal,
 	};
 	return {

@@ -1,12 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
-import type { AdminState, EnginePhase, SettingsSaveResponse, StatusReport, UsageWindow } from "../../src/shared/adminApi";
+import type { AdminState, EnginePhase, HomeFacts, SettingsSaveResponse, StatusReport, UsageWindow } from "../../src/shared/adminApi";
+import type { Loadout } from "../../src/shared/agent";
+import { parseRepoConfig } from "../../src/orchestrator/dispatch/checkouts";
 import { ConfigError, parseSettings, type Settings } from "../../src/shared/config";
+import { parseOmpConfig } from "../../src/shared/ompconfig";
 import { versionInfo } from "../../src/shared/version";
 import { createAdminClient } from "../../src/web/adminClient";
 import { CONFIG_FIELDS } from "../../src/web/forms";
-import { formatCount, formatDuration, formatUsd } from "../../src/web/live";
-import { createLoginThrottle, createSessionStore } from "../../src/web/sessions";
+import { SAMPLE_OMP, SAMPLE_REPO_CONFIG, SAMPLE_SETTINGS } from "../../src/web/homePage";
+import { formatCount, formatDuration, formatUsd, liveView } from "../../src/web/live";
+import { createLoginThrottle, WEB_LOGIN_LIMITS } from "../../src/shared/loginThrottle";
+import { createSessionStore } from "../../src/web/sessions";
 import { startWebServer, type WebHealth, type WebServer } from "../../src/web/server";
 import { THEME_KEY } from "../../src/web/views";
 
@@ -45,6 +50,10 @@ interface Stub {
 	report: StatusReport;
 	/** Makes GET /status fail with a 500 carrying internal detail. */
 	failStatus: boolean;
+	/** POST /login waits for this before answering (a slow password check). */
+	loginGate?: Promise<void>;
+	/** Home page facts in GET /state. */
+	home: HomeFacts;
 	calls: StubCall[];
 	/** Last raw PUT /settings body. */
 	lastSave?: { config: unknown; secrets: Record<string, unknown> };
@@ -55,6 +64,7 @@ function emptyReport(): StatusReport {
 	return {
 		state: {} as AdminState, // replaced per request
 		runs: { pending: 0, running: 0, oldestPendingMs: null },
+		activeRuns: [],
 		workers: [],
 		limits: null,
 		warnings: [],
@@ -66,7 +76,9 @@ function emptyReport(): StatusReport {
 			byRepo: [],
 			jobs: [],
 			daily: [],
+			setup: [],
 		},
+		loadouts: [],
 	};
 }
 
@@ -78,6 +90,7 @@ function startStub(): Stub {
 		phase: "setup",
 		report: emptyReport(),
 		failStatus: false,
+		home: { checklist: { setup: false, credentials: false, workChannel: false, watchedRepo: false, modelAccess: false } },
 		calls: [],
 		stop: async () => {},
 	};
@@ -90,6 +103,7 @@ function startStub(): Stub {
 		unlocked: stub.unlocked,
 		username: stub.username,
 		version: ORCHESTRATOR_VERSION,
+		home: stub.home,
 	});
 	const fail = (status: number, error: string) => Response.json({ error }, { status });
 
@@ -130,6 +144,7 @@ function startStub(): Stub {
 				}
 				case "POST /login": {
 					if (!stub.initialized) return fail(409, "not set up");
+					await stub.loginGate;
 					const ok = body!.username === stub.username && body!.password === stub.password;
 					if (ok) stub.unlocked = true;
 					return Response.json({ ok });
@@ -213,7 +228,7 @@ afterEach(async () => {
 	cleanups = [];
 });
 
-function start(opts: { token?: string } = {}): Harness {
+function start(opts: { token?: string; trustedProxies?: string[] } = {}): Harness {
 	const stub = startStub();
 	let clock = Date.now();
 	const server = startWebServer({
@@ -221,6 +236,7 @@ function start(opts: { token?: string } = {}): Harness {
 		host: "127.0.0.1",
 		port: 0,
 		now: () => clock,
+		...(opts.trustedProxies ? { trustedProxies: opts.trustedProxies } : {}),
 	});
 	cleanups.push(() => server.stop(), () => stub.stop());
 	const h: Harness = {
@@ -461,9 +477,62 @@ describe("sessions (WEB-03, WEB-05, WEB-09)", () => {
 		expect((await h.post("/login", { username: USERNAME, password: PASSWORD })).status).toBe(303);
 	});
 
+	test("parallel attempts from one IP are checked one at a time, so the 5-failure block holds (WEB-03)", async () => {
+		const h = start();
+		await setUp(h);
+		h.cookie = "";
+		const gate = Promise.withResolvers<void>();
+		h.stub.loginGate = gate.promise;
+		const settled: number[] = [];
+		const posts = Array.from({ length: 20 }, (_, i) =>
+			h.post("/login", { username: USERNAME, password: `wrong password ${i}` }).then(res => {
+				settled.push(res.status);
+				return res;
+			}),
+		);
+		const deadline = Date.now() + 5000;
+		while (settled.length < 19) {
+			if (Date.now() > deadline) throw new Error("the parallel attempts were not refused");
+			await Bun.sleep(5);
+		}
+		// Only one password check reached the orchestrator; the rest were told to retry.
+		expect(h.stub.calls.filter(c => c.path === "/login").length).toBe(1);
+		gate.resolve();
+		const all = await Promise.all(posts);
+		expect(all.map(r => r.status).sort()).toEqual([401, ...Array<number>(19).fill(429)]);
+		const refused = all.find(r => r.status === 429)!;
+		expect(refused.headers.get("retry-after")).toBe("1");
+		expect(await refused.text()).toContain("still being checked");
+	});
+
+	test("behind a trusted proxy the right-most untrusted X-Forwarded-For entry is throttled, not the proxy", async () => {
+		const h = start({ trustedProxies: ["127.0.0.0/8", "::1"] });
+		await setUp(h);
+		h.cookie = "";
+		const from = (forwardedFor: string, password: string) =>
+			h.post("/login", { username: USERNAME, password }, { origin: h.server.url, "x-forwarded-for": forwardedFor });
+		for (let i = 0; i < 5; i++) expect((await from("203.0.113.9", `wrong password ${i}`)).status).toBe(401);
+		expect((await from("203.0.113.9", PASSWORD)).status).toBe(429);
+		// A spoofed entry further left changes nothing: the proxy appended the real client last.
+		expect((await from("198.51.100.7, 203.0.113.9", PASSWORD)).status).toBe(429);
+		// The admin, through the same proxy, is not locked out.
+		expect((await from("198.51.100.7", PASSWORD)).status).toBe(303);
+	});
+
+	test("without trusted proxies X-Forwarded-For is ignored", async () => {
+		const h = start();
+		await setUp(h);
+		h.cookie = "";
+		for (let i = 0; i < 5; i++) {
+			const res = await h.post("/login", { username: USERNAME, password: `wrong ${i} password` }, { origin: h.server.url, "x-forwarded-for": `198.51.100.${i}` });
+			expect(res.status).toBe(401);
+		}
+		expect((await h.post("/login", { username: USERNAME, password: PASSWORD }, { origin: h.server.url, "x-forwarded-for": "198.51.100.99" })).status).toBe(429);
+	});
+
 	test("failures spread over more than 15 minutes don't block", () => {
 		let now = 0;
-		const throttle = createLoginThrottle(() => now);
+		const throttle = createLoginThrottle(WEB_LOGIN_LIMITS, () => now);
 		for (let i = 0; i < 4; i++) throttle.fail("1.2.3.4");
 		now += 16 * 60_000;
 		throttle.fail("1.2.3.4");
@@ -696,6 +765,20 @@ describe("settings (/admin)", () => {
 
 // ---------------------------------------------------------------------------------------------------------------------
 
+const ZERO_USAGE = { costUsd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+const LOADOUT: Loadout = {
+	capturedAt: "2026-10-29T08:00:00.000Z",
+	profile: "plan",
+	tools: ["read", "grep"],
+	skills: [{ name: "review", source: "user", description: "Reviews code" }],
+	agents: [],
+	mcp: [
+		{ server: "github", status: "connected", tools: ["a", "b"] },
+		{ server: "docs", status: "failed", error: "timeout <x>", tools: [] },
+	],
+};
+
 function liveReport(title: string): StatusReport {
 	const now = Date.now();
 	return {
@@ -713,6 +796,26 @@ function liveReport(title: string): StatusReport {
 			queuedJobs: 3,
 		},
 		runs: { pending: 2, running: 1, oldestPendingMs: 95_000 },
+		activeRuns: [
+			{ id: "run-0", kind: "implement", state: "pending", repo: "acme/widgets", owner: "job:j0", createdAt: new Date(now - 9_030_000).toISOString(), usage: ZERO_USAGE },
+			{
+				id: "run-1",
+				kind: "plan",
+				state: "running",
+				repo: "acme/widgets",
+				owner: "job:j1",
+				threadId: "thread-9",
+				workerId: "agentbot-worker-x7k2p",
+				createdAt: new Date(now - 4_200_000).toISOString(),
+				claimedAt: new Date(now - 3_930_000 - 192_000).toISOString(),
+				startedAt: new Date(now - 3_930_000).toISOString(),
+				setupMs: 192_000,
+				lastTool: "grep",
+				usage: { costUsd: 1.5, input: 12_345, output: 678, cacheRead: 0, cacheWrite: 0 },
+				loadout: LOADOUT,
+			},
+			{ id: "run-2", kind: "ask", state: "assigned", owner: "chat:t2", workerId: "agentbot-worker-q", createdAt: new Date(now - 60_000).toISOString(), claimedAt: new Date(now - 45_500).toISOString(), usage: ZERO_USAGE },
+		],
 		workers: [
 			{ id: "agentbot-worker-x7k2p", address: "10.0.0.7", version: "0.4.12", ompVersion: "18.12.1", runId: "run-1", phase: "running", connectedAt: new Date(now - 125_000).toISOString() },
 		],
@@ -732,7 +835,12 @@ function liveReport(title: string): StatusReport {
 				{ day: "2026-10-28", costUsd: 0.001 },
 				{ day: "2026-10-29", costUsd: 0.004 },
 			],
+			setup: [
+				{ repo: "acme/slow", runs: 3, avgMs: 600_000, maxMs: 900_000 },
+				{ repo: "acme/widgets", runs: 2, avgMs: 30_000, maxMs: 45_000 },
+			],
 		},
+		loadouts: [LOADOUT],
 	};
 }
 
@@ -796,9 +904,28 @@ describe("status", () => {
 		expect(h.stub.calls.findLast(c => c.path === "/status")).toBeDefined();
 		for (const secret of [DISCORD_TOKEN, "PEMBODYsecretvalue123", OPENAI_KEY]) expect(page).not.toContain(secret);
 
+		// Runs (§9.3, NFR-06): pending with its age; in progress with worker, elapsed, setup time, last tool, cost, tokens, loadout.
+		expect(page).toMatch(/<tr><td>implement<\/td><td><a href="https:\/\/github\.com\/acme\/widgets">acme\/widgets<\/a><\/td><td>2h 30m<\/td><\/tr>/);
+		expect(page).toContain(
+			'<tr><td><a href="https://discord.com/channels/guild-1/thread-9">plan</a></td><td><a href="https://github.com/acme/widgets">acme/widgets</a></td>' +
+				"<td>agentbot-worker-x7k2p</td><td>running</td><td>1h 5m</td><td>3m 12s</td><td>grep</td><td>$1.50</td><td>12,345 in · 678 out</td>" +
+				"<td>2 tools · 1 skills · 0 agents · MCP github ✓, docs ✗</td></tr>",
+		);
+		expect(page).toMatch(/<tr><td>ask<\/td><td>—<\/td><td>agentbot-worker-q<\/td><td>assigned<\/td><td>—<\/td><td>4[45]s so far<\/td>/);
+		// Setup time per repository, slowest first, and the latest loadout per profile.
+		expect(page).toContain("<tr><td>acme/slow</td><td>3</td><td>10m 0s</td><td>15m 0s</td></tr>");
+		expect(page).toContain(
+			"<tr><td>plan</td><td>2026-10-29 08:00:00 UTC</td><td>read, grep</td><td>review</td><td>—</td><td>github (connected, 2 tools); docs (failed, 0 tools: timeout &lt;x&gt;)</td></tr>",
+		);
+
 		const script = pageScript(page);
 		expect(() => new Function(script)).not.toThrow();
 		expect(script).toContain("function liveView(");
+		// The shipped functions re-render the live sections exactly as the server did.
+		const shipped = new Function(`${script.slice(0, script.indexOf("function fill("))}\nreturn liveView;`)() as typeof liveView;
+		const data = (await (await h.get("/status.json?window=24h")).json()) as StatusReport;
+		const ctx = { guildId: "guild-1", now: Date.now() };
+		expect(shipped(data, ctx)).toEqual(liveView(data, ctx));
 	});
 
 	test("without a running engine the page shows the phase and empty sections", async () => {
@@ -809,6 +936,10 @@ describe("status", () => {
 		expect(page).toContain("No watched repositories.");
 		expect(page).toContain("Limits are shown once the settings are saved and unlocked.");
 		expect(page).toContain("No open issues.");
+		expect(page).toContain("No pending runs.");
+		expect(page).toContain("No runs in progress.");
+		expect(page).toContain("No runs started in this window.");
+		expect(page).toContain("No run has reported a loadout yet.");
 	});
 });
 
@@ -891,11 +1022,12 @@ describe("home and navigation (WEB-10, WEB-11)", () => {
 		const page = await res.text();
 		expect(page).toContain('<span class="badge ok">running</span>');
 		const cards = [...page.matchAll(/<h3><a href="([^"]+)">/g)].map(m => m[1]);
-		expect(cards).toEqual(["/status", "/admin", "/status.json", "/healthz"]);
+		expect(cards).toEqual(expect.arrayContaining(["/status", "/logs", "/admin", "/admin/repos", "/admin/models", "/admin/omp", "/admin/skills"]));
 		const menu = [...page.matchAll(/<li><a href="([^"]+)"/g)].map(m => m[1]);
 		expect(menu).toEqual(["/", ...cards]);
 		expect(page).toContain('<a href="/" aria-current="page">Home</a>');
-		for (const later of ["/logs", "/admin/omp", "/admin/models", "/admin/skills", "/admin/repos", "/admin/vscode"]) expect(page).not.toContain(`href="${later}`);
+		// This server runs without VS Code (AGENTBOT_WEB_VSCODE=off), so neither the cards nor the menu list it.
+		expect(page).not.toContain('href="/admin/vscode');
 
 		const info = await versionInfo();
 		expect(page).toContain(`<td>AgentBot (web)</td><td>${info.agentbot}</td>`);
@@ -909,6 +1041,35 @@ describe("home and navigation (WEB-10, WEB-11)", () => {
 		const failed = await (await h.get("/")).text();
 		expect(failed).toContain('<span class="badge bad">error</span>');
 		expect(failed).toContain("Discord &lt;login&gt; failed");
+	});
+
+	test("home shows the model account and MCP server counts, the getting-started checklist with links, and valid sample configs", async () => {
+		const h = start();
+		await setUp(h);
+		const steps = (page: string) =>
+			Object.fromEntries([...page.matchAll(/<li data-step="(\w+)" class="(done|todo)">/g)].map(m => [m[1]!, m[2]!]));
+
+		const fresh = await (await h.get("/")).text();
+		expect(fresh).toContain('Model accounts: <strong id="model-accounts">—</strong>');
+		expect(fresh).toContain('MCP servers: <strong id="mcp-servers">—</strong>');
+		expect(steps(fresh)).toEqual({ setup: "todo", credentials: "todo", workChannel: "todo", watchedRepo: "todo", modelAccess: "todo" });
+
+		h.stub.home = { modelAccounts: 2, mcpServers: 3, checklist: { setup: true, credentials: true, workChannel: true, watchedRepo: false, modelAccess: true } };
+		const page = await (await h.get("/")).text();
+		expect(page).toContain('Model accounts: <strong id="model-accounts">2</strong>');
+		expect(page).toContain('MCP servers: <strong id="mcp-servers">3</strong>');
+		expect(steps(page)).toEqual({ setup: "done", credentials: "done", workChannel: "done", watchedRepo: "todo", modelAccess: "done" });
+		// Each step links to where it is done.
+		expect(page).toMatch(/<li data-step="watchedRepo" class="todo">.*<a href="\/admin\/repos">/);
+		expect(page).toMatch(/<li data-step="modelAccess" class="done">.*<a href="\/admin\/models">/);
+		expect(page).toMatch(/<li data-step="workChannel" class="done">.*<a href="\/admin">/);
+
+		// Sample configs are valid against the real schemas and show no stored secret.
+		expect(page).toContain("Sample configs");
+		expect(() => parseSettings(SAMPLE_SETTINGS)).not.toThrow();
+		expect(() => parseOmpConfig(SAMPLE_OMP)).not.toThrow();
+		expect(parseRepoConfig(SAMPLE_REPO_CONFIG)).toEqual({ baseBranch: "develop", setupCommand: "bun install" });
+		for (const script of scripts(page)) expect(() => new Function(script)).not.toThrow();
 	});
 
 	test("every page offers the light/dark/auto switch once, applied before first paint, and the menu where logged in", async () => {

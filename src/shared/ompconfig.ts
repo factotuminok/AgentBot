@@ -64,14 +64,26 @@ const ompConfigSchema = z.object({
 
 export type McpServer = z.infer<typeof mcpServer>;
 
+/** JSON Schema (draft 2020-12) of one MCP server entry as an admin writes it. */
+export function mcpServerJsonSchema(): Record<string, unknown> {
+	return z.toJSONSchema(mcpServer, { io: "input" });
+}
+
 export interface OmpConfig {
 	/** Setting id → value, as accepted by omp `Settings.isolated`. */
 	settings: Record<string, unknown>;
 	mcpServers: Record<string, McpServer>;
 }
 
+/** `path` locates the error in the `{ settings, mcpServers }` object when it is about one field. */
 export class OmpConfigError extends Error {
 	override name = "OmpConfigError";
+	constructor(
+		message: string,
+		readonly path?: (string | number)[],
+	) {
+		super(message);
+	}
 }
 
 export function emptyOmpConfig(): OmpConfig {
@@ -116,14 +128,14 @@ export function listSettings(): SettingInfo[] {
  */
 export function parseSettingValue(id: string, text: string): unknown {
 	const setting = lookup(id);
-	if (!setting) throw new OmpConfigError(`Unknown omp setting "${id}"`);
-	if (LOCKED_SETTINGS[id]) throw new OmpConfigError(`${id} is managed by AgentBot: ${LOCKED_SETTINGS[id]!.reason}`);
+	if (!setting) throw new OmpConfigError(`Unknown omp setting "${id}"`, ["settings", id]);
+	if (LOCKED_SETTINGS[id]) throw new OmpConfigError(`${id} is managed by AgentBot: ${LOCKED_SETTINGS[id]!.reason}`, ["settings", id]);
 	try {
 		const value = setting.definition.type === "array" || setting.definition.type === "record" ? JSON.parse(text) : setting.parse(text);
 		setting.assertWritable(value);
 		return value;
 	} catch (err) {
-		throw new OmpConfigError(`${id}: ${errorMessage(err)}`);
+		throw new OmpConfigError(`${id}: ${errorMessage(err)}`, ["settings", id]);
 	}
 }
 
@@ -132,16 +144,17 @@ export function parseOmpConfig(raw: unknown): OmpConfig {
 	const rawServers = raw && typeof raw === "object" && "mcpServers" in raw ? raw.mcpServers : undefined;
 	if (rawServers && typeof rawServers === "object") {
 		const reserved = Object.keys(rawServers).find(name => RESERVED_MCP_NAME.test(name));
-		if (reserved) throw new OmpConfigError(`Invalid omp config: mcpServers.${reserved}: reserved name`);
+		if (reserved) throw new OmpConfigError(`Invalid omp config: mcpServers.${reserved}: reserved name`, ["mcpServers", reserved]);
 	}
 	const result = ompConfigSchema.safeParse(raw);
 	if (!result.success) {
 		const issue = result.error.issues[0]!;
-		throw new OmpConfigError(`Invalid omp config: ${issue.path.join(".") || "(root)"}: ${issue.message}`);
+		const path = issue.path.map(p => (typeof p === "number" ? p : String(p)));
+		throw new OmpConfigError(`Invalid omp config: ${path.join(".") || "(root)"}: ${issue.message}`, path);
 	}
 	for (const id of Object.keys(result.data.settings)) {
-		if (LOCKED_SETTINGS[id]) throw new OmpConfigError(`${id} is managed by AgentBot: ${LOCKED_SETTINGS[id]!.reason}`);
-		if (!lookup(id)) throw new OmpConfigError(`Unknown omp setting "${id}"`);
+		if (LOCKED_SETTINGS[id]) throw new OmpConfigError(`${id} is managed by AgentBot: ${LOCKED_SETTINGS[id]!.reason}`, ["settings", id]);
+		if (!lookup(id)) throw new OmpConfigError(`Unknown omp setting "${id}"`, ["settings", id]);
 	}
 	try {
 		Settings.isolated(sessionSettings(result.data));

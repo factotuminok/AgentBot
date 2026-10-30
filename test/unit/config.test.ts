@@ -36,10 +36,6 @@ describe("parseConfig", () => {
 		expect(() => parseConfig({ ...minimal, github: { appId: -1 } })).toThrow(/^Invalid config: github\.appId: /);
 	});
 
-	test("workChannelId is required", () => {
-		expect(() => parseConfig({ ...minimal, discord: { guildId: "1", allowedUserIds: ["42"] } })).toThrow(/discord\.workChannelId:/);
-	});
-
 	test("old repos/updates sections are dropped", () => {
 		const config = parseConfig({ ...minimal, repos: [{ name: "a/b" }], updates: {} });
 		expect(config).not.toHaveProperty("repos");

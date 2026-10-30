@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import { join, resolve } from "node:path";
 import { parseLogCapOverride } from "./rollinglog";
 
@@ -21,6 +22,8 @@ export interface AgentbotEnv {
 	ompDir: string;
 	webHost: string;
 	webPort: number;
+	/** `AGENTBOT_WEB_TRUSTED_PROXIES`: addresses and CIDRs of reverse proxies in front of web (WEB-03 client address). */
+	webTrustedProxies: string[];
 	/** `AGENTBOT_MASTER_KEY_FILE`: mounted master key file; orchestrator only. */
 	masterKeyFile?: string;
 	internalHost: string;
@@ -39,11 +42,23 @@ export interface AgentbotEnv {
 	orchestratorUrl: string;
 	/** `AGENTBOT_WORKER_CLAIM_TIMEOUT` in milliseconds. */
 	workerClaimTimeoutMs: number;
+	/** `AGENTBOT_WORKER_ADDRESS_BINDING` (default on): one claim per worker address, worker ids bound to their first address (architecture §6). */
+	workerAddressBinding: boolean;
+	/** `AGENTBOT_WORKER_RUN_DIR`: parent of the worker's run-local root (the image: `/run/agentbot`, a tmpfs or memory `emptyDir`). */
+	workerRunDir?: string;
 	workerCapacity: number;
-	/** `AGENTBOT_WORKER_IMAGE`; undefined means the AgentBot image itself. */
+	/** `AGENTBOT_WORKER_IMAGE`: launcher only; undefined means the AgentBot image itself (`image`). */
 	workerImage?: string;
+	/** `AGENTBOT_IMAGE`: launcher only; the AgentBot image this stack runs (compose sets it to the services' image). */
+	image?: string;
+	/** `AGENTBOT_WORKER_NETWORK`: launcher only, required; the stack network workers join. */
+	workerNetwork?: string;
+	/** `AGENTBOT_WORKER_SECRET`: launcher only; the Podman secret holding the worker token. */
+	workerSecret: string;
 	/** `AGENTBOT_WORKER_MEMORY` in bytes. */
 	workerMemoryBytes: number;
+	/** `AGENTBOT_WORKER_CPUS`: launcher only; CPU quota per worker container, in CPUs (`podman run --cpus`). */
+	workerCpus: number;
 	/** `AGENTBOT_WORKER_DISK` in bytes. */
 	workerDiskBytes: number;
 	podmanSocket: string;
@@ -93,6 +108,15 @@ export function parseSize(name: string, raw: string): number {
 	return bytes;
 }
 
+/** A CPU count such as `2` or `1.5` (`podman run --cpus`): at least 0.01 (a 1 ms quota per 100 ms), at most 1024. */
+function cpus(env: Env, name: string, fallback: number): number {
+	const raw = str(env, name);
+	if (raw === undefined) return fallback;
+	const value = Number(raw);
+	if (!/^\d+(\.\d+)?$/.test(raw) || value < 0.01 || value > 1024) fail(name, raw, "a number of CPUs from 0.01 to 1024, such as 2 or 1.5");
+	return value;
+}
+
 function flag(env: Env, name: string, fallback: boolean): boolean {
 	const raw = str(env, name);
 	if (raw === undefined) return fallback;
@@ -112,6 +136,33 @@ function url(env: Env, name: string, fallback: string): string {
 	}
 	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") fail(name, raw, "an http(s) URL");
 	return raw.replace(/\/+$/, "");
+}
+
+/** An image reference such as `ghcr.io/owner/agentbot:1.2.3`; undefined when unset. */
+function image(env: Env, name: string): string | undefined {
+	const raw = str(env, name);
+	if (raw !== undefined && !/^[a-z0-9][^\s]*$/i.test(raw)) fail(name, raw, "an image reference");
+	return raw;
+}
+
+/** A Podman network or secret name; undefined when unset. */
+function podmanName(env: Env, name: string): string | undefined {
+	const raw = str(env, name);
+	if (raw !== undefined && !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(raw)) fail(name, raw, "a Podman name (letters, digits, '_', '.', '-')");
+	return raw;
+}
+
+/** Comma-separated IP addresses and CIDRs (`10.0.0.0/8`, `fd00::/8`); empty when unset. */
+function addressList(env: Env, name: string): string[] {
+	const entries = (str(env, name) ?? "").split(",").map(entry => entry.trim()).filter(entry => entry !== "");
+	for (const entry of entries) {
+		const [address = "", prefix, extra] = entry.split("/");
+		const version = isIP(address);
+		const bits = version === 6 ? 128 : 32;
+		const validPrefix = prefix === undefined || (/^\d{1,3}$/.test(prefix) && Number(prefix) <= bits);
+		if (version === 0 || !validPrefix || extra !== undefined) fail(name, entry, "comma-separated IP addresses or CIDRs");
+	}
+	return entries;
 }
 
 /** Reads and validates every `AGENTBOT_*` variable; throws on the first invalid one. */
@@ -135,6 +186,7 @@ export function loadEnv(env: Env = process.env): Readonly<AgentbotEnv> {
 		ompDir: resolve(str(env, "AGENTBOT_OMP_DIR") ?? join(stateDir, "omp")),
 		webHost: str(env, "AGENTBOT_WEB_HOST") ?? "127.0.0.1",
 		webPort: int(env, "AGENTBOT_WEB_PORT", 8080, 1, 65535),
+		webTrustedProxies: addressList(env, "AGENTBOT_WEB_TRUSTED_PROXIES"),
 		masterKeyFile: optionalPath("AGENTBOT_MASTER_KEY_FILE"),
 		internalHost: str(env, "AGENTBOT_INTERNAL_HOST") ?? "0.0.0.0",
 		internalPort: int(env, "AGENTBOT_INTERNAL_PORT", 8081, 1, 65535),
@@ -146,9 +198,15 @@ export function loadEnv(env: Env = process.env): Readonly<AgentbotEnv> {
 		ompRuntimeDir: optionalPath("AGENTBOT_OMP_RUNTIME_DIR"),
 		orchestratorUrl: url(env, "AGENTBOT_ORCHESTRATOR_URL", "http://orchestrator:8081"),
 		workerClaimTimeoutMs: parseDuration("AGENTBOT_WORKER_CLAIM_TIMEOUT", claimTimeout),
+		workerAddressBinding: flag(env, "AGENTBOT_WORKER_ADDRESS_BINDING", true),
+		workerRunDir: optionalPath("AGENTBOT_WORKER_RUN_DIR"),
 		workerCapacity: int(env, "AGENTBOT_WORKER_CAPACITY", 4, 1, 1000),
-		workerImage: str(env, "AGENTBOT_WORKER_IMAGE"),
+		workerImage: image(env, "AGENTBOT_WORKER_IMAGE"),
+		image: image(env, "AGENTBOT_IMAGE"),
+		workerNetwork: podmanName(env, "AGENTBOT_WORKER_NETWORK"),
+		workerSecret: podmanName(env, "AGENTBOT_WORKER_SECRET") ?? "agentbot_worker_token",
 		workerMemoryBytes: parseSize("AGENTBOT_WORKER_MEMORY", workerMemory),
+		workerCpus: cpus(env, "AGENTBOT_WORKER_CPUS", 2),
 		workerDiskBytes: parseSize("AGENTBOT_WORKER_DISK", workerDisk),
 		podmanSocket: str(env, "AGENTBOT_PODMAN_SOCKET") ?? "/run/podman/podman.sock",
 		launcherAllowRootful: flag(env, "AGENTBOT_LAUNCHER_ALLOW_ROOTFUL", false),

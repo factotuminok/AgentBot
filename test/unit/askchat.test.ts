@@ -230,6 +230,19 @@ describe("admission (CHAT-04, DSC-06)", () => {
 		await done(a, first.threadId!);
 	});
 
+	test("capacity is shared: a slot held by another feature refuses /ask before any thread exists", async () => {
+		const a = await setup({ limits: { maxChatSessions: 1 } });
+		const gate = Promise.withResolvers<void>();
+		void a.h.deps.chatSlots.track("plan:t-1", gate.promise);
+		const refused = await ask(a, "One");
+		expect(refused.emitted.responses.at(-1)?.msg?.content).toBe("Chat capacity reached; try again shortly.");
+		expect(refused.threadId).toBeUndefined();
+		gate.resolve();
+		await gate.promise;
+		const accepted = (await ask(a, "Two")).threadId!;
+		await done(a, accepted);
+	});
+
 	test("a non-allowed user has one live run across threads; allowed members are not limited", async () => {
 		const a = await setup({ limits: { maxChatSessions: 5 } });
 		a.dispatcher.script({ kind: "ask" }, { hold: true });
@@ -283,6 +296,26 @@ describe("follow-ups (CHAT-03, DSC-06)", () => {
 		expect(next.req.prompt).not.toContain(SWEPT_NOTE);
 	});
 
+	test("a non-allowed starter may follow up in their own thread; a stranger's attachment is ignored (DSC-06)", async () => {
+		const a = await setup();
+		a.dispatcher.once({ kind: "ask" }, { hold: true });
+		const id = (await ask(a, "Start", { actor: a.stranger })).threadId!;
+		await until(() => a.dispatcher.runs[0]?.registered === true, "registered run");
+		const run = a.dispatcher.runs[0]!;
+
+		const intruder = a.h.discord.actor("u-intruder", { username: "intruder" });
+		a.files.set("x1", "payload");
+		const ignored = await a.h.discord.emitMessage({ channelId: id, content: "", actor: intruder, attachments: [{ name: "x.txt", url: "x1", size: 7 }] });
+		await a.h.discord.settled();
+		expect(a.h.discord.message(ignored.ref!.messageId)?.reactions).toEqual([]);
+		expect(run.steers).toEqual([]);
+
+		const own = await a.h.discord.emitMessage({ channelId: id, content: "one more thing", actor: a.stranger });
+		await until(() => a.h.discord.message(own.ref!.messageId)?.reactions.includes("👀") === true, "👀 for the starter");
+		expect(run.steers).toHaveLength(1);
+		expect(run.steers[0]!.text).toContain("one more thing");
+	});
+
 	test("a steer the run ends before reading gets ⏳, then Not delivered", async () => {
 		const a = await setup();
 		a.dispatcher.once({ kind: "ask" }, { hold: true, steerResult: "queued" });
@@ -293,6 +326,26 @@ describe("follow-ups (CHAT-03, DSC-06)", () => {
 		a.dispatcher.runs[0]!.finish();
 		await until(() => thread(a, id).some(m => m.replyTo === e.ref!.messageId && m.content.startsWith("Not delivered")), "Not delivered");
 		expect(a.h.discord.message(e.ref!.messageId)?.reactions).toEqual([]);
+	});
+});
+
+describe("/work cancel (requirements §20 item 2)", () => {
+	test("stops the live run, which posts Stopped; with nothing running it says so", async () => {
+		const a = await setup();
+		a.dispatcher.once({ kind: "ask" }, { hold: true });
+		const id = (await ask(a, "Stop me")).threadId!;
+		await until(() => a.dispatcher.runs[0]?.registered === true, "registered run");
+		expect(await a.chat.cancel(id, "@alice")).toBe("Stopping the current run (requested by @alice)…");
+		await until(() => !!posted(a, id, "⏹️ **Stopped.**"), "Stopped message");
+		expect(a.dispatcher.runs[0]!.aborted).toBe("user");
+		expect(await a.chat.cancel(id, "@alice")).toBe("Nothing is running in this chat.");
+	});
+
+	test("undefined outside ask threads", async () => {
+		const a = await setup();
+		expect(await a.chat.cancel("nope", "@alice")).toBeUndefined();
+		a.h.db.insertChat("repo-thread", "o/r");
+		expect(await a.chat.cancel("repo-thread", "@alice")).toBeUndefined();
 	});
 });
 

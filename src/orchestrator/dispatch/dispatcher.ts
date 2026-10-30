@@ -1,4 +1,4 @@
-import type { WorkerStatus } from "../../shared/adminApi";
+import type { RunStatus, WorkerStatus } from "../../shared/adminApi";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import type { AgentProfile, Loadout, TodoItem } from "../../shared/agent";
 import type { RunUsage, TranscriptEvent } from "../../shared/transcript";
@@ -6,7 +6,7 @@ import type { RunKind } from "../engine/state";
 
 /**
  * The engine's view of agent runs (architecture §3: the runner becomes the dispatcher and keeps the `runAgent` API).
- * Phase 2 ships only a fake (`createFakeDispatcher`); phase 3 implements it with runs, leases and workers.
+ * `createWorkerDispatcher` implements it with runs, leases and workers; `createFakeDispatcher` is the test double.
  *
  * Contract:
  * - `runAgent` is **start or attach**: if an unfinished run exists for `req.owner` (RUN-21: at most one), the call attaches
@@ -69,8 +69,8 @@ export interface RunRequest {
 	session: string;
 	/** Continue that session instead of starting it fresh (JOB-10, CHAT-03, plan revisions). */
 	resume: boolean;
-	/** Repository the run checks out (`owner/name`); absent for `/ask`. Checkout details arrive in phase 4. */
-	repo?: string;
+	/** The repository checkout (RUN-17); absent for `/ask`, required for every other kind. */
+	checkout?: CheckoutRequest;
 	/** Discord thread the run reports into (RUN-14). */
 	threadId?: string;
 	/** `create_issue` (chat profile, AGT-10): executed in the orchestrator, result returned to the agent. */
@@ -80,6 +80,27 @@ export interface RunRequest {
 	 * serves `inputs/` to the worker and writes new or changed outputs it uploads into `outputs/` before the run settles.
 	 */
 	scratchDir?: string;
+}
+
+/** What the engine tells the dispatcher about a run's checkout; the dispatcher fixes the start commit (RUN-17). */
+export interface CheckoutRequest {
+	/** `owner/name`. */
+	repo: string;
+	/** The repository's default branch on GitHub: `.agentbot.yml` is read from it, and it is the base branch unless the file sets `baseBranch` (GH-26). */
+	defaultBranch(): Promise<string>;
+	/** Job runs: the issue branch `agentbot/issue-<n>-<slug>` (WS-03). revise and fix_ci start from its head (RUN-17). */
+	issueBranch?: string;
+	/** Runs that write code: the commit message for leftover changes, e.g. `<agent>: remaining changes for #N` (JOB-19, JOB-22, DSC-30). */
+	leftoverMessage?: string;
+	/** The bot's git identity, for the worker's local commits (GH-04). */
+	identity: { name: string; email: string };
+	/** An installation token for fetching the mirror (WS-02); asked for each time the run is about to become pending. */
+	gitToken(): Promise<string>;
+}
+
+/** implement, revise and fix_ci change code: their checkpoints hold the working tree and their result is pushed (RUN-18, RUN-19). */
+export function writesCode(kind: RunRequest["kind"]): boolean {
+	return kind === "implement" || kind === "revise" || kind === "fix_ci";
 }
 
 export type AbortReason = "user" | "time" | "cost";
@@ -151,7 +172,15 @@ export interface RunResult {
 	hasSession: boolean;
 	/** Ask runs: names of new or changed regular files written to `<scratchDir>/outputs` (CHAT-10). */
 	outputs?: string[];
+	/**
+	 * Runs that write code: the result bundle was imported into the runs repo (`commits` > 0) and waits for `pushResult`
+	 * or `discardResult`, or the run's branch had no new commits (`commits` 0, nothing kept) (RUN-19).
+	 */
+	code?: { runId: string; commits: number };
 }
+
+/** `pushResult`: `pushed: false` when the branch changed on GitHub during the run, so the push was not a fast-forward (RUN-19). */
+export type PushOutcome = { pushed: true; sha: string } | { pushed: false };
 
 /** The caller detached (engine stopping); the run keeps going. */
 export class RunDetached extends Error {
@@ -181,12 +210,27 @@ export interface Dispatcher {
 	runAgent(req: RunRequest, hooks: RunHooks, signal?: AbortSignal): Promise<RunResult>;
 	/** True while `owner` has a pending or active run (CHAT-04, DSC-06, RUN-21). */
 	hasUnfinishedRun(owner: RunOwner): boolean;
+	/** True while `owner` has a run to attach to: unfinished, or finished with a result no caller has received (NFR-03). */
+	hasRun(owner: RunOwner): boolean;
 	/** Counts for health and status (architecture §4.5). */
 	counts(): { pending: number; running: number; oldestPendingMs: number | null };
 	/** Connected workers for the status page (§9.3); none for the fake. */
 	workers(): WorkerStatus[];
-	/** AGT-21: connect one MCP server on a worker; the 20 s timeout starts when a worker picks the test up. */
-	mcpTest(spec: { name: string; server: unknown }, opts?: { onWaitingForWorker?(): void }): Promise<{ ok: boolean; tools: string[]; error?: string }>;
+	/** Read-only view of the unfinished runs for the status page, oldest first (§9.3, NFR-06). */
+	activeRuns(): RunStatus[];
+	/** AGT-21: connect one MCP server on a worker; the 20 s timeout starts when a worker picks the test up (`onStarted`). */
+	mcpTest(
+		spec: { name: string; server: unknown },
+		opts?: { onWaitingForWorker?(): void; onStarted?(): void },
+	): Promise<{ ok: boolean; tools: string[]; error?: string }>;
+	/** RUN-19: pushes a finished run's imported result to `branch` on GitHub, fast-forward only. The result stays kept until `discardResult`. */
+	pushResult(runId: string, branch: string, token: string): Promise<PushOutcome>;
+	/** RUN-20: deletes a run's result once it was pushed, or when it is discarded (a rejected push, nothing to push). */
+	discardResult(runId: string): Promise<void>;
+	/** WS-08: deletes every temporary ref the issue's runs keep (terminal cleanup). Never throws. */
+	releaseIssue(issueId: number): Promise<void>;
+	/** GH-26: the repository's base branch and `setupCommand`, read from `.agentbot.yml` on a freshly fetched mirror. Throws with the problem. */
+	repoConfig(checkout: CheckoutRequest): Promise<{ baseBranch: string; setupCommand?: string }>;
 }
 
 /** RUN-14: the Discord state of a run's live messages, kept per owner so a restarted orchestrator edits the same messages. */

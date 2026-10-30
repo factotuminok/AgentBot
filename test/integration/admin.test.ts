@@ -4,15 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAdminApi } from "../../src/orchestrator/api/admin";
 import { type InternalApi, startInternalApi } from "../../src/orchestrator/api/server";
-import { createFakeDispatcher } from "../../src/orchestrator/dispatch/fake";
+import type { RunRequest, RunUi } from "../../src/orchestrator/dispatch/dispatcher";
+import { createFakeDispatcher, type FakeDispatcher } from "../../src/orchestrator/dispatch/fake";
 import { type Controller, createController } from "../../src/orchestrator/engine/controller";
 import { createGitHub } from "../../src/orchestrator/github/app";
 import { openAgentLog } from "../../src/orchestrator/store/agentlog";
 import { type Db, dbPath, openDb } from "../../src/orchestrator/store/db";
+import { loadoutKey } from "../../src/orchestrator/store/stats";
 import { openVault, type Vault } from "../../src/orchestrator/store/vault";
 import type { AdminState, SettingsSaveResponse, SettingsView, StatusReport } from "../../src/shared/adminApi";
+import type { Loadout } from "../../src/shared/agent";
 import { createFakeDiscord } from "../fakes/discord";
 import { type FakeGitHub, startFakeGitHub } from "../fakes/github";
+import type { ThrottleLimits } from "../../src/shared/loginThrottle";
 
 const WEB_TOKEN = "web-api-token-for-tests";
 const SETUP_TOKEN = "setup-token-for-tests";
@@ -23,6 +27,7 @@ interface Orchestrator {
 	vault: Vault;
 	controller: Controller;
 	api: InternalApi;
+	dispatcher: FakeDispatcher;
 	/** Admin API call with the web token. */
 	call(method: string, path: string, body?: unknown, headers?: Record<string, string>): Promise<Response>;
 	close(): Promise<void>;
@@ -46,7 +51,11 @@ function fakeGitHub(): FakeGitHub {
 }
 
 /** One orchestrator process over `stateDir`: what main.ts wires, with the fake Discord and GitHub. */
-async function orchestrator(stateDir: string, github: FakeGitHub, opts: { webToken?: string | null; setupToken?: string } = {}): Promise<Orchestrator> {
+async function orchestrator(
+	stateDir: string,
+	github: FakeGitHub,
+	opts: { webToken?: string | null; setupToken?: string; modelAccounts?: () => number; passwordLimits?: ThrottleLimits } = {},
+): Promise<Orchestrator> {
 	const db = openDb(dbPath(stateDir));
 	const vault = await openVault(db);
 	const agentLog = await openAgentLog({ dir: join(stateDir, "logs", "agent"), maxBytes: 1024 ** 3 });
@@ -69,6 +78,8 @@ async function orchestrator(stateDir: string, github: FakeGitHub, opts: { webTok
 		workerCapacity: 4,
 		webToken: opts.webToken === null ? undefined : (opts.webToken ?? WEB_TOKEN),
 		setupToken: vault.isInitialized() ? undefined : (opts.setupToken ?? SETUP_TOKEN),
+		modelAccounts: opts.modelAccounts,
+		...(opts.passwordLimits ? { passwordLimits: opts.passwordLimits } : {}),
 	});
 	const api = startInternalApi({
 		host: "127.0.0.1",
@@ -97,6 +108,7 @@ async function orchestrator(stateDir: string, github: FakeGitHub, opts: { webTok
 		vault,
 		controller,
 		api,
+		dispatcher,
 		close,
 		call: (method, path, body, headers = {}) =>
 			fetch(`${api.url}/internal/admin${path}`, {
@@ -204,6 +216,24 @@ describe("login and credentials (WEB-03, WEB-04)", () => {
 		expect(await (await o.call("POST", "/login", { username: "root", password: "a new long password" })).json()).toEqual({ ok: true });
 		expect(await (await o.call("POST", "/login", { username: "admin", password: PASSWORD })).json()).toEqual({ ok: false });
 	});
+
+	test("password checks are throttled for the whole admin API: one at a time, and a failure budget (architecture §6)", async () => {
+		const o = await orchestrator(tempStateDir(), fakeGitHub(), { passwordLimits: { maxFailures: 3, windowMs: 60_000 } });
+		await setUp(o);
+		const wrong = () => o.call("POST", "/login", { username: "admin", password: "wrong password!" });
+		// Parallel guesses with the web token are not all checked: each scrypt check runs alone.
+		const parallel = (await Promise.all(Array.from({ length: 5 }, wrong))).map(res => res.status);
+		expect(parallel).toContain(429);
+		const checked = parallel.filter(status => status === 200).length;
+		for (let i = checked; i < 3; i++) expect((await wrong()).status).toBe(200);
+		// The budget is spent: even the right password waits, and so does a credential change.
+		const blocked = await o.call("POST", "/login", { username: "admin", password: PASSWORD });
+		expect(blocked.status).toBe(429);
+		expect(blocked.headers.get("retry-after")).toBe("60");
+		expect(await errorOf(blocked)).toBe("Too many failed password checks. Try again in 1 minute.");
+		const change = await o.call("POST", "/credentials", { currentPassword: PASSWORD, username: "root", password: "a new long password" });
+		expect(change.status).toBe(429);
+	});
 });
 
 describe("settings", () => {
@@ -290,5 +320,101 @@ describe("status", () => {
 
 		const health = (await (await fetch(`${o.api.url}/readyz`)).json()) as { phase: string; runs: unknown };
 		expect(health).toMatchObject({ phase: "running", runs: { pending: 0, running: 0 } });
+	});
+
+	test("lists pending runs with their age and runs in progress with setup time, last tool and live usage; the latest loadout per profile", async () => {
+		const o = await orchestrator(tempStateDir(), fakeGitHub());
+		await setUp(o);
+		const pendingGate = Promise.withResolvers<void>();
+		const setupGate = Promise.withResolvers<void>();
+		const progressed = Promise.withResolvers<void>();
+		o.dispatcher.once({ owner: { kind: "draft", draftId: "waiting" } }, { pending: pendingGate.promise });
+		o.dispatcher.once(
+			{ owner: { kind: "draft", draftId: "busy" } },
+			{
+				// Setup (worker start, checkout, setupCommand) lasts until the gate opens; then the agent registers and reports.
+				steps: [{ until: setupGate.promise }, { progress: { tool: "grep", usage: { costUsd: 0.5, input: 1200, output: 30, cacheRead: 0, cacheWrite: 0 } } }],
+				registerAt: 1,
+				hold: true,
+			},
+		);
+		const hooks = { ui: {} as RunUi, register: () => {} };
+		const request = (draftId: string, repo: string): RunRequest => ({
+			owner: { kind: "draft", draftId },
+			kind: "draft",
+			profile: "draft",
+			prompt: "p",
+			thinking: "high",
+			limits: { minutes: 1, costUsd: 1 },
+			session: `draft-${draftId}`,
+			resume: false,
+			threadId: `thread-${draftId}`,
+			checkout: { repo, defaultBranch: async () => "main", identity: { name: "a", email: "a@b" }, gitToken: async () => "t" },
+		});
+		const waiting = o.dispatcher.runAgent(request("waiting", "o/a"), hooks);
+		const busy = o.dispatcher.runAgent(request("busy", "o/b"), { ...hooks, onProgress: () => progressed.resolve() });
+
+		// Still setting up: claimed, not started, no setup time yet.
+		const settingUp = ((await (await o.call("GET", "/status")).json()) as StatusReport).activeRuns[1]!;
+		expect(settingUp).toMatchObject({ owner: "draft:busy", state: "assigned" });
+		expect(settingUp.claimedAt).toBeDefined();
+		expect(settingUp.startedAt).toBeUndefined();
+		expect(settingUp.setupMs).toBeUndefined();
+		setupGate.resolve();
+		await progressed.promise;
+		const loadout: Loadout = { capturedAt: new Date().toISOString(), profile: "implement", tools: ["read"], skills: [], agents: [], mcp: [] };
+		o.db.kvSet(loadoutKey("implement"), JSON.stringify(loadout));
+
+		const report = (await (await o.call("GET", "/status")).json()) as StatusReport;
+		expect(report.runs).toMatchObject({ pending: 1, running: 1 });
+		expect(report.runs.oldestPendingMs).toBeGreaterThanOrEqual(0);
+		expect(report.activeRuns.map(r => [r.owner, r.state, r.repo, r.threadId])).toEqual([
+			["draft:waiting", "pending", "o/a", "thread-waiting"],
+			["draft:busy", "running", "o/b", "thread-busy"],
+		]);
+		const [pending, running] = report.activeRuns;
+		expect(pending!.claimedAt).toBeUndefined();
+		expect(pending!.setupMs).toBeUndefined();
+		expect(Date.parse(pending!.createdAt)).toBeLessThanOrEqual(Date.now());
+		expect(running).toMatchObject({ lastTool: "grep", usage: { costUsd: 0.5, input: 1200, output: 30 }, claimedAt: settingUp.claimedAt });
+		expect(running!.setupMs).toBe(Date.parse(running!.startedAt!) - Date.parse(running!.claimedAt!));
+		expect(running!.setupMs).toBeGreaterThanOrEqual(0);
+		expect(report.loadouts).toEqual([loadout]);
+		expect(report.usage.setup).toEqual([]);
+
+		pendingGate.resolve();
+		o.dispatcher.run({ kind: "draft", draftId: "busy" })!.finish();
+		await Promise.all([waiting, busy]);
+		expect(o.dispatcher.activeRuns()).toEqual([]);
+	});
+});
+
+describe("home facts (§9.3 `/`)", () => {
+	test("counts model accounts and MCP servers and tracks the getting-started checklist", async () => {
+		const github = fakeGitHub();
+		let accounts = 0;
+		const o = await orchestrator(tempStateDir(), github, { modelAccounts: () => accounts });
+		const none = { setup: false, credentials: false, workChannel: false, watchedRepo: false, modelAccess: false };
+		expect((await state(o)).home).toEqual({ modelAccounts: 0, checklist: none });
+
+		await setUp(o);
+		expect((await state(o)).home).toEqual({ modelAccounts: 0, mcpServers: 0, checklist: { ...none, setup: true } });
+
+		await o.call("PUT", "/settings", { config: config(github), secrets: { discordToken: "discord-token", githubAppPrivateKey: github.privateKey } });
+		expect((await state(o)).home.checklist).toEqual({ ...none, setup: true, credentials: true, workChannel: true });
+
+		accounts = 2;
+		o.vault.writeOmpConfig({ settings: {}, mcpServers: { echo: { command: "echo" }, docs: { type: "http", url: "https://mcp.example.com/mcp" } } });
+		o.db.watchRepo({ repoId: 1, repo: "o/r", channelId: "c1", createdBy: "u" });
+		expect((await state(o)).home).toEqual({
+			modelAccounts: 2,
+			mcpServers: 2,
+			checklist: { setup: true, credentials: true, workChannel: true, watchedRepo: true, modelAccess: true },
+		});
+
+		// A provider API key alone also gives model access.
+		accounts = 0;
+		await o.call("PUT", "/settings", { config: config(github), secrets: { providerKeys: { openai: "sk-1" } } });
+		expect((await state(o)).home).toMatchObject({ modelAccounts: 0, checklist: { modelAccess: true } });
 	});
 });

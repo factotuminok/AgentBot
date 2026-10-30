@@ -1,3 +1,4 @@
+import type { Loadout } from "../shared/agent";
 import type { StatusReport } from "../shared/adminApi";
 
 /*
@@ -25,6 +26,10 @@ export interface LiveView {
 	open: Cell[][];
 	/** Connected workers: id, address, run, phase, omp version, connected for (§9.3). */
 	workers: Cell[][];
+	/** Pending runs: run, repository, waiting for (§9.3). */
+	pending: Cell[][];
+	/** Runs in progress: run, repository, worker, state, elapsed, setup time, last tool, cost, tokens, loadout (§9.3, NFR-06). */
+	running: Cell[][];
 }
 
 /** `$1.23`; four decimals for non-zero amounts under a cent. */
@@ -50,6 +55,13 @@ export function formatDuration(ms: number): string {
 /** ISO timestamp → `2026-10-15 12:34:56 UTC`. */
 export function formatTime(iso: string): string {
 	return `${iso.slice(0, 19).replace("T", " ")} UTC`;
+}
+
+/** `12 tools · 3 skills · 2 agents · MCP github ✓, docs ✗`. */
+export function loadoutSummary(loadout: Loadout): string {
+	const parts = [`${loadout.tools.length} tools`, `${loadout.skills.length} skills`, `${loadout.agents.length} agents`];
+	if (loadout.mcp.length) parts.push(`MCP ${loadout.mcp.map(m => `${m.server} ${m.status === "connected" ? "✓" : m.status === "pending" ? "…" : "✗"}`).join(", ")}`);
+	return parts.join(" · ");
 }
 
 export function liveView(report: StatusReport, ctx: LiveContext): LiveView {
@@ -116,5 +128,29 @@ export function liveView(report: StatusReport, ctx: LiveContext): LiveView {
 		worker.ompVersion,
 		formatDuration(ctx.now - Date.parse(worker.connectedAt)),
 	]);
-	return { state, watches, limits, warnings, open, workers };
+	const pending: Cell[][] = [];
+	const running: Cell[][] = [];
+	for (const run of report.activeRuns) {
+		const label = discordLink(run.kind, run.threadId ?? null);
+		const repo: Cell = run.repo ? [run.repo, `https://github.com/${run.repo}`] : "—";
+		if (run.state === "pending") {
+			pending.push([label, repo, formatDuration(ctx.now - Date.parse(run.createdAt))]);
+			continue;
+		}
+		const setup =
+			run.setupMs !== undefined ? formatDuration(run.setupMs) : run.claimedAt ? `${formatDuration(ctx.now - Date.parse(run.claimedAt))} so far` : "—";
+		running.push([
+			label,
+			repo,
+			run.workerId ?? "—",
+			run.state,
+			run.startedAt ? formatDuration(ctx.now - Date.parse(run.startedAt)) : "—",
+			setup,
+			run.lastTool ?? "",
+			formatUsd(run.usage.costUsd),
+			`${formatCount(run.usage.input)} in · ${formatCount(run.usage.output)} out`,
+			run.loadout ? loadoutSummary(run.loadout) : "",
+		]);
+	}
+	return { state, watches, limits, warnings, open, workers, pending, running };
 }

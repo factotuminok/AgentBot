@@ -232,11 +232,12 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 				break;
 			case "tool_execution_end": {
 				transcript({ type: "tool_end", tool: event.toolName, isError: !!event.isError, text: toolResultText(event.result) });
+				if (event.toolName === "yield" && !event.isError) {
+					const details = (event.result as { details?: YieldDetails } | undefined)?.details;
+					if (details?.status === "success") output = details.data;
+				}
+				// After the yield is captured: kills seen at a successful yield are counted but not steered (AGT-18).
 				checkOom(event.toolName);
-				if (event.toolName !== "yield" || event.isError) break;
-				const details = (event.result as { details?: YieldDetails } | undefined)?.details;
-				if (details?.status !== "success") break;
-				output = details.data;
 				break;
 			}
 			case "turn_start":

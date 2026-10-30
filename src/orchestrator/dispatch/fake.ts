@@ -1,11 +1,14 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import type { RunStatus } from "../../shared/adminApi";
 import type { TodoItem } from "../../shared/agent";
 import type { RunUsage, TranscriptEvent } from "../../shared/transcript";
 import {
 	type AbortReason,
+	type CheckoutRequest,
 	type Dispatcher,
 	ownerKey,
+	type PushOutcome,
 	RunDetached,
 	type RunHandle,
 	type RunHooks,
@@ -18,6 +21,7 @@ import {
 	type SteerOptions,
 	UI_CALL_CONTEXT,
 	type UiCallContext,
+	writesCode,
 } from "./dispatcher";
 
 /**
@@ -70,6 +74,8 @@ export interface FakeRunScript {
 	steerResult?: "delivered" | "queued" | "ended";
 	/** Ask runs: files written to `<req.scratchDir>/outputs/<name>` when the run ends; their names become `result.outputs`. */
 	outputFiles?: Record<string, string>;
+	/** Runs that write code: the commits of their result (RUN-19); default 1. 0 means the branch had no new commits. */
+	commits?: number;
 }
 
 /** Which runs a script applies to; every given field must match. A function decides itself. */
@@ -113,6 +119,10 @@ export interface FakeDispatcherOptions {
 	cannedOutput?(req: RunRequest): unknown;
 	/** Answers `mcpTest`; default `{ ok: true, tools: [] }`. */
 	mcpTest?(spec: { name: string; server: unknown }): Promise<{ ok: boolean; tools: string[]; error?: string }>;
+	/** Answers `pushResult` for a kept result; default `{ pushed: true, sha: "fake-sha-<n>" }`. */
+	push?(p: { runId: string; branch: string; req: RunRequest }): PushOutcome | Promise<PushOutcome>;
+	/** Answers `repoConfig`; default: the base branch is the default branch, no `setupCommand`. */
+	repoConfig?(checkout: CheckoutRequest): Promise<{ baseBranch: string; setupCommand?: string }>;
 }
 
 export interface FakeDispatcher extends Dispatcher {
@@ -130,6 +140,11 @@ export interface FakeDispatcher extends Dispatcher {
 	readonly calls: readonly { req: RunRequest; attached: boolean }[];
 	/** Every `mcpTest` request, in call order. */
 	readonly mcpTests: readonly { name: string; server: unknown }[];
+	/** Every successful or refused `pushResult`, in call order. */
+	readonly pushes: readonly { runId: string; branch: string; outcome: PushOutcome }[];
+	/** Results deleted with `discardResult`, and issues released with `releaseIssue`. */
+	readonly discarded: readonly string[];
+	readonly released: readonly number[];
 	/** Settles once no run is unfinished. */
 	idle(): Promise<void>;
 }
@@ -196,6 +211,12 @@ interface RunImpl extends FakeRun {
 	outcome: FakeOutcome | undefined;
 	handle: RunHandle;
 	pendingSince: number | undefined;
+	/** Status view (§9.3): when it became pending, left pending ("claimed") and registered ("started"); latest progress. */
+	createdAt: number;
+	claimedAt: number | undefined;
+	startedAt: number | undefined;
+	lastTool: string | undefined;
+	liveUsage: RunUsage;
 	/** Usage computed at the end, waiting for a caller when none was attached (OBS-05: reported exactly once). */
 	usageOwed: RunUsage | undefined;
 	posted: Map<string, { channelId: string; messageIds: string[] }>;
@@ -217,6 +238,11 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 	const runs: RunImpl[] = [];
 	const calls: { req: RunRequest; attached: boolean }[] = [];
 	const mcpTests: { name: string; server: unknown }[] = [];
+	/** Results of code-writing runs waiting for `pushResult` or `discardResult`, by run id (RUN-19). */
+	const keptResults = new Map<string, RunRequest>();
+	const pushes: { runId: string; branch: string; outcome: PushOutcome }[] = [];
+	const discarded: string[] = [];
+	const released: number[] = [];
 	let nextId = 1;
 	let idleWaiters: (() => void)[] = [];
 
@@ -366,6 +392,11 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			caller: undefined,
 			outcome: undefined,
 			pendingSince: Date.now(),
+			createdAt: Date.now(),
+			claimedAt: undefined,
+			startedAt: undefined,
+			lastTool: undefined,
+			liveUsage: { costUsd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			usageOwed: undefined,
 			done,
 			handle: {
@@ -399,16 +430,23 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			},
 		};
 		const usage = (): RunUsage => ({ ...DEFAULT_USAGE, ...script.usage });
-		const baseResult = (): RunResult => ({
-			output: script.output ?? canned(req),
-			usage: usage(),
-			oomKills: script.oomKills ?? 0,
-			hasSession: script.hasSession ?? true,
-		});
+		const baseResult = (): RunResult => {
+			const result: RunResult = {
+				output: script.output ?? canned(req),
+				usage: usage(),
+				oomKills: script.oomKills ?? 0,
+				hasSession: script.hasSession ?? true,
+			};
+			if (!writesCode(req.kind)) return result;
+			const code = { runId: `fake-run-${run.id}`, commits: script.commits ?? 1 };
+			if (code.commits > 0) keptResults.set(code.runId, req);
+			return { ...result, code };
+		};
 		const hooksNow = () => run.caller?.hooks;
 		const register = () => {
 			if (run.registered) return;
 			run.registered = true;
+			run.startedAt = Date.now();
 			hooksNow()?.register(run.handle);
 			if (script.steerResult !== "queued") settleSteers("delivered");
 		};
@@ -438,6 +476,7 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			}
 			run.state = "running";
 			run.pendingSince = undefined;
+			run.claimedAt = Date.now();
 			hooksNow()?.onTranscript?.({ type: "prompt", text: req.prompt });
 			const steps = script.steps ?? [];
 			const registerAt = script.registerAt === undefined ? 0 : script.registerAt;
@@ -445,8 +484,12 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 				if (registerAt === i) register();
 				const step = steps[i]!;
 				const hooks = hooksNow();
-				if ("progress" in step) hooks?.onProgress?.({ usage: usage(), elapsedMs: 0, ...step.progress });
-				else if ("todos" in step) hooks?.onTodos?.(step.todos);
+				if ("progress" in step) {
+					const progress: RunProgress = { usage: usage(), elapsedMs: 0, ...step.progress };
+					run.liveUsage = progress.usage;
+					if (progress.tool) run.lastTool = progress.tool;
+					hooks?.onProgress?.(progress);
+				} else if ("todos" in step) hooks?.onTodos?.(step.todos);
 				else if ("transcript" in step) hooks?.onTranscript?.(step.transcript);
 				else if ("ui" in step) {
 					if (!hooks) throw new Error("fake run asked a question while no caller was attached");
@@ -540,11 +583,36 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			if (signal?.aborted) return Promise.reject(new RunDetached());
 			return start(req, hooks, signal);
 		},
+		// A run lost while no caller was attached is still there to attach to: the attach reports `RunLost`.
+		hasRun: owner => byOwner.has(ownerKey(owner)) || lostOwners.has(ownerKey(owner)),
 		hasUnfinishedRun(owner) {
 			const run = byOwner.get(ownerKey(owner));
 			return run !== undefined && run.state !== "finished";
 		},
 		workers: () => [],
+		activeRuns() {
+			const iso = (ms: number) => new Date(ms).toISOString();
+			return [...byOwner.values()]
+				.filter(run => run.state !== "finished")
+				.sort((a, b) => a.createdAt - b.createdAt)
+				.map(run => {
+					const status: RunStatus = {
+						id: `fake-run-${run.id}`,
+						kind: run.req.kind,
+						state: run.state === "pending" ? "pending" : run.registered ? "running" : "assigned",
+						owner: run.key,
+						createdAt: iso(run.createdAt),
+						usage: run.liveUsage,
+					};
+					if (run.req.checkout) status.repo = run.req.checkout.repo;
+					if (run.req.threadId) status.threadId = run.req.threadId;
+					if (run.claimedAt !== undefined) status.claimedAt = iso(run.claimedAt);
+					if (run.startedAt !== undefined) status.startedAt = iso(run.startedAt);
+					if (run.claimedAt !== undefined && run.startedAt !== undefined) status.setupMs = run.startedAt - run.claimedAt;
+					if (run.lastTool) status.lastTool = run.lastTool;
+					return status;
+				});
+		},
 		counts() {
 			let pending = 0;
 			let running = 0;
@@ -557,9 +625,37 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			}
 			return { pending, running, oldestPendingMs: oldest === undefined ? null : Date.now() - oldest };
 		},
-		async mcpTest(spec) {
+		async mcpTest(spec, testOpts) {
 			mcpTests.push(spec);
+			testOpts?.onWaitingForWorker?.();
+			testOpts?.onStarted?.();
 			return opts.mcpTest ? opts.mcpTest(spec) : { ok: true, tools: [] };
+		},
+		async pushResult(runId, branch) {
+			const req = keptResults.get(runId);
+			if (!req) throw new Error(`run ${runId} keeps no result to push`);
+			const outcome = opts.push ? await opts.push({ runId, branch, req }) : { pushed: true as const, sha: `fake-sha-${pushes.length + 1}` };
+			pushes.push({ runId, branch, outcome });
+			return outcome;
+		},
+		async discardResult(runId) {
+			keptResults.delete(runId);
+			discarded.push(runId);
+		},
+		async releaseIssue(issueId) {
+			released.push(issueId);
+		},
+		async repoConfig(checkout) {
+			return opts.repoConfig ? opts.repoConfig(checkout) : { baseBranch: await checkout.defaultBranch() };
+		},
+		get pushes() {
+			return pushes;
+		},
+		get discarded() {
+			return discarded;
+		},
+		get released() {
+			return released;
 		},
 		script(match, script, times) {
 			scripts.push({ match, script, left: times ?? Number.POSITIVE_INFINITY });

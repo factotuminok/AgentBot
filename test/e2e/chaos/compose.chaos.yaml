@@ -1,0 +1,49 @@
+# Chaos stack (test/e2e/chaos/run.ts): compose.yaml with the chaos image (test/e2e/chaos/Containerfile) as the
+# orchestrator and the workers, the real web and launcher from the release image, and the fake GitHub as its own service.
+#   podman compose -f compose.yaml -f test/e2e/chaos/compose.chaos.yaml -p agentbot-chaos up -d
+# Set AGENTBOT_IMAGE to the chaos image (the launcher starts workers from it) and AGENTBOT_BASE_IMAGE to the release
+# image; test/e2e/chaos/run.ts sets everything.
+#   CHAOS_ORCH_PORT     host port of the orchestrator's internal API (the driver's e2e control API), default 18181
+#   CHAOS_GITHUB_PORT   host port of the fake GitHub's control API, default 18191
+#   E2E_LEASE_MS, E2E_REATTACH_GRACE_MS, E2E_MAX_CONCURRENT_JOBS  passed to the scenario orchestrator
+
+services:
+  github:
+    image: ${AGENTBOT_IMAGE}
+    user: "10001:10001"
+    userns_mode: "keep-id:uid=10001,gid=10001"
+    init: true
+    restart: unless-stopped
+    networks: [agentbot]
+    command: ["github"]
+    volumes:
+      - e2e-github:/e2e-github
+    ports:
+      - "127.0.0.1:${CHAOS_GITHUB_PORT:-18191}:8091"
+
+  orchestrator:
+    environment:
+      E2E_GITHUB_URL: http://github:8090
+      E2E_GITHUB_CONTROL_URL: http://github:8091
+      E2E_GIT_ROOT: /e2e-github
+      E2E_DISCORD_STATE: /state/e2e-discord.json
+      E2E_LEASE_MS: ${E2E_LEASE_MS:-}
+      E2E_REATTACH_GRACE_MS: ${E2E_REATTACH_GRACE_MS:-}
+      E2E_MAX_CONCURRENT_JOBS: ${E2E_MAX_CONCURRENT_JOBS:-}
+      E2E_POLL_SECONDS: "1"
+    volumes:
+      - e2e-github:/e2e-github
+    ports:
+      - "127.0.0.1:${CHAOS_ORCH_PORT:-18181}:8081"
+    depends_on:
+      github:
+        condition: service_started
+
+  web:
+    image: ${AGENTBOT_BASE_IMAGE:-localhost/agentbot:dev}
+
+  launcher:
+    image: ${AGENTBOT_BASE_IMAGE:-localhost/agentbot:dev}
+
+volumes:
+  e2e-github: {}

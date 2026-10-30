@@ -13,10 +13,10 @@ describe("leases (RUN-02, RUN-07, architecture §6)", () => {
 		const row = claimNextRun(db, "w1", LEASE_MS)!;
 		expect(row.id).toBe(first.id);
 		expect(row.state).toBe("assigned");
-		expect(holdsLease(db.getRun(row.id), "w1", row.lease_token!)).toBe(true);
-		expect(holdsLease(db.getRun(row.id), "w2", row.lease_token!)).toBe(false);
+		expect(holdsLease(db.getRun(row.id), "w1", row.leaseToken)).toBe(true);
+		expect(holdsLease(db.getRun(row.id), "w2", row.leaseToken)).toBe(false);
 		expect(holdsLease(db.getRun(row.id), "w1", "wrong")).toBe(false);
-		expect(holdsLease(db.getRun(row.id), undefined, row.lease_token!)).toBe(true);
+		expect(holdsLease(db.getRun(row.id), undefined, row.leaseToken)).toBe(true);
 	});
 
 	test("one claim per worker id, ever, even after its run ended", () => {
@@ -49,7 +49,7 @@ describe("leases (RUN-02, RUN-07, architecture §6)", () => {
 		const leaseC = claimNextRun(db, "wc", 1000)!;
 		db.transitionRun(b.id, ["assigned"], "running");
 		db.transitionRun(c.id, ["assigned"], "running");
-		expect(db.renewLease(c.id, leaseC.lease_token!, 60_000)).not.toBeNull();
+		expect(db.renewLease(c.id, leaseC.leaseToken, 60_000)).not.toBeNull();
 		expect(db.renewLease(c.id, "wrong", 60_000)).toBeNull();
 
 		const expired = db.expireLeases(later(5_000));
@@ -59,8 +59,8 @@ describe("leases (RUN-02, RUN-07, architecture §6)", () => {
 		expect(db.getRun(b.id)).toMatchObject({ state: "lost", loss_count: 1, lease_token: null });
 		expect(db.getRun(c.id)?.state).toBe("running");
 		// Revoked tokens hold nothing.
-		expect(holdsLease(db.getRun(a.id), "wa", leaseA.lease_token!)).toBe(false);
-		expect(holdsLease(db.getRun(b.id), "wb", leaseB.lease_token!)).toBe(false);
+		expect(holdsLease(db.getRun(a.id), "wa", leaseA.leaseToken)).toBe(false);
+		expect(holdsLease(db.getRun(b.id), "wb", leaseB.leaseToken)).toBe(false);
 	});
 
 	test("after a restart, the grace period keeps leases alive until it ends (RUN-07)", () => {

@@ -1,0 +1,24 @@
+# Launcher smoke-test images (test/e2e/launcher/smoke.sh), built from the repository root. Not the release image: just
+# enough of its layout (user 10001, `agentbot` on PATH as the entrypoint) to run `agentbot launcher` and a stub worker.
+FROM docker.io/oven/bun:1.4.2-debian AS base
+RUN groupadd --gid 10001 agentbot \
+	&& useradd --uid 10001 --gid 10001 --create-home --home-dir /home/agentbot --shell /usr/sbin/nologin agentbot \
+	&& install -d -o 10001 -g 10001 -m 0700 /run/agentbot
+ENV HOME=/home/agentbot AGENTBOT_COMMIT=e2e
+ENTRYPOINT ["agentbot"]
+
+# The launcher (and the stub orchestrator): the app sources with the one dependency the launcher loads.
+FROM base AS launcher
+WORKDIR /app
+RUN printf '{"name":"deps","private":true}\n' > package.json && bun add zod@4.6.7
+COPY package.json /app/package.json
+COPY src/ /app/src/
+COPY test/e2e/launcher/stub-orchestrator.ts /app/stub-orchestrator.ts
+RUN chmod 0755 /app/src/cli.ts && ln -s /app/src/cli.ts /usr/local/bin/agentbot
+USER 10001:10001
+
+# The stub worker: `agentbot worker` says hello to the stub orchestrator and exits 0.
+FROM base AS worker
+COPY test/e2e/launcher/stub-worker.ts /usr/local/bin/agentbot
+RUN chmod 0755 /usr/local/bin/agentbot
+USER 10001:10001

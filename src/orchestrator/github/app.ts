@@ -297,7 +297,13 @@ export async function createGitHub(opts: CreateGitHubOptions): Promise<GitHub> {
 		},
 
 		async createPull(fullName, p) {
-			const { data } = await (await client(fullName)).rest.pulls.create({ ...split(fullName), ...p });
+			const octokit = await client(fullName);
+			// A job that opened the PR but stopped before recording its number finds it here instead of opening a second (NFR-03).
+			const [owner] = fullName.split("/");
+			const { data: open } = await octokit.rest.pulls.list({ ...split(fullName), head: `${owner}:${p.head}`, base: p.base, state: "open", per_page: 1 });
+			const existing = open[0];
+			if (existing) return { number: existing.number, url: existing.html_url };
+			const { data } = await octokit.rest.pulls.create({ ...split(fullName), ...p });
 			return { number: data.number, url: data.html_url };
 		},
 

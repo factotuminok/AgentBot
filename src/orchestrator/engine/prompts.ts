@@ -70,6 +70,7 @@ export const IMPLEMENT_SCHEMA = {
 /** Used for both revise and fix_ci jobs. */
 export const REVISE_SCHEMA = {
 	type: "object",
+	additionalProperties: false,
 	required: ["summary"],
 	properties: { summary: { type: "string" } },
 };

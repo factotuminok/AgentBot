@@ -8,7 +8,7 @@ import { createGitHub } from "../../src/orchestrator/github/app";
 import { openAgentLog } from "../../src/orchestrator/store/agentlog";
 import { type Db, openDb } from "../../src/orchestrator/store/db";
 import { openVault, type Vault } from "../../src/orchestrator/store/vault";
-import { parseSettings, type Settings } from "../../src/shared/config";
+import { parseSettings, type Settings, WORK_CHANNEL_MISSING } from "../../src/shared/config";
 import { createFakeDiscord, type FakeDiscord } from "../fakes/discord";
 import { type FakeGitHub, startFakeGitHub } from "../fakes/github";
 
@@ -107,6 +107,20 @@ test("apply chooses setup, locked and unconfigured from the vault (ENG-02)", asy
 	await locked.apply();
 	expect(locked.status().phase).toBe("locked");
 	await locked.stop();
+});
+
+test("settings without a work channel save, but the engine stays unconfigured until one is chosen (DSC-33, WEB-20)", async () => {
+	const h = await harness();
+	const settings = h.settings();
+	delete settings.config.discord.workChannelId;
+	h.vault.writeSettings(settings);
+	await h.controller.apply();
+	expect(h.controller.status()).toMatchObject({ phase: "unconfigured", error: WORK_CHANNEL_MISSING });
+	expect(h.discords).toHaveLength(0);
+
+	h.vault.writeSettings(h.settings());
+	await h.controller.apply();
+	expect(h.controller.status()).toMatchObject({ phase: "running", error: undefined });
 });
 
 test("a running engine creates the state dirs, logs in to Discord and reports a snapshot", async () => {

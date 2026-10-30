@@ -76,7 +76,18 @@ export interface FakeGitHub {
 
 const now = () => new Date().toISOString();
 
-export function startFakeGitHub(): FakeGitHub {
+export interface FakeGitHubOptions {
+	/**
+	 * Where the repositories' git remotes live (`<gitRoot>/<owner>/<name>.git`, bare): branch lookups read the branch head
+	 * there, so what the orchestrator pushes is what the API reports. Without it, branches come from `FakeRepo.branches`.
+	 */
+	gitRoot?: string;
+	/** Listen address (default 127.0.0.1) and port (default 0, any free port); `url` always names 127.0.0.1. */
+	hostname?: string;
+	port?: number;
+}
+
+export function startFakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
 	const { privateKey } = generateKeyPairSync("rsa", {
 		modulusLength: 2048,
 		privateKeyEncoding: { type: "pkcs1", format: "pem" },
@@ -255,7 +266,17 @@ export function startFakeGitHub(): FakeGitHub {
 	});
 	repoRoute("POST", "/pulls", (r, _m, _u, body) => {
 		const i = api.addPull(r.fullName, { head: body.head, base: body.base, title: body.title });
+		i.body = body.body ?? "";
 		return json({ number: i.number, html_url: `https://github.com/${r.fullName}/pull/${i.number}` }, 201);
+	});
+	repoRoute("GET", "/pulls", (r, _m, url) => {
+		const head = url.searchParams.get("head")?.split(":").at(-1);
+		const base = url.searchParams.get("base");
+		const state = url.searchParams.get("state") ?? "open";
+		const list = [...r.issues.values()].filter(
+			i => i.pull && (!head || i.pull.head === head) && (!base || i.pull.base === base) && (state === "all" || i.state === state),
+		);
+		return page(url, list.map(i => ({ number: i.number, html_url: `https://github.com/${r.fullName}/pull/${i.number}` })));
 	});
 	repoRoute("GET", "/pulls/{n}", (r, m) => {
 		const i = issueOf(r, m[0]!);
@@ -299,8 +320,16 @@ export function startFakeGitHub(): FakeGitHub {
 		return page(url, list, items => ({ total_count: list.length, workflow_runs: items }));
 	});
 	repoRoute("GET", "/branches/{branch}", (r, m) => {
-		const sha = r.branches.get(decodeURIComponent(m[0]!));
-		return sha ? json({ name: m[0], commit: { sha } }) : notFound();
+		const branch = decodeURIComponent(m[0]!);
+		let sha = r.branches.get(branch);
+		if (opts.gitRoot) {
+			const head = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], {
+				cwd: `${opts.gitRoot}/${r.fullName}.git`,
+				env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+			});
+			sha = head.exitCode === 0 ? head.stdout.toString().trim() : undefined;
+		}
+		return sha ? json({ name: branch, commit: { sha } }) : notFound();
 	});
 	repoRoute("GET", "/actions/jobs/{id}/logs", (r, m) => {
 		const text = r.jobLogs.get(Number(m[0]));
@@ -308,8 +337,8 @@ export function startFakeGitHub(): FakeGitHub {
 	});
 
 	server = Bun.serve({
-		port: 0,
-		hostname: "127.0.0.1",
+		port: opts.port ?? 0,
+		hostname: opts.hostname ?? "127.0.0.1",
 		async fetch(req) {
 			const url = new URL(req.url);
 			const text = req.method === "GET" || req.method === "HEAD" ? "" : await req.text();

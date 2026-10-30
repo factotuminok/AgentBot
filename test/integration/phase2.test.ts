@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { restMessage } from "../../src/orchestrator/discord/discordjs";
 import type { Actor } from "../../src/orchestrator/discord/surface";
 import { createFakeDispatcher, type FakeDispatcher } from "../../src/orchestrator/dispatch/fake";
 import { type Controller, createController } from "../../src/orchestrator/engine/controller";
@@ -168,7 +169,8 @@ describe("phase 2 exit", () => {
 	test("watch → label → thread in the repo channel → canned plan awaiting approval", async () => {
 		const h = await boot();
 		h.gh.addRepo("acme/app");
-		const gh = h.gh.addIssue("acme/app", { title: "Add a thing" });
+		// DSC-07: user text that would ping everyone if mentions were parsed.
+		const gh = h.gh.addIssue("acme/app", { title: "Add a thing for @everyone and <@999>" });
 
 		const e = await work(h, "watch", { repo: "acme/app" });
 		const watch = h.db.watchByName("acme/app")!;
@@ -193,6 +195,17 @@ describe("phase 2 exit", () => {
 		expect(labels).toContain("agentbot:awaiting-approval");
 		expect(labels).not.toContain("agentbot:planning");
 		expect(h.discord.message(thread.id)?.content).toStartWith("📋");
+
+		// DSC-07: only the plan review mentions anyone, and only the allowed users; the issue text pings nobody.
+		await h.discord.settled();
+		const sent = h.discord.channels().flatMap(c => h.discord.messages(c.id)).filter(m => m.authorId === h.discord.botUserId);
+		expect(sent.some(m => m.content.includes("@everyone"))).toBe(true);
+		expect(sent.filter(m => m.content.includes("**Plan ready for your approval**"))).toHaveLength(1);
+		for (const m of sent) {
+			const { allowed_mentions } = restMessage({ content: m.content, mentions: m.mentions }).body;
+			if (m.content.includes("**Plan ready for your approval**")) expect(allowed_mentions).toEqual({ parse: [], users: [ALLOWED], roles: [] });
+			else expect(allowed_mentions).toEqual({ parse: [], users: [], roles: [] });
+		}
 	});
 
 	test("/work start on an unwatched repo threads in the work channel; labelling there does nothing", async () => {
@@ -215,8 +228,30 @@ describe("phase 2 exit", () => {
 		expect(h.db.watchByName("acme/other")).toBeNull();
 	});
 
-	test("Approve enqueues implement, which fails needing worker checkouts with a Retry button", async () => {
+	test("Approve runs implement, which pushes the branch and opens the PR", async () => {
 		const h = await boot();
+		h.gh.addRepo("acme/app");
+		const gh = h.gh.addIssue("acme/app", { title: "Add a thing" });
+		await work(h, "start", { repo: "acme/app", issue: gh.number });
+		const { issue, plan } = await awaitPlan(h, "acme/app", gh.number);
+		// The fake dispatcher's push does not reach the fake GitHub; the branch it pushes to is there already.
+		const branch = `agentbot/issue-${gh.number}-add-a-thing`;
+		h.gh.getRepo("acme/app").branches.set(branch, "pushed");
+
+		await clickButton(h, plan, "Approve");
+		await until(() => h.db.getIssue(issue.id)?.state === "in_review", "the issue to be in review");
+		const row = h.db.getIssue(issue.id)!;
+		expect(row.branch).toBe(branch);
+		expect(h.gh.getIssue("acme/app", row.pr_number!).pull).toMatchObject({ head: branch, base: "main" });
+		expect(h.dispatcher.pushes.map(p => p.branch)).toEqual([branch]);
+		await until(() => h.discord.messages(issue.thread_id!).some(m => m.content.startsWith("✅ **Implementation complete**")), "the done message");
+		await until(() => !!h.discord.message(issue.thread_id!)?.content.startsWith("👀"), "the 👀 top-message icon");
+		expect(h.gh.getIssue("acme/app", gh.number).labels.toSorted()).toEqual(["agentbot", "agentbot:in-review"]);
+	});
+
+	test("a failed implement posts the failure with a Retry button", async () => {
+		const h = await boot();
+		h.dispatcher.once({ kind: "implement" }, { commits: 0 });
 		h.gh.addRepo("acme/app");
 		const gh = h.gh.addIssue("acme/app", { title: "Add a thing" });
 		await work(h, "start", { repo: "acme/app", issue: gh.number });
@@ -227,7 +262,7 @@ describe("phase 2 exit", () => {
 		await until(() => h.discord.messages(issue.thread_id!).some(m => m.content.startsWith("❌ implement failed")), "the failure message");
 		await h.discord.settled();
 		const failure = h.discord.messages(issue.thread_id!).find(m => m.content.startsWith("❌ implement failed"))!;
-		expect(failure.content).toContain("implement runs need worker checkouts");
+		expect(failure.content).toBe("❌ implement failed: Agent produced no commits");
 		expect(buttons(failure).map(b => b.label)).toEqual(["Retry"]);
 		// The top-message icon follows the label sync of the `job_failed` transition.
 		await until(() => !!h.discord.message(issue.thread_id!)?.content.startsWith("❌"), "the ❌ top-message icon");
@@ -236,6 +271,7 @@ describe("phase 2 exit", () => {
 
 	test("renaming the trigger relabels tracked issues without cancelling them; the old trigger no longer picks up work", async () => {
 		const h = await boot();
+		h.dispatcher.once({ kind: "implement" }, { commits: 0 });
 		h.gh.addRepo("acme/app");
 		await work(h, "watch", { repo: "acme/app" });
 		const waiting = h.gh.addIssue("acme/app", { title: "Awaiting approval" });

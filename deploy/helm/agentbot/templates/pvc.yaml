@@ -1,0 +1,36 @@
+{{- if not .Values.orchestrator.persistence.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "agentbot.fullname" . }}-state
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "orchestrator") | nindent 4 }}
+  annotations:
+    # The database, mirrors and sessions outlive `helm uninstall`; a reinstall with the same release name adopts them.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.orchestrator.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.orchestrator.persistence.size }}
+{{- end }}
+{{- if not .Values.web.persistence.existingClaim }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "agentbot.fullname" . }}-web-home
+  labels:
+    {{- include "agentbot.labels" (dict "root" . "component" "web") | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.web.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.web.persistence.size }}
+{{- end }}

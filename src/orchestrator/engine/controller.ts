@@ -1,26 +1,32 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { EnginePhase, StatusReport } from "../../shared/adminApi";
-import { type LabelNames, resolveLabelNames, type Settings } from "../../shared/config";
+import { type EngineConfig, hasWorkChannel, type LabelNames, resolveLabelNames, type Settings, WORK_CHANNEL_MISSING } from "../../shared/config";
 import { errorMessage, log } from "../../shared/log";
 import { attachBot } from "../discord/bot";
 import { createDiscordJsConnection } from "../discord/discordjs";
 import { createInteractionRouter } from "../discord/interactionRouter";
 import { createThreadReplies } from "../discord/replies";
+import { createOmpNotices } from "../discord/ompUpdate";
 import type { DiscordConnection } from "../discord/surface";
 import type { Dispatcher } from "../dispatch/dispatcher";
 import { createGitHub } from "../github/app";
 import { relabelTrackedIssues } from "../github/labels";
 import { createPoller } from "../github/poller";
 import type { GitHub } from "../github/types";
+import type { OmpUpdater } from "../omp/updates";
 import type { AgentLog } from "../store/agentlog";
 import type { Db } from "../store/db";
 import { sweepSessions } from "../store/sessions";
 import type { Vault } from "../store/vault";
 import { createAskChat } from "./chat";
+import { createIssueDrafter } from "./draft";
+import { createPlanner } from "./plans";
+import { createRepoChat } from "./repoChat";
 import type { EngineDeps } from "./deps";
 import { createTrackIssue } from "./issues";
 import { createScheduler } from "./scheduler";
+import { createChatSlots } from "./chatSlots";
 
 export type { EnginePhase };
 
@@ -63,6 +69,8 @@ export interface ControllerOptions {
 	connectDiscord?(): DiscordConnection;
 	/** The GitHub App client per engine instance; defaults to `createGitHub` against api.github.com. */
 	connectGitHub?: GitHubFactory;
+	/** Process-wide in-place omp updates (UPD-02, UPD-03): each engine posts the notices and handles Approve. */
+	ompUpdates?: OmpUpdater;
 }
 
 /** A running engine instance: everything that must be torn down before settings can be re-applied. */
@@ -74,7 +82,7 @@ interface RunningEngine {
 /** State directories the engine works in (ENG-03 step 1). */
 const STATE_DIRS = ["sessions", "scratch", "omp-agent", "repos"] as const;
 
-async function startEngine(opts: ControllerOptions, { config, secrets }: Settings): Promise<RunningEngine> {
+async function startEngine(opts: ControllerOptions, config: EngineConfig, secrets: Settings["secrets"]): Promise<RunningEngine> {
 	const { stateDir, db, agentLog, dispatcher } = opts;
 	for (const dir of STATE_DIRS) await mkdir(join(stateDir, dir), { recursive: true });
 	const sessionDir = join(stateDir, "sessions");
@@ -96,14 +104,30 @@ async function startEngine(opts: ControllerOptions, { config, secrets }: Setting
 		interactions: createInteractionRouter(),
 		agentLog,
 		sessionDir,
+		chatSlots: createChatSlots(config.limits.maxChatSessions),
 		signal: lifetime.signal,
 	};
 	const scheduler = createScheduler(deps);
 	const trackIssue = createTrackIssue(deps, scheduler);
 	const poller = createPoller(deps, scheduler, trackIssue);
 	const askChat = createAskChat(deps, { scratchRoot: join(stateDir, "scratch") });
+	const repoChat = createRepoChat(deps);
+	const planner = createPlanner(deps, { scheduler });
+	const drafter = createIssueDrafter(deps, { trackIssue });
+	/** Run-owning features that outlive the engine: started after login, detached at stop (RUN-09, RUN-14). */
+	const features = [
+		{ name: "ask chat", feature: askChat },
+		{ name: "repo chat", feature: repoChat },
+		{ name: "planner", feature: planner },
+		{ name: "issue drafter", feature: drafter },
+	];
+	const detachFeatures = () =>
+		Promise.all(
+			features.map(({ name, feature }) => feature.stop().catch(err => log("error", `${name} detach failed`, { error: errorMessage(err) }))),
+		);
+	const ompNotices = opts.ompUpdates ? createOmpNotices(deps, opts.ompUpdates) : undefined;
 	// Attached before login: command registration and the nickname run on every ready event (DSC-01, DSC-29).
-	const bot = attachBot({ deps, connection, scheduler, trackIssue, poller, askChat });
+	const bot = attachBot({ deps, connection, scheduler, trackIssue, poller, askChat, repoChat, planner, drafter, ompNotices });
 	try {
 		try {
 			await connection.login(secrets.discordToken);
@@ -114,13 +138,14 @@ async function startEngine(opts: ControllerOptions, { config, secrets }: Setting
 		await relabelTrackedIssues(deps);
 		scheduler.recover();
 		scheduler.tick();
-		askChat.start();
+		for (const { feature } of features) feature.start();
 		poller.start();
+		ompNotices?.start();
 	} catch (err) {
 		poller.stop();
 		lifetime.abort();
 		await scheduler.detach().catch(detachErr => log("warn", "scheduler detach failed", { error: errorMessage(detachErr) }));
-		await askChat.stop().catch(detachErr => log("warn", "ask chat detach failed", { error: errorMessage(detachErr) }));
+		await detachFeatures();
 		bot.detach();
 		await connection.destroy().catch(destroyErr => log("warn", "discord destroy failed", { error: errorMessage(destroyErr) }));
 		throw err;
@@ -132,9 +157,10 @@ async function startEngine(opts: ControllerOptions, { config, secrets }: Setting
 		async stop() {
 			// ENG-04 order: poller, dispatch (detach from runs; never abort them), then Discord.
 			poller.stop();
+			ompNotices?.stop();
 			lifetime.abort();
 			await scheduler.detach().catch(err => log("error", "scheduler detach failed", { error: errorMessage(err) }));
-			await askChat.stop().catch(err => log("error", "ask chat detach failed", { error: errorMessage(err) }));
+			await detachFeatures();
 			bot.detach();
 			await connection.destroy();
 			log("info", "engine stopped");
@@ -197,9 +223,10 @@ export function createController(opts: ControllerOptions): Controller {
 		} catch (err) {
 			log("error", "applying log size failed", { error: errorMessage(err) });
 		}
+		if (!hasWorkChannel(settings.config)) return set("unconfigured", WORK_CHANNEL_MISSING);
 		set("starting");
 		try {
-			running = await startEngine(opts, settings);
+			running = await startEngine(opts, settings.config, settings.secrets);
 			set("running");
 		} catch (err) {
 			set("error", errorMessage(err));

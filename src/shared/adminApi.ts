@@ -1,4 +1,6 @@
+import type { Loadout } from "./agent";
 import type { Config } from "./config";
+import type { RunUsage } from "./transcript";
 import type { WorkerPhase } from "./wire";
 
 /**
@@ -25,6 +27,29 @@ export interface AdminState {
 	unlocked: boolean;
 	username?: string;
 	version: string;
+	/** Home page facts (§9.3 `/`). */
+	home: HomeFacts;
+}
+
+/**
+ * Counts and getting-started progress for the home page (§9.3 `/`). Counts are absent while they can't be read (the
+ * vault is locked, or no reader is wired); a step whose data can't be read is not done.
+ */
+export interface HomeFacts {
+	modelAccounts?: number;
+	mcpServers?: number;
+	checklist: {
+		/** The admin account exists (WEB-02). */
+		setup: boolean;
+		/** Discord bot token, GitHub App id and private key are saved. */
+		credentials: boolean;
+		/** `discord.workChannelId` is set (DSC-33). */
+		workChannel: boolean;
+		/** At least one repository is watched (DSC-35). */
+		watchedRepo: boolean;
+		/** A model sign-in or a provider API key exists. */
+		modelAccess: boolean;
+	};
 }
 
 /** POST /internal/admin/setup — WEB-02. 400 on a bad token/username/password, 409 once an admin exists. */
@@ -94,7 +119,39 @@ export interface WorkerStatus {
 	connectedAt: string;
 }
 
-/** GET /internal/admin/status?window=7d — the status page and `/status.json` (§9.3). Phase 2 subset. */
+/**
+ * A run that has not finished (§9.3: pending runs and their age, runs in progress). Setup time is the time from the
+ * claim to the agent starting — worker start, downloads, checkout and `setupCommand` (NFR-06).
+ */
+export interface RunStatus {
+	id: string;
+	/** `RunKind`, or `ask` for the public `/ask` chat. */
+	kind: string;
+	state: "pending" | "assigned" | "running" | "finishing";
+	/** `owner/name`; absent for `/ask` runs. */
+	repo?: string;
+	/** Owner key: `job:<id>`, `chat:<thread>`, `plan:<thread>` or `draft:<id>`. */
+	owner: string;
+	/** Discord thread the run reports into. */
+	threadId?: string;
+	workerId?: string;
+	/** When the run became pending. */
+	createdAt: string;
+	/** The latest claim by a worker. */
+	claimedAt?: string;
+	/** The agent started (the host `registered`). */
+	startedAt?: string;
+	/** `startedAt − claimedAt`; absent until the agent started. */
+	setupMs?: number;
+	/** The tool of the latest progress report. */
+	lastTool?: string;
+	/** Live usage (latest progress report); zero until the first one. */
+	usage: RunUsage;
+	/** The run's loadout once the agent reported it (AGT-27). */
+	loadout?: Loadout;
+}
+
+/** GET /internal/admin/status?window=7d — the status page and `/status.json` (§9.3). */
 export interface StatusReport {
 	state: AdminState;
 	engine?: {
@@ -107,6 +164,8 @@ export interface StatusReport {
 		queuedJobs: number;
 	};
 	runs: { pending: number; running: number; oldestPendingMs: number | null };
+	/** Unfinished runs, oldest first: pending ones with their age, and runs in progress (§9.3, NFR-06). */
+	activeRuns: RunStatus[];
 	workers: WorkerStatus[];
 	limits: {
 		maxConcurrentJobs: number;
@@ -128,5 +187,9 @@ export interface StatusReport {
 		byRepo: { repo: string; runs: number; costUsd: number }[];
 		jobs: { kind: string; succeeded: number; failed: number; cancelled: number; avgDurationMs: number | null }[];
 		daily: { day: string; costUsd: number }[];
+		/** NFR-06: setup time (claim → agent start) of runs started in the window, per repository, slowest average first. */
+		setup: { repo: string; runs: number; avgMs: number; maxMs: number }[];
 	};
+	/** The latest loadout per profile, in plan/implement/chat/draft/ask order (AGT-27). */
+	loadouts: Loadout[];
 }

@@ -1,13 +1,16 @@
 import { mkdir, rm } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
+import { postmortem } from "@oh-my-pi/pi-utils";
 import { loadEnv } from "../shared/env";
 import { errorMessage, log } from "../shared/log";
+import { installedOmpVersion } from "../shared/ompPins";
+import { readTokenFile } from "../shared/tokens";
 import { APP_ROOT, type AppIdentity, appIdentity } from "../shared/version";
 import type { OrchestratorControl, WorkerPhase } from "../shared/wire";
 import { WorkerConnection } from "./connection";
 import { type ActiveRun, McpTestRun, type RunTiming, RunSupervisor } from "./runner";
-import { StatusFile, workerRoot } from "./status";
+import { StatusFile, workerRoot, workerRunBaseDir } from "./status";
 
 /**
  * The worker role (architecture §2.3): connect, claim one run, serve it, clean up, exit 0. Nothing to claim within
@@ -20,15 +23,24 @@ export interface WorkerOptions {
 	/** Pod or container name (`HOSTNAME`), else random. */
 	workerId: string;
 	claimTimeoutMs: number;
-	/** Run-local root; holds the status file and everything of the run, and is deleted at the end (RUN-20). */
+	/** Checkout root on container storage: checkout, sessions, skills and scratch copies (architecture §5, "worker checkout"). */
 	root: string;
+	/**
+	 * Run-local root (architecture §5, "run-local"; a tmpfs in the image): the status file, the run-private auth store,
+	 * omp's `HOME` and agent dir, and the host's `TMPDIR`. May equal `root`. Both are deleted at the end (RUN-20).
+	 */
+	runLocal: string;
 	identity: AppIdentity;
 	ompVersion: string;
 	/** The agent host entry; tests use a fixture host. */
 	hostEntry?: string;
 	timing?: Partial<RunTiming>;
+	/** The checkout's size limit (STO-06, `AGENTBOT_WORKER_DISK`). */
+	diskLimitBytes?: number;
 	reconnectMinMs?: number;
 	reconnectMaxMs?: number;
+	/** Ping interval of the orchestrator connection (`KEEPALIVE_MS`). */
+	keepaliveMs?: number;
 	/** Aborted on SIGTERM: checkpoint, stop the host, clean up (RUN-18). */
 	signal?: AbortSignal;
 }
@@ -37,10 +49,11 @@ export type WorkerOutcome = "nothing" | "run" | "mcp-test";
 
 type Assign = Extract<OrchestratorControl, { t: "assign" }>;
 
-/** Serves at most one assignment and deletes the run-local root before returning. */
+/** Serves at most one assignment and deletes the checkout and run-local roots before returning. */
 export async function runWorkerOnce(opts: WorkerOptions): Promise<WorkerOutcome> {
 	await mkdir(opts.root, { recursive: true, mode: 0o700 });
-	const status = new StatusFile(opts.root, opts.identity.version);
+	await mkdir(opts.runLocal, { recursive: true, mode: 0o700 });
+	const status = new StatusFile(opts.runLocal, opts.identity.version);
 	const claimed = Promise.withResolvers<Assign | undefined>();
 	const ready = Promise.withResolvers<ActiveRun | undefined>();
 	let active: ActiveRun | undefined;
@@ -52,6 +65,7 @@ export async function runWorkerOnce(opts: WorkerOptions): Promise<WorkerOutcome>
 		ompVersion: opts.ompVersion,
 		reconnectMinMs: opts.reconnectMinMs,
 		reconnectMaxMs: opts.reconnectMaxMs,
+		keepaliveMs: opts.keepaliveMs,
 		onControl: msg => {
 			if (msg.t === "assign") claimed.resolve(msg);
 			else if (msg.t === "nothing") claimed.resolve(undefined);
@@ -83,9 +97,12 @@ export async function runWorkerOnce(opts: WorkerOptions): Promise<WorkerOutcome>
 			lease,
 			orchestratorUrl: opts.orchestratorUrl,
 			root: opts.root,
+			runLocal: opts.runLocal,
 			ompVersion: opts.ompVersion,
+			identity: opts.identity,
 			hostEntry: opts.hostEntry,
 			timing: opts.timing,
+			diskLimitBytes: opts.diskLimitBytes,
 			onPhase: (phase: WorkerPhase) => status.update({ phase }),
 		};
 		const run = assign.kind === "run" ? new RunSupervisor(supervisorOptions, assign.spec) : new McpTestRun(supervisorOptions, assign.mcp);
@@ -103,44 +120,51 @@ export async function runWorkerOnce(opts: WorkerOptions): Promise<WorkerOutcome>
 		clearTimeout(claimTimer);
 		ready.resolve(undefined);
 		await conn.stop();
-		await rm(opts.root, { recursive: true, force: true }).catch(err => log("warn", "run-local cleanup failed", { error: errorMessage(err) }));
+		for (const dir of new Set([opts.root, opts.runLocal]))
+			await rm(dir, { recursive: true, force: true }).catch(err => log("warn", "run directory cleanup failed", { dir, error: errorMessage(err) }));
 	}
 }
 
-/** The omp version installed with this app copy, for `hello` and `run-info`. */
-export async function installedOmpVersion(): Promise<string> {
-	try {
-		const pkg = (await Bun.file(join(APP_ROOT, "node_modules", "@oh-my-pi", "pi-coding-agent", "package.json")).json()) as { version?: unknown };
-		return typeof pkg.version === "string" ? pkg.version : "unknown";
-	} catch {
-		return "unknown";
-	}
+/**
+ * `runWorkerOnce` as this process's one job: the checkout root at `workerRoot()` and the run-local root under
+ * `AGENTBOT_WORKER_RUN_DIR`, with `HOME` and `PI_CODING_AGENT_DIR` pointed into the run-local root before omp loads
+ * (spike S2), and SIGTERM wired to the checkpoint-and-stop path (RUN-18). omp's SDK,
+ * loaded for the auth store, handles SIGTERM process-wide by running registered cleanups and then exiting, so the worker
+ * registers with it: the SIGTERM checkpoint and the cleanup finish before the process exits (within postmortem's 10 s).
+ */
+export async function runWorkerProcess(opts: Omit<WorkerOptions, "root" | "runLocal" | "signal">): Promise<WorkerOutcome> {
+	const root = workerRoot();
+	const runLocal = workerRoot(workerRunBaseDir());
+	await mkdir(join(runLocal, "home"), { recursive: true, mode: 0o700 });
+	await mkdir(join(runLocal, "auth"), { recursive: true, mode: 0o700 });
+	process.env.HOME = join(runLocal, "home");
+	process.env.PI_CODING_AGENT_DIR = join(runLocal, "auth");
+	const sigterm = new AbortController();
+	process.once("SIGTERM", () => sigterm.abort());
+	const done = runWorkerOnce({ ...opts, root, runLocal, signal: sigterm.signal });
+	postmortem.register(
+		"agentbot-worker-sigterm",
+		async () => {
+			sigterm.abort();
+			await done.catch(() => {});
+		},
+		{ exitOnly: true },
+	);
+	return done;
 }
 
 /** `agentbot worker`: one run, then exit 0. */
 export async function runWorker(): Promise<never> {
 	const env = loadEnv();
-	if (!env.workerTokenFile) throw new Error("AGENTBOT_WORKER_TOKEN_FILE is not set");
-	const workerToken = (await Bun.file(env.workerTokenFile).text()).trim();
-	if (!workerToken) throw new Error(`worker token file ${env.workerTokenFile} is empty`);
-	const root = workerRoot();
-	// omp captures these when it loads (spike S2); the supervisor loads it only for the auth store and `mcp-test`.
-	await mkdir(join(root, "home"), { recursive: true, mode: 0o700 });
-	await mkdir(join(root, "auth"), { recursive: true, mode: 0o700 });
-	process.env.HOME = join(root, "home");
-	process.env.PI_CODING_AGENT_DIR = join(root, "auth");
-	const sigterm = new AbortController();
-	process.once("SIGTERM", () => sigterm.abort());
-	const workerId = process.env.HOSTNAME?.trim() || `${hostname()}-${crypto.randomUUID().slice(0, 8)}`;
-	await runWorkerOnce({
+	const workerToken = await readTokenFile(env.workerTokenFile, "AGENTBOT_WORKER_TOKEN_FILE");
+	await runWorkerProcess({
 		orchestratorUrl: env.orchestratorUrl,
 		workerToken,
-		workerId,
+		workerId: process.env.HOSTNAME?.trim() || `${hostname()}-${crypto.randomUUID().slice(0, 8)}`,
 		claimTimeoutMs: env.workerClaimTimeoutMs,
-		root,
 		identity: await appIdentity(),
-		ompVersion: await installedOmpVersion(),
-		signal: sigterm.signal,
+		ompVersion: installedOmpVersion(APP_ROOT),
+		diskLimitBytes: env.workerDiskBytes,
 	});
 	process.exit(0);
 }

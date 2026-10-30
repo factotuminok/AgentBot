@@ -28,6 +28,7 @@ import {
 } from "../store/scratch";
 import { chatSessionKey } from "../store/sessions";
 import { loadoutKey } from "../store/stats";
+import { CAPACITY_REACHED } from "./chatSlots";
 import type { EngineDeps } from "./deps";
 import { askFollowUp, askPrompt, CHAT_SCHEMA, type ChatOutput, runPrompt } from "./prompts";
 
@@ -64,6 +65,8 @@ export interface AskChat {
 	 * an answer to a waiting question (DSC-18), steering for the live run, or a new run resuming the session (CHAT-03).
 	 */
 	message(e: MessageEvent): Promise<boolean>;
+	/** `/work cancel` in an ask thread (requirements §20 item 2): undefined when not an ask thread; else the reply text. */
+	cancel(threadId: string, by: string): Promise<string | undefined>;
 	/** Engine start: re-attaches to the ask chats' unfinished runs (RUN-14) and starts the idle sweep (CHAT-06). */
 	start(): void;
 	/** Engine stop: stops the sweep and detaches from live runs, which keep going (RUN-09). */
@@ -203,7 +206,7 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 		if (threadId && (active.has(threadId) || dispatcher.hasUnfinishedRun(chatOwner(threadId)))) {
 			return "Still starting the previous request; send that again in a moment.";
 		}
-		if (active.size >= config.limits.maxChatSessions) return "Chat capacity reached; try again shortly.";
+		if (deps.chatSlots.full()) return CAPACITY_REACHED;
 		if (userId && !allowed) {
 			const other = liveRunOf(userId);
 			if (other) return `You already have a request running in <#${other}>; wait for it to finish.`;
@@ -211,7 +214,7 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 		return undefined;
 	}
 
-	/** Runs one turn (or re-attaches to the live one) and tracks it in `active` until it settles. */
+	/** Runs one turn (or re-attaches to the live one) and tracks it in `active` and the shared chat slots until it settles. */
 	function launch(threadId: string, ownerId: string, turn: Turn | undefined): Promise<void> {
 		const done = run(threadId, ownerId, turn)
 			.catch(err => log("error", "ask chat run failed", { thread: threadId, error: errorMessage(err) }))
@@ -220,6 +223,7 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 				handles.delete(threadId);
 			});
 		active.set(threadId, done);
+		void deps.chatSlots.track(`chat:${threadId}`, done);
 		return done;
 	}
 
@@ -432,9 +436,21 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 			}
 			return true;
 		},
+		async cancel(threadId, by) {
+			if (!db.getAskChat(threadId)) return undefined;
+			const handle = handles.get(threadId);
+			if (handle) {
+				log("info", "ask chat stopped", { thread: threadId, by });
+				await handle.abort("user");
+				return `Stopping the current run (requested by ${by})…`;
+			}
+			if (active.has(threadId) || dispatcher.hasUnfinishedRun(chatOwner(threadId))) return "The run is still starting; try again in a moment.";
+			return "Nothing is running in this chat.";
+		},
 		start() {
 			for (const ask of allAskChats.all()) {
-				if (active.has(ask.thread_id) || !dispatcher.hasUnfinishedRun(chatOwner(ask.thread_id))) continue;
+				// A run that finished while no engine was attached still holds its answer (NFR-03).
+				if (active.has(ask.thread_id) || !dispatcher.hasRun(chatOwner(ask.thread_id))) continue;
 				log("info", "ask chat re-attached after start", { thread: ask.thread_id });
 				void launch(ask.thread_id, ask.owner_id, undefined);
 			}
