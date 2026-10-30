@@ -320,6 +320,11 @@ Work:
 
 **Exit:** all requirements verified (§7). A tagged release is published, then deployed by CD to both targets.
 
+Release status: `v0.1.4` was tagged and its image pushed by CI on `main` (test, image and kind jobs green). CD ran and skipped both targets, which are not configured yet (README "Continuous deployment"). Requirement status is in `wiki/verification.md`. Still open for this exit:
+- CD to both targets;
+- the real Discord, GitHub and model end-to-end run (§5), which needs a test guild, a GitHub App on a test repository, and a model sign-in;
+- the requirements still marked partial there.
+
 Load test done on kind with `bun test/e2e/k8s/load.ts` (`wiki/load-test.md`). Both scenarios succeeded: 10 concurrent implement runs on one repository, then 10 on 10 repositories, each pushing its own branch and opening a PR. At 10 concurrent runs, NFR-06 setup (claim → agent registered) was 7–9 s p50 and 10–14 s p95. The Discord queue peaked at 11 writes, the oldest 15 s old (10 issues sharing one watch channel). It fixed three bugs: package-manager caches on the run-local tmpfs (ENOSPC), event-loop stalls from SQLite fsyncs (`synchronous=NORMAL`), and false watch suspensions from the cached repository listing.
 
 Chaos tests done on the rootless compose stack with `bun test/e2e/chaos/run.ts` (manual, needs the podman machine). The fake GitHub runs as its own service and the fake Discord persists its state, so both outlive restarts. Three seeded rounds passed (seeds 11, 4242 and 20261030), each taking 4 issues through the phase 5 flow while 15 to 30 random SIGKILLs hit the orchestrator, web, the launcher and workers. Every issue finished with one PR, no duplicated comment, message or push, no unfinished run and no worker left. The limits round passed too: a full 2 MiB checkout and a real kernel OOM kill (512 MiB worker) were each reported for their own run only. The tests found two bugs. Workers had no liveness check on their orchestrator connection: an orchestrator restarted with a new address left them half-open, and every one of their runs was lost. They now ping, and drop silent connections and hung connection attempts (`src/worker/connection.ts`). Disk limits under 1 GiB printed as "0.0 GiB".
