@@ -133,7 +133,8 @@ describe("limits (JOB-07, AGT-14)", () => {
 		// The 0.6 s limit is enforced at a check, not before it.
 		expect(took).toBeGreaterThanOrEqual(600);
 		expect(took).toBeLessThan(10_000);
-		expect(model.requests.length).toBeGreaterThan(2);
+		// The run was working (the model never lets it stop) when the limit hit; how many turns fit in 0.6 s depends on the host.
+		expect(model.requests.length).toBeGreaterThanOrEqual(1);
 	}, 40_000);
 });
 

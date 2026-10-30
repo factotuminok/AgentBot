@@ -31,6 +31,10 @@ describe("log redaction (F9)", () => {
 		expect(lines[0]).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7");
 		expect(lines[0]).toContain(REDACTED);
 		expect(lines[0]).toContain('"other":"short"');
+		// The armor lines are public text quoted by the private-key error message; only the key body is secret.
+		log("warn", "key rejected", { error: "paste the whole .pem file, from the -----BEGIN PRIVATE KEY----- line" });
+		expect(lines.at(-1)).toContain("-----BEGIN PRIVATE KEY-----");
+		lines.length = 1;
 		removeLogSecret(SECRET);
 		log("info", "after the run", { token: SECRET });
 		expect(lines[1]).toContain(SECRET);

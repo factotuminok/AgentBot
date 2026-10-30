@@ -23,9 +23,12 @@ const secrets = new Set<string>();
 const MIN_SECRET_CHARS = 8;
 export const REDACTED = "[redacted]";
 
-/** The forms of `value` to mask: the whole value and, for multi-line values (PEM keys), each long line, JSON-escaped. */
+/**
+ * The forms of `value` to mask: the whole value and, for multi-line values (PEM keys), each long line, JSON-escaped.
+ * PEM armor lines (`-----BEGIN …-----`) are public text that error messages quote, so they are not masked.
+ */
 function secretForms(value: string): string[] {
-	const lines = value.includes("\n") ? value.split(/\r?\n/).map(line => line.trim()) : [];
+	const lines = value.includes("\n") ? value.split(/\r?\n/).map(line => line.trim()).filter(line => !line.startsWith("-----")) : [];
 	return [value, ...lines].filter(form => form.length >= MIN_SECRET_CHARS).map(form => JSON.stringify(form).slice(1, -1));
 }
 
