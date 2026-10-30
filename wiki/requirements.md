@@ -858,7 +858,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 
   Docker Engine is not supported for this stack, because the launcher refuses a rootful socket.
 - **OPS-04** CI MUST:
-  - run on every branch push, except pushes that change only Markdown or `wiki/`;
+  - run on every pull request, and on every push to `main` except pushes that change only Markdown or `wiki/` (changes reach `main` only through pull requests whose `test` and `kind` checks passed);
   - wait 30 s, with newer pushes cancelling older runs;
   - run `bun install --frozen-lockfile`, typecheck and tests.
 
