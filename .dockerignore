@@ -4,6 +4,8 @@
 !bun.lock
 !src/
 !scripts/build-vsix.ts
+!scripts/vsix/package.json
+!scripts/vsix/bun.lock
 !scripts/omp-latest.ts
 !vscode/
 **/.DS_Store

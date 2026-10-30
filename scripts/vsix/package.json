@@ -1,0 +1,8 @@
+{
+	"name": "agentbot-vsix-tools",
+	"private": true,
+	"description": "Pinned packager for the bundled VS Code extension (scripts/build-vsix.ts); separate lockfile so image builds are reproducible.",
+	"dependencies": {
+		"@vscode/vsce": "4.1.0"
+	}
+}

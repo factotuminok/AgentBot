@@ -13,6 +13,7 @@
 FROM docker.io/oven/bun:1.4.2-debian AS vsix
 WORKDIR /src
 COPY scripts/build-vsix.ts scripts/
+COPY scripts/vsix/package.json scripts/vsix/bun.lock scripts/vsix/
 COPY vscode/extension/ vscode/extension/
 RUN bun scripts/build-vsix.ts
 
