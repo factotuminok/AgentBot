@@ -2,11 +2,26 @@
 
 A long-running service that uses the omp coding agent (`@oh-my-pi/pi-coding-agent`) to develop and maintain the GitHub repositories its GitHub App is installed on. GitHub issues drive the work, Discord is the control surface, and a password-protected web UI handles configuration and operations. The design lives in [`wiki/`](wiki/): [requirements](wiki/requirements.md), [architecture](wiki/architecture.md) and the [implementation plan](wiki/implementation.md).
 
+## Installation
+
+AgentBot ships as one image, `ghcr.io/factotuminok/agentbot:<version>` / `:latest`; the role is the command argument (`orchestrator`, `web`, `worker`, `launcher`; OPS-01). There are two supported installation paths: rootless Podman and Kubernetes. Docker Engine cannot run the full stack.
+
+| | Podman (rootless) | Kubernetes | Docker Engine |
+|---|---|---|---|
+| Status | Supported | Supported | Not supported for the full stack |
+| Minimum versions | rootless Podman ≥ 4.6, plus docker-compose or podman-compose as the `podman compose` provider | Kubernetes ≥ 1.27, KEDA ≥ 2.12 (≥ 2.19 recommended), Helm 3 (CI tests 3.22.1) | none |
+| Starts workers | the `launcher` service, through your rootless Podman socket, up to `AGENTBOT_WORKER_CAPACITY` (default 4) | a KEDA `ScaledJob`, up to `worker.maxReplicas` (default 10) | none: the launcher refuses the Docker socket |
+| Storage | named volumes `agentbot-state` and `agentbot-web` | two ReadWriteOnce PVCs (state 20Gi, web home 5Gi), no ReadWriteMany | none |
+| Secrets | `scripts/init-secrets.sh`: files in `secrets/` and the Podman secret `agentbot_worker_token` | the chart generates Secret `agentbot`, or use `secrets.existingSecret` | none |
+| Steps | [Running on Podman](#running-on-podman) | [Running on Kubernetes](#running-on-kubernetes) | [Docker Engine](#docker-engine-not-supported) |
+
+Deployments of a particular installation (which version, where, when) are not run from this repository: CI only tests, publishes `ghcr.io/factotuminok/agentbot:<version>` and `:latest`, and tags `v<version>`.
+
 ## Running on Podman
 
 `compose.yaml` runs three long-running services from one image: `orchestrator`, `web` and `launcher`. The launcher starts one short-lived worker container per agent run through your rootless Podman socket (architecture §7.2).
 
-**Requirements:** rootless Podman ≥ 4.6 and a compose provider for `podman compose`: docker-compose or podman-compose (tested with docker-compose 5.6.0 and podman-compose 1.6.0 on Podman 6.1.4). **Docker Engine is not supported**: the launcher refuses a rootful socket (LCH-01), so no worker would ever start. A rootful Podman socket is refused the same way.
+**Requirements:** rootless Podman ≥ 4.6 and a compose provider for `podman compose`: docker-compose or podman-compose (tested with docker-compose 5.6.0 and podman-compose 1.6.0 on Podman 6.1.4). A rootful Podman socket is refused too (LCH-01); [Docker Engine](#docker-engine-not-supported) explains the scope of `AGENTBOT_LAUNCHER_ALLOW_ROOTFUL`.
 
 1. **Enable your user's Podman socket** once, as the user that will run the stack:
 
@@ -27,6 +42,8 @@ A long-running service that uses the omp coding agent (`@oh-my-pi/pi-coding-agen
    podman build -t localhost/agentbot:dev .
    export AGENTBOT_IMAGE=localhost/agentbot:dev   # or put AGENTBOT_IMAGE=... into .env next to compose.yaml
    ```
+
+   `docker build` builds the same image too; see [Docker Engine](#docker-engine-not-supported).
 
 3. **Create the secrets** once:
 
@@ -85,25 +102,45 @@ The Helm chart `deploy/helm/agentbot` runs the orchestrator and web as single-re
 ```sh
 helm install agentbot deploy/helm/agentbot -n agentbot --create-namespace --set image.tag=<version>
 kubectl -n agentbot logs deploy/agentbot-orchestrator | grep setupToken
-kubectl -n agentbot port-forward svc/agentbot-web 8080:8080   # or enable web.ingress (TLS)
+kubectl -n agentbot port-forward svc/agentbot-web 8080:8080   # or enable web.ingress (below)
 ```
 
-- **Secrets:** the master key and the web, worker and scale tokens are generated on first install into Secret `agentbot` and kept on every upgrade. `secrets.existingSecret` names your own Secret instead (keys `master-key`, `web-api-token`, `worker-token`, `scale-token`). The Secret and the state PVC are kept on `helm uninstall`; back them up together. To rotate the web token, put a new value into the Secret and restart both readers (upgrades keep the new value):
+The commands assume release name `agentbot`. With another name the objects are `<release>-agentbot-*`; `helm install` prints the matching commands.
+
+- **Secrets:** the master key and the web, worker and scale tokens are generated on first install into Secret `agentbot` and kept on every upgrade. `secrets.existingSecret` names your own Secret instead (keys `master-key` of at least 32 characters, `web-api-token`, `worker-token`, `scale-token`). The Secret and the state PVC are kept on `helm uninstall`; back them up together. To rotate the web token, put a new value into the Secret and restart both readers (upgrades keep the new value):
 
   ```sh
   kubectl -n agentbot patch secret agentbot --type merge -p "{\"data\":{\"web-api-token\":\"$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | base64 | tr -d '\n')\"}}"
   kubectl -n agentbot rollout restart deploy/agentbot-orchestrator deploy/agentbot-web
   ```
-- **Behind the ingress:** set `web.trustedProxies` to the ingress controller pods' addresses (e.g. the pod CIDR), so the login throttle counts each client, not the controller.
+- **Behind the ingress:** set `web.ingress.enabled=true` and `web.ingress.host` (`web.ingress.className` selects the controller; `web.ingress.tls.secretName`, empty means the controller's default certificate). Set `web.trustedProxies` to the ingress controller pods' addresses (e.g. the pod CIDR), so the login throttle counts each client, not the controller.
 - **Concurrency:** `worker.maxReplicas` is also the orchestrator's worker capacity. To use all of it, raise `maxConcurrentJobs` and `maxChatSessions` in Settings; the orchestrator's health warns while their sum is lower.
-- **Workers:** `worker.diskLimit` (checkout space, default 20Gi), `worker.resources` (default 500m CPU / 1.5 Gi requested, 4 Gi limit), `worker.image` (a derived image with your repositories' toolchains).
+- **Workers:** `worker.diskLimit` (checkout space, default 20Gi), `worker.resources` (default requests 500m CPU / 1.5 Gi memory / 20 Gi ephemeral storage, limit 4 Gi memory; when you change `worker.diskLimit`, change the ephemeral-storage request to match), `worker.image.repository` and `worker.image.tag` (a derived image with your repositories' toolchains; empty means the AgentBot image and `image.tag`).
 - **NetworkPolicies** (on by default): the orchestrator accepts only web, workers and the KEDA operator (`networkPolicy.keda` selects it), web only the ingress controller (`networkPolicy.web.ingressController`, or `networkPolicy.web.allowAll=true`), workers nothing. Web may connect only to DNS and the orchestrator. Workers may connect to DNS, the orchestrator and the internet, but not to link-local addresses (cloud metadata) or `networkPolicy.worker.clusterCIDRs` (default: every private range). Narrow that list to your cluster's pod and Service CIDRs if workers need a private registry or proxy. Set `networkPolicy.dns` if your cluster's DNS is not kube-dns in `kube-system`, and add NodeLocal DNSCache's address there if you use it.
 
 **Upgrade:** `helm upgrade agentbot deploy/helm/agentbot -n agentbot --reuse-values --set image.tag=<version>`. The orchestrator and web restart once each (`Recreate`); runs in progress keep their worker pod and finish.
 
 `values.yaml` documents every value. `test/e2e/k8s/install-smoke.sh` installs the chart on a local kind cluster (`test/e2e/k8s/kind.sh up`, kind on Podman with KEDA) and runs a real worker through it.
 
-Deployments of a particular installation (which version, where, when) are not run from this repository: CI only tests, publishes `ghcr.io/factotuminok/agentbot:<version>` and `:latest`, and tags `v<version>`.
+## Docker Engine (not supported)
+
+Docker Engine cannot run the full stack (OPS-03). The launcher starts workers only through a Podman API socket: it calls `GET /libpod/info`, a Docker socket has no `/libpod/` routes, and the launcher exits with "the socket is not a Podman API socket" (LCH-01). No worker ever starts, so runs stay pending ("Waiting for a worker…"). `compose.yaml` and `scripts/init-secrets.sh` also target rootless Podman: `keep-id` user namespaces, the Podman socket mount, the Podman secret and the script's rootless check.
+
+`AGENTBOT_LAUNCHER_ALLOW_ROOTFUL=1` is **not** a Docker workaround. It never accepts a Docker socket. It only lets the launcher use a rootful *Podman* socket, which gives the launcher root on the host and logs a warning at every start (LCH-01). `compose.yaml` does not set it.
+
+**Use one of the supported paths instead:**
+
+- Install rootless Podman on the same host: [Running on Podman](#running-on-podman). docker-compose can stay as the `podman compose` provider.
+- Or use a cluster: [Running on Kubernetes](#running-on-kubernetes).
+
+**Building the image with Docker works.** CI builds the released image this way, from the root `Dockerfile`. The image is OCI and the same for both supported runtimes:
+
+```sh
+docker build -t <registry>/agentbot:<tag> .
+docker push <registry>/agentbot:<tag>
+```
+
+Then set `AGENTBOT_IMAGE` (Podman) or `image.repository` and `image.tag` (Helm). For a local kind cluster, `kind load docker-image` together with `image.pullPolicy=Never` replaces the push, as in CI's `kind` job.
 
 ## Configuration
 
