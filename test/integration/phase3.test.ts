@@ -35,7 +35,8 @@ const SCALE_TOKEN = "phase3-scale-token";
 const WORK = "work-channel";
 const ASK = "ask-channel";
 const ALICE = "u-alice";
-const LEASE_MS = 1_500;
+/** Short enough to keep the lost-worker test quick; long enough that a worker starting under a loaded CI runner renews it in time. */
+const LEASE_MS = 3_000;
 const WORKER_PROCESS = join(import.meta.dir, "..", "fixtures", "worker-process.ts");
 const LOST = "the worker running this was lost (pod evicted or crashed)";
 
