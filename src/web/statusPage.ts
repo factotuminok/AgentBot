@@ -98,6 +98,7 @@ setInterval(async () => {
 		fill("state-rows", view.state, "");
 		fill("watch-rows", view.watches, "No watched repositories.");
 		fill("limit-rows", view.limits, "Limits are shown once the settings are saved and unlocked.");
+		fill("worker-rows", view.workers, "No workers connected.");
 		fill("warning-rows", view.warnings, "No warnings.");
 		fill("open-rows", view.open, "No open issues.");
 	} catch {}
@@ -127,6 +128,9 @@ ${table(["Repository", "Channel", "State", "Last poll", "Last error"], view.watc
 <section id="limits"><h2>Concurrency limits</h2>
 ${table([], view.limits, "Limits are shown once the settings are saved and unlocked.", "limit-rows")}
 ${table(["Warnings"], view.warnings, "No warnings.", "warning-rows")}
+</section>
+<section id="workers"><h2>Workers</h2>
+${table(["Worker", "Address", "Run", "Phase", "omp", "Connected for"], view.workers, "No workers connected.", "worker-rows")}
 </section>
 <section id="issues"><h2>Issues</h2>
 ${table(states, states.length ? [states.map(state => formatCount(report.issues.counts[state] ?? 0))] : [], "No issues.")}

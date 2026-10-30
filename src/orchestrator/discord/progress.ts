@@ -1,5 +1,6 @@
 import type { TodoItem } from "../../shared/agent";
 import { errorMessage, log } from "../../shared/log";
+import type { RunUiState } from "../dispatch/dispatcher";
 import { type ProgressState, progressLine, todoList } from "./render";
 import type { DiscordSurface, InteractionResponder, MsgRef, Priority } from "./surface";
 
@@ -97,18 +98,50 @@ function replyEditor(responder: InteractionResponder, render: () => string): Mes
 	};
 }
 
-export async function startProgress(surface: DiscordSurface, target: string | ProgressTarget, title: string, activity: string): Promise<Progress> {
+export interface ProgressOptions {
+	/**
+	 * RUN-14: the stored state of a run this progress continues after an orchestrator restart. The status and to-do
+	 * messages it names are edited again (re-rendered from the snapshot); one that was deleted is posted anew.
+	 */
+	restore?: RunUiState;
+	/** RUN-14: called with the current state whenever a message id, the snapshot or the to-do list changes. */
+	persist?(state: RunUiState): void;
+}
+
+const PROGRESS_STATES: Record<string, ProgressState> = { running: "running", waiting: "waiting", done: "done", failed: "failed", cancelled: "cancelled" };
+
+/** A stored message that still exists, or undefined (deleted, or the lookup failed). */
+async function existing(surface: DiscordSurface, ref: MsgRef | undefined): Promise<MsgRef | undefined> {
+	if (!ref) return undefined;
+	try {
+		return (await surface.fetchMessage(ref)) ? ref : undefined;
+	} catch (err) {
+		log("debug", "progress message lookup failed", { channel: ref.channelId, message: ref.messageId, error: errorMessage(err) });
+		return undefined;
+	}
+}
+
+export async function startProgress(
+	surface: DiscordSurface,
+	target: string | ProgressTarget,
+	title: string,
+	activity: string,
+	opts: ProgressOptions = {},
+): Promise<Progress> {
 	const where: ProgressTarget = typeof target === "string" ? { channelId: target } : target;
 	const singleMessage = "responder" in where;
-	const startedAt = Date.now();
+	const snapshot = singleMessage ? undefined : opts.restore;
+	const restoredState = PROGRESS_STATES[snapshot?.progress?.state ?? ""];
+	// A restored run keeps its elapsed time (answer waits were already excluded from it).
+	const startedAt = Date.now() - (snapshot?.progress?.elapsedMs ?? 0);
 	const state = {
-		status: "running" as ProgressState,
-		activity,
-		cost: 0,
-		lastEdit: startedAt,
-		todos: [] as TodoItem[],
+		status: (restoredState === "waiting" ? "waiting" : "running") as ProgressState,
+		activity: snapshot?.progress?.activity ?? activity,
+		cost: snapshot?.progress?.costUsd ?? 0,
+		lastEdit: Date.now(),
+		todos: snapshot?.todos ?? ([] as TodoItem[]),
 		waitedMs: 0,
-		waitingSince: undefined as number | undefined,
+		waitingSince: restoredState === "waiting" ? Date.now() : (undefined as number | undefined),
 	};
 	const elapsed = () => Date.now() - startedAt - state.waitedMs - (state.waitingSince === undefined ? 0 : Date.now() - state.waitingSince);
 	const render = () => {
@@ -117,16 +150,40 @@ export async function startProgress(surface: DiscordSurface, target: string | Pr
 	};
 
 	let ref: MsgRef | null = null;
+	let todoRef: MsgRef | undefined;
+	const persist = () => {
+		if (!opts.persist || !ref) return;
+		try {
+			opts.persist({
+				threadId: ref.channelId,
+				statusMessage: ref,
+				...(todoRef ? { todoMessage: todoRef } : {}),
+				progress: { state: state.status, activity: state.activity, elapsedMs: elapsed(), costUsd: state.cost },
+				todos: state.todos,
+			});
+		} catch (err) {
+			log("warn", "progress state not stored", { error: errorMessage(err) });
+		}
+	};
+
 	let progress: MessageEditor;
 	if ("responder" in where) {
 		progress = replyEditor(where.responder, render);
 		await where.responder.editReply({ content: render() });
 	} else {
-		ref = await surface.send(where.channelId, { content: render() }, "high");
-		progress = surfaceEditor(surface, ref, render);
+		const kept = await existing(surface, snapshot?.statusMessage);
+		if (kept) {
+			ref = kept;
+			progress = surfaceEditor(surface, ref, render);
+			await progress.edit("state");
+		} else {
+			ref = await surface.send(where.channelId, { content: render() }, "high");
+			progress = surfaceEditor(surface, ref, render);
+		}
 	}
 	const edit = (priority: Priority) => {
 		state.lastEdit = Date.now();
+		persist();
 		return progress.edit(priority);
 	};
 	const heartbeat = setInterval(() => void edit("activity"), HEARTBEAT_MS);
@@ -135,6 +192,32 @@ export async function startProgress(surface: DiscordSurface, target: string | Pr
 	// The separate todo message (channel targets): posted on the first non-empty list, then edited.
 	let todoMessage: Promise<MessageEditor | undefined> | undefined;
 	const renderTodos = () => todoList(state.todos);
+	const postTodos = (channelId: string): Promise<MessageEditor | undefined> =>
+		surface.send(channelId, { content: renderTodos() }, "high").then(
+			posted => {
+				todoRef = posted;
+				persist();
+				return surfaceEditor(surface, posted, renderTodos);
+			},
+			err => {
+				log("debug", "todo message not posted", { channel: channelId, error: errorMessage(err) });
+				return undefined;
+			},
+		);
+	if (ref && snapshot) {
+		const channelId = ref.channelId;
+		const keptTodo = await existing(surface, snapshot.todoMessage);
+		if (keptTodo) {
+			todoRef = keptTodo;
+			const editor = surfaceEditor(surface, keptTodo, renderTodos);
+			await editor.edit("state");
+			todoMessage = Promise.resolve(editor);
+		} else if (state.todos.length > 0) {
+			todoMessage = postTodos(channelId);
+			await todoMessage;
+		}
+	}
+	persist();
 
 	return {
 		activity(text, cost) {
@@ -165,18 +248,14 @@ export async function startProgress(surface: DiscordSurface, target: string | Pr
 			state.todos = todos;
 			if (singleMessage) {
 				void edit("activity");
-			} else if (todoMessage) {
+				return;
+			}
+			persist();
+			if (todoMessage) {
 				void todoMessage.then(message => message?.edit("activity"));
 			} else if (todos.length > 0 && ref) {
-				const channelId = ref.channelId;
 				// Later lists edit it once it exists (the branch above), so the first send needs no follow-up edit.
-				todoMessage = surface.send(channelId, { content: renderTodos() }, "high").then(
-					todoRef => surfaceEditor(surface, todoRef, renderTodos),
-					err => {
-						log("debug", "todo message not posted", { channel: channelId, error: errorMessage(err) });
-						return undefined;
-					},
-				);
+				todoMessage = postTodos(ref.channelId);
 			}
 		},
 		async finish(final) {

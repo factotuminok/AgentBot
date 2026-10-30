@@ -1,3 +1,4 @@
+import type { WorkerStatus } from "../../shared/adminApi";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import type { AgentProfile, Loadout, TodoItem } from "../../shared/agent";
 import type { RunUsage, TranscriptEvent } from "../../shared/transcript";
@@ -22,6 +23,20 @@ export type RunOwner =
 	| { kind: "chat"; threadId: string }
 	| { kind: "plan"; threadId: string }
 	| { kind: "draft"; draftId: string };
+
+/** Stable text key of an owner: `job:<id>`, `chat:<thread>`, `plan:<thread>` or `draft:<id>`. */
+export function ownerKey(owner: RunOwner): string {
+	switch (owner.kind) {
+		case "job":
+			return `job:${owner.jobId}`;
+		case "chat":
+			return `chat:${owner.threadId}`;
+		case "plan":
+			return `plan:${owner.threadId}`;
+		case "draft":
+			return `draft:${owner.draftId}`;
+	}
+}
 
 /** The orchestrator-side UI that answers the agent's relayed `ui` calls (questions, DSC-16 to DSC-20). */
 export type RunUi = Pick<ExtensionUIContext, "askDialog" | "select" | "input" | "editor" | "confirm" | "notify">;
@@ -59,21 +74,62 @@ export interface RunRequest {
 	/** Discord thread the run reports into (RUN-14). */
 	threadId?: string;
 	/** `create_issue` (chat profile, AGT-10): executed in the orchestrator, result returned to the agent. */
-	createIssue?(title: string, body: string): Promise<{ number: number; url: string }>;
+	createIssue?: { repo: string; file(title: string, body: string): Promise<{ number: number; url: string }> };
+	/**
+	 * Ask runs (CHAT-07): the thread's scratch directory in the orchestrator (`<state>/scratch/<threadId>`). The dispatcher
+	 * serves `inputs/` to the worker and writes new or changed outputs it uploads into `outputs/` before the run settles.
+	 */
+	scratchDir?: string;
 }
 
 export type AbortReason = "user" | "time" | "cost";
 
+export interface SteerOptions {
+	/** Called once if the text can't be delivered right now (worker disconnected, host not `registered`): react ⏳ (RUN-15). */
+	onQueued?(): void;
+	/** New ask attachments saved to `inputs/` that the worker must download before this steer (`scratch-input`, CHAT-08). */
+	scratchInputs?: string[];
+}
+
 export interface RunHandle {
-	/** AGT-15: delivered as `[Discord @user]: <text>`. Resolves `delivered` when the agent received it (RUN-15). */
-	steer(text: string, from: string): Promise<"delivered" | "queued" | "not-ready" | "ended">;
+	/**
+	 * AGT-15: delivered as `[Discord @user]: <text>`. Resolves when the run settled it (RUN-15): `delivered` once the host's
+	 * reply came back ok (react 👀), `ended` if the run ended first ("Not delivered…"). A host "not ready" refusal is retried
+	 * after `registered`, so callers never see it.
+	 */
+	steer(text: string, from: string, opts?: SteerOptions): Promise<"delivered" | "ended">;
 	/** One-shot; the first reason wins (AGT-07). */
 	abort(reason: AbortReason): Promise<void>;
 }
 
+/**
+ * Passed as an extra member of the dialog options object to every `RunUi` call (questions, DSC-16 to DSC-20; RUN-08, RUN-15).
+ * Read it with `uiCallContext(dialogOptions)`.
+ */
+export interface UiCallContext {
+	/** Stable across orchestrator restarts: `<runId>:<host request id>`. */
+	key: string;
+	/** Discord message ids of this question if it was already posted before a restart (RUN-08): bind to them, don't repost. */
+	posted?: { channelId: string; messageIds: string[] };
+	/** Record the question's Discord message ids as soon as it is posted (RUN-08). */
+	onPosted(posted: { channelId: string; messageIds: string[] }): void;
+	/** Resolves true when the worker acknowledged the relayed answer (react ✅), false if the run ended first. */
+	delivered: Promise<boolean>;
+}
+
+export const UI_CALL_CONTEXT = "agentbotCall";
+
+export function uiCallContext(dialogOptions: unknown): UiCallContext | undefined {
+	return (dialogOptions as Record<string, UiCallContext | undefined> | undefined)?.[UI_CALL_CONTEXT];
+}
+
 export interface RunHooks {
 	ui: RunUi;
-	/** Once, as soon as the run can take steering and abort (relayed `registered`); also after re-attach. */
+	/**
+	 * Once per `runAgent` call, as soon as the run can take steering and abort. The worker dispatcher registers at once:
+	 * an abort before any worker started the run finishes it immediately (RUN-05), and steers sent before the host is
+	 * `registered` are queued (⏳ via `onQueued`) and delivered afterwards (RUN-15). The fake registers per its script.
+	 */
 	register(handle: RunHandle): void;
 	/** While no worker has started the run (RUN-03): "Waiting for a worker…". */
 	onWaitingForWorker?(): void;
@@ -93,6 +149,8 @@ export interface RunResult {
 	oomKills: number;
 	/** The run's omp session exists in the orchestrator and can be resumed (JOB-10). */
 	hasSession: boolean;
+	/** Ask runs: names of new or changed regular files written to `<scratchDir>/outputs` (CHAT-10). */
+	outputs?: string[];
 }
 
 /** The caller detached (engine stopping); the run keeps going. */
@@ -125,4 +183,18 @@ export interface Dispatcher {
 	hasUnfinishedRun(owner: RunOwner): boolean;
 	/** Counts for health and status (architecture §4.5). */
 	counts(): { pending: number; running: number; oldestPendingMs: number | null };
+	/** Connected workers for the status page (§9.3); none for the fake. */
+	workers(): WorkerStatus[];
+	/** AGT-21: connect one MCP server on a worker; the 20 s timeout starts when a worker picks the test up. */
+	mcpTest(spec: { name: string; server: unknown }, opts?: { onWaitingForWorker?(): void }): Promise<{ ok: boolean; tools: string[]; error?: string }>;
+}
+
+/** RUN-14: the Discord state of a run's live messages, kept per owner so a restarted orchestrator edits the same messages. */
+export interface RunUiState {
+	threadId?: string;
+	statusMessage?: { channelId: string; messageId: string };
+	todoMessage?: { channelId: string; messageId: string };
+	/** Latest progress snapshot (state, activity, elapsed, cost). */
+	progress?: { state: string; activity: string; elapsedMs: number; costUsd: number };
+	todos?: TodoItem[];
 }

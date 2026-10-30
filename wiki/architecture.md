@@ -273,7 +273,7 @@ sequenceDiagram
 - **RUN-07** After a restart, the orchestrator MUST NOT requeue `assigned` or `running` runs straight away. It MUST wait `workers.reattachGraceSeconds` (default 90) for their workers to re-announce, then treat the missing ones as lost (RUN-04). This replaces DevForge's "abort everything on shutdown and requeue" (JOB-08).
 - **RUN-08** Open questions MUST be stored with their Discord message ids, so that a re-attached run's pending `ui` request is bound to the question already posted instead of posting it again.
 - **RUN-09** Orchestrator shutdown (SIGTERM) MUST stop Discord, the poller and dispatch, flush the database and exit. It MUST NOT abort runs on workers.
-- **RUN-14** For every run, the orchestrator MUST store with the run:
+- **RUN-14** For every run, the orchestrator MUST store, keyed by the run's owner (job, chat thread, plan thread or draft) so that a re-executed job or chat finds it before its new run exists:
   - the Discord ids of its thread, live status message and to-do message;
   - the latest progress snapshot (state, activity, elapsed, cost);
   - the latest to-do list.

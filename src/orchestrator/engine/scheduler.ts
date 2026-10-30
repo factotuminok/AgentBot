@@ -109,11 +109,11 @@ export function createScheduler(deps: EngineDeps): Scheduler {
 			issue = await applyEvent(deps, issue, "cancelled");
 			await terminalCleanup(deps, issue, `⏹️ **Cancelled** — ${reason}. Archiving this thread.`);
 		},
-		async steer(issueId, text, from) {
+		async steer(issueId, text, from, opts) {
 			const entry = entryFor(issueId);
 			if (!entry) return "none";
 			if (!entry.handle) return "not-ready";
-			return entry.handle.steer(text, from);
+			return entry.handle.steer(text, from, opts);
 		},
 		recover() {
 			for (const job of db.runningJobs()) {

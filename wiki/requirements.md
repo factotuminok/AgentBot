@@ -520,7 +520,7 @@ Any non-terminal state also accepts `cancelled`.
   - be at most 100 characters, keeping an extension of at most 20 characters;
   - fall back to `file`.
 - **CHAT-10** Output:
-  - the answer MUST be attached as `answer.md` with a short message, and truncated with a note if it exceeds the upload limit;
+  - the answer MUST be attached as `answer.md` with a short message, and truncated with a note if it exceeds the upload limit; the cut MUST fall on a UTF-8 character boundary, never inside a multi-byte sequence;
   - new or changed regular files in `outputs/` (symlinks excluded) MUST be attached, at most 10 files and 10 MiB per message;
   - files that are too large MUST be listed by name;
   - produced files MUST be delivered even when the run stopped or failed;
@@ -817,10 +817,10 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
   - watches (repository id, `owner/name`, channel id, created by (Discord user id or admin username), state `watching`, `unwatched` or `suspended`, `lastError`; DSC-35 to DSC-37) and their poll cursors;
   - seen feedback (repo, PR, item id);
   - agent runs (usage);
-  - runs (state, kind, owner, worker id, lease token and expiry, loss count, omp version used, start commit, whether a kept result or checkpoint exists; Discord ids of the thread, status message and to-do message; latest progress snapshot and to-do list; architecture §4.1, RUN-14);
+  - runs (state, kind, owner, worker id, lease token and expiry, loss count, omp version used, start commit, whether a kept result or checkpoint exists; architecture §4.1);
   - outgoing relay messages to workers that have not been acknowledged yet (architecture RUN-06);
   - open questions (run, Discord message ids, options; RUN-08);
-  - a key-value store (vault, log cap, omp update state, loadouts, label names last applied (GH-23), and the revision of each config workspace file (WEB-26)).
+  - a key-value store (vault, log cap, omp update state, loadouts, label names last applied (GH-23), the revision of each config workspace file (WEB-26), and per run owner the Discord ids of the thread, status message and to-do message with the latest progress snapshot and to-do list (architecture RUN-14)).
 
   Model sign-ins live in omp's own SQLite store `<state>/omp-agent/agent.db`, next to the main database (CRED-01). The packed omp runtime copies and their failed markers live in `<state>/omp-runtime/` (architecture §8).
 - **DB-03** All persistent state MUST live in the orchestrator's **state** volume (`<state>`, RWO): the database, the model sign-in store, the mirrors and their runs repos with the temporary refs, session files, ask scratch files, skills and agents, omp runtime copies, and the orchestrator and agent logs. The web pod has its own **web home** volume (RWO) for the `agentbot` user's `$HOME`: the synced copy of the config workspace (WEB-25), queued saves (WEB-27) and code-server data. Workers keep nothing: their checkout and run-local storage are deleted with them (architecture §5, RUN-20). No volume is shared between components.
@@ -895,6 +895,5 @@ These follow from the requirements as written and probably need a deliberate dec
 
 1. `/work ask` and `/work plan` create the thread before they check capacity (CHAT-04, DSC-25). A full system therefore refuses inside the new thread instead of refusing up front.
 2. `/work cancel` works only in issue and plan threads. Chats stop only at a limit or when their worker is lost (architecture RUN-04).
-3. Truncating `answer.md` to the upload limit (CHAT-10) must cut at a character boundary, not in the middle of a UTF-8 sequence.
-4. The revise and fix_ci output schema (AGT-12) should reject extra properties like the other schemas do.
-5. The `plan` profile grants `bash` (AGT-08), so read-only planning (AGT-13) is enforced only by the prompt.
+3. The revise and fix_ci output schema (AGT-12) should reject extra properties like the other schemas do.
+4. The `plan` profile grants `bash` (AGT-08), so read-only planning (AGT-13) is enforced only by the prompt.

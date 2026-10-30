@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { createInteractionRouter } from "../../src/orchestrator/discord/interactionRouter";
-import { answerFromText, createDiscordUI, type DiscordUIOptions } from "../../src/orchestrator/discord/questions";
+import { acknowledgeSteer, answerFromText, createDiscordUI, type DiscordUIOptions, NOT_DELIVERED } from "../../src/orchestrator/discord/questions";
 import { createThreadReplies, type ThreadReplies } from "../../src/orchestrator/discord/replies";
 import type { ComponentEvent, MsgRef } from "../../src/orchestrator/discord/surface";
+import { UI_CALL_CONTEXT, type UiCallContext } from "../../src/orchestrator/dispatch/dispatcher";
 import { createFakeDiscord, type FakeDiscord } from "../fakes/discord";
 
 describe("thread replies", () => {
@@ -69,7 +70,6 @@ async function setup(overrides: Partial<DiscordUIOptions> = {}) {
 		if (event.type === "message") replies.deliver(event.where.channelId, event.content);
 	});
 	const waiting: boolean[] = [];
-	const answered: MsgRef[] = [];
 	const ui = createDiscordUI(fake, threadId, {
 		jobId: "job-1",
 		askTimeoutMs: 60_000,
@@ -78,7 +78,6 @@ async function setup(overrides: Partial<DiscordUIOptions> = {}) {
 		interactions,
 		mention: { text: "<@admin> ", users: ["admin"] },
 		onWaiting: on => waiting.push(on),
-		onAnswered: ref => answered.push(ref),
 		...overrides,
 	});
 	const admin = fake.actor("admin");
@@ -88,7 +87,6 @@ async function setup(overrides: Partial<DiscordUIOptions> = {}) {
 		replies,
 		ui,
 		waiting,
-		answered,
 		admin,
 		/** The thread's messages (the starter lives in the parent channel). */
 		messages: () => fake.messages(threadId),
@@ -142,7 +140,7 @@ describe("Discord questions", () => {
 		expect(t.messages()[0]!.content).toBe("**How big?**\n→ Large");
 		expect(t.messages()[0]!.components).toEqual([]);
 		expect(t.waiting).toEqual([true, false]);
-		expect(t.answered).toEqual([question]);
+		expect(t.messages()[0]!.reactions).toEqual(["✅"]);
 	});
 
 	test("a typed message in the thread reaches the question through the bot's routing (DSC-18)", async () => {
@@ -330,6 +328,97 @@ describe("Discord questions", () => {
 		await t.fake.settled();
 		expect(t.messages()[0]!.content).toBe("⚠️ careful");
 		expect(t.messages()[0]!.mentions).toBeUndefined();
+	});
+});
+
+describe("re-attached questions and delivery (RUN-08, RUN-15)", () => {
+	function context(over: Partial<UiCallContext> = {}) {
+		const delivered = Promise.withResolvers<boolean>();
+		const posts: { channelId: string; messageIds: string[] }[] = [];
+		const call: UiCallContext = { key: "run-1:7", onPosted: p => void posts.push(p), delivered: delivered.promise, ...over };
+		return { call, posts, delivered, options: { [UI_CALL_CONTEXT]: call } };
+	}
+
+	test("a new question records its message ids; ✅ waits for the run's acknowledgement", async () => {
+		const t = await setup();
+		const c = context();
+		const result = t.ui.askDialog!(
+			[
+				{ id: "a", question: "First?", options: [{ label: "X" }] },
+				{ id: "b", question: "Second?", options: [{ label: "Y" }] },
+			],
+			c.options as never,
+		);
+		const first = await t.asked(1);
+		await t.reply("1");
+		const second = await t.asked(2);
+		await t.reply("1");
+		await result;
+		expect(c.posts).toEqual([
+			{ channelId: t.threadId, messageIds: [first.messageId] },
+			{ channelId: t.threadId, messageIds: [first.messageId, second.messageId] },
+		]);
+		await t.fake.settled();
+		expect(t.messages().map(m => m.reactions)).toEqual([[], []]);
+		c.delivered.resolve(true);
+		await turns();
+		await t.fake.settled();
+		expect(t.messages().map(m => m.reactions)).toEqual([["✅"], ["✅"]]);
+	});
+
+	test("an answer the run has not acknowledged shows ⏳, replaced by ✅ on delivery", async () => {
+		const t = await setup({ queuedReactMs: 0 });
+		const c = context();
+		const result = t.ui.input("Name?", undefined, c.options as never);
+		await t.asked();
+		await t.reply("Bob");
+		expect(await result).toBe("Bob");
+		// The zero-delay ⏳ timer fires on the next macrotask, which `settled` yields to.
+		await t.fake.settled();
+		expect(t.messages()[0]!.reactions).toEqual(["⏳"]);
+		c.delivered.resolve(true);
+		await turns();
+		await t.fake.settled();
+		expect(t.messages()[0]!.reactions).toEqual(["✅"]);
+	});
+
+	test("a re-attached question binds to the message already posted instead of posting again", async () => {
+		const t = await setup();
+		const old = await t.fake.send(t.threadId, { content: "❓ **Pick**" });
+		const c = context({ posted: { channelId: t.threadId, messageIds: [old.messageId] } });
+		const result = t.ui.askDialog!([{ id: "q", question: "Pick", options: [{ label: "A" }, { label: "B" }] }], c.options as never);
+		await turns();
+		expect(t.messages()).toHaveLength(1);
+		await t.click(old, "ask:job-1:0:sel", { values: ["1"] });
+		const answered = await result;
+		expect(answered?.kind === "submit" ? answered.results[0]?.selectedOptions : undefined).toEqual(["B"]);
+		expect(c.posts).toEqual([]);
+		c.delivered.resolve(false);
+		await turns();
+		await t.fake.settled();
+		expect(t.messages()[0]!.reactions).toEqual([]);
+	});
+
+	test("steering: ⏳ while queued, 👀 once delivered; Not delivered when the run ended first", async () => {
+		const t = await setup();
+		const message = await t.fake.send(t.threadId, { content: "steer me" });
+		const gate = Promise.withResolvers<"delivered" | "ended">();
+		const acked = acknowledgeSteer(t.fake, message, onQueued => {
+			onQueued();
+			return gate.promise;
+		});
+		await t.fake.settled();
+		expect(t.fake.message(message.messageId)!.reactions).toEqual(["⏳"]);
+		gate.resolve("delivered");
+		expect(await acked).toBe("delivered");
+		await t.fake.settled();
+		expect(t.fake.message(message.messageId)!.reactions).toEqual(["👀"]);
+
+		const late = await t.fake.send(t.threadId, { content: "too late" });
+		expect(await acknowledgeSteer(t.fake, late, async () => "ended")).toBe("ended");
+		await t.fake.settled();
+		expect(t.messages().find(m => m.replyTo === late.messageId)?.content).toBe(NOT_DELIVERED);
+		expect(await acknowledgeSteer(t.fake, late, async () => "none" as const)).toBe("none");
 	});
 });
 

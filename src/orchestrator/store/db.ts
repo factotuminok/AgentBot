@@ -85,7 +85,8 @@ export type RunOutcome = "succeeded" | "failed" | "aborted" | "cancelled" | "los
 export interface RunRow {
 	id: string;
 	state: RunState;
-	kind: RunKind;
+	/** `ask` is the public `/ask` chat (owner `chat_thread_id`); the others are `RunKind`s. */
+	kind: RunKind | "ask";
 	job_id: string | null;
 	chat_thread_id: string | null;
 	plan_thread_id: string | null;
@@ -115,6 +116,15 @@ export interface RunRow {
 	relay_out_seq: number;
 	/** Highest relay sequence number received from the worker and stored (RUN-06). */
 	relay_in_seq: number;
+	/** The run's omp session key: `<state>/sessions/<key>.jsonl` (JOB-10). */
+	session_key: string | null;
+	/** Ask runs: the thread's scratch directory in the orchestrator (CHAT-07). */
+	scratch_dir: string | null;
+	/**
+	 * JSON of the run's outcome while no attached caller has received it yet (the `Dispatcher` contract: results are kept
+	 * until delivered, across restarts too); null once delivered or when the run never produced one.
+	 */
+	result: string | null;
 	outcome: RunOutcome | null;
 	error: string | null;
 	created_at: string;
@@ -181,6 +191,7 @@ export type RunPatch = Partial<
 		| "todos"
 		| "outcome"
 		| "error"
+		| "result"
 	>
 >;
 export type WatchPatch = Partial<Pick<WatchRow, "repo" | "channel_id" | "state" | "last_error" | "cursor" | "last_polled_at">>;
@@ -220,7 +231,7 @@ CREATE TABLE IF NOT EXISTS runs(
 	omp_version TEXT, start_ref TEXT, start_commit TEXT, continues_run_id TEXT REFERENCES runs(id),
 	has_checkpoint INTEGER NOT NULL DEFAULT 0, has_result INTEGER NOT NULL DEFAULT 0,
 	thread_id TEXT, status_message_id TEXT, todo_message_id TEXT, progress TEXT, todos TEXT,
-	relay_out_seq INTEGER NOT NULL DEFAULT 0, relay_in_seq INTEGER NOT NULL DEFAULT 0,
+	relay_out_seq INTEGER NOT NULL DEFAULT 0, relay_in_seq INTEGER NOT NULL DEFAULT 0, session_key TEXT, scratch_dir TEXT, result TEXT,
 	outcome TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
 	CHECK((job_id IS NOT NULL) + (chat_thread_id IS NOT NULL) + (plan_thread_id IS NOT NULL) + (draft_id IS NOT NULL) = 1));
 CREATE INDEX IF NOT EXISTS runs_state ON runs(state, created_at);
@@ -233,6 +244,7 @@ CREATE TABLE IF NOT EXISTS relay_outbox(
 CREATE TABLE IF NOT EXISTS open_questions(
 	run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, request_id TEXT NOT NULL, channel_id TEXT NOT NULL,
 	message_id TEXT NOT NULL, options TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(run_id, request_id));
+CREATE TABLE IF NOT EXISTS worker_claims(worker_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, claimed_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS watches(
 	repo_id INTEGER PRIMARY KEY, repo TEXT NOT NULL, channel_id TEXT NOT NULL, created_by TEXT NOT NULL,
 	state TEXT NOT NULL, last_error TEXT, cursor TEXT, last_polled_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -260,9 +272,13 @@ export interface AgentRunRecord {
 	usage: UsageRecord;
 }
 
+/** The `runs` column that names a run's owner (exactly one is set per row). */
+export type RunOwnerColumn = "job_id" | "chat_thread_id" | "plan_thread_id" | "draft_id";
+const RUN_OWNER_COLUMNS: readonly string[] = ["job_id", "chat_thread_id", "plan_thread_id", "draft_id"] satisfies RunOwnerColumn[];
+
 /** A new run; exactly one of `jobId`, `chatThreadId`, `planThreadId` and `draftId` must be set. */
 export interface NewRun {
-	kind: RunKind;
+	kind: RunKind | "ask";
 	jobId?: string;
 	chatThreadId?: string;
 	planThreadId?: string;
@@ -271,6 +287,8 @@ export interface NewRun {
 	startRef?: string;
 	startCommit?: string;
 	continuesRunId?: string;
+	sessionKey?: string;
+	scratchDir?: string;
 }
 
 export interface NewQuestion {
@@ -336,6 +354,7 @@ const RUN_COLUMNS: Record<keyof RunPatch, true> = {
 	todos: true,
 	outcome: true,
 	error: true,
+	result: true,
 };
 
 const WATCH_COLUMNS: Record<keyof WatchPatch, true> = {
@@ -417,6 +436,8 @@ export interface Db {
 	getRun(id: string): RunRow | null;
 	/** Runs in any of `states`, oldest first. */
 	runsInState(...states: RunState[]): RunRow[];
+	/** The owner's current run: the newest one that is not `finished` or still holds an undelivered `result`. */
+	currentRun(column: RunOwnerColumn, ownerId: string): RunRow | null;
 	/** Atomically assigns the oldest pending run to `workerId` with a fresh lease of `leaseMs` (RUN-02). */
 	claimRun(workerId: string, leaseMs: number): RunRow | null;
 	/** Extends the lease if `token` still holds run `id` (assigned, running or finishing); null otherwise. */
@@ -445,11 +466,17 @@ export interface Db {
 	ackOutbox(runId: string, seq: number): number;
 	/** Records an incoming relay sequence number; false when it was already received (a duplicate to drop). */
 	acceptInbound(runId: string, seq: number): boolean;
+	/** The run (or `mcp-test` task) id `workerId` claimed, if it ever claimed one (one claim per worker id, architecture §6). */
+	workerClaim(workerId: string): string | null;
+	/** Records the one claim of `workerId`; false when it already has one. */
+	recordWorkerClaim(workerId: string, runId: string): boolean;
 
 	insertQuestion(question: NewQuestion): QuestionRow;
 	getQuestion(runId: string, requestId: string): QuestionRow | null;
 	questionsForRun(runId: string): QuestionRow[];
 	deleteQuestion(runId: string, requestId: string): void;
+	/** Records the Discord messages a question was posted as (RUN-08); message ids are stored comma-separated. */
+	setQuestionPosted(runId: string, requestId: string, channelId: string, messageIds: string[]): void;
 
 	/**
 	 * Records a watch in state `watching` (DSC-35). Re-watching an `unwatched` repository clears its cursor so issues
@@ -482,6 +509,11 @@ export function openDb(path: string): Db {
 	db.run("PRAGMA busy_timeout=5000");
 	db.transaction(() => {
 		for (const stmt of SCHEMA.split(";")) if (stmt.trim()) db.run(stmt);
+		// Columns added after the runs table first shipped (phase 3).
+		const columns = new Set(db.query<{ name: string }, []>("PRAGMA table_info(runs)").all().map(c => c.name));
+		for (const column of ["session_key", "scratch_dir", "result"]) {
+			if (!columns.has(column)) db.run(`ALTER TABLE runs ADD COLUMN ${column} TEXT`);
+		}
 	})();
 
 	const q = {
@@ -560,9 +592,9 @@ export function openDb(path: string): Db {
 
 		insertRun: db.query<RunRow, [Params]>(
 			`INSERT INTO runs(id, state, kind, job_id, chat_thread_id, plan_thread_id, draft_id, thread_id, start_ref,
-				start_commit, continues_run_id, created_at, updated_at)
+				start_commit, continues_run_id, session_key, scratch_dir, created_at, updated_at)
 			VALUES ($id, 'pending', $kind, $job_id, $chat_thread_id, $plan_thread_id, $draft_id, $thread_id, $start_ref,
-				$start_commit, $continues_run_id, $now, $now) RETURNING *`,
+				$start_commit, $continues_run_id, $session_key, $scratch_dir, $now, $now) RETURNING *`,
 		),
 		runById: db.query<RunRow, [string]>("SELECT * FROM runs WHERE id = ?"),
 		claimRun: db.query<RunRow, [string, string, string, string]>(
@@ -611,6 +643,13 @@ export function openDb(path: string): Db {
 			"SELECT * FROM open_questions WHERE run_id = ? ORDER BY created_at, rowid",
 		),
 		deleteQuestion: db.query<null, [string, string]>("DELETE FROM open_questions WHERE run_id = ? AND request_id = ?"),
+		setQuestionPosted: db.query<null, [string, string, string, string]>(
+			"UPDATE open_questions SET channel_id = ?3, message_id = ?4 WHERE run_id = ?1 AND request_id = ?2",
+		),
+		workerClaim: db.query<{ run_id: string }, [string]>("SELECT run_id FROM worker_claims WHERE worker_id = ?"),
+		recordWorkerClaim: db.query<null, [string, string, string]>(
+			"INSERT OR IGNORE INTO worker_claims(worker_id, run_id, claimed_at) VALUES (?, ?, ?)",
+		),
 		watchRepo: db.query<WatchRow, [number, string, string, string, string]>(
 			`INSERT INTO watches(repo_id, repo, channel_id, created_by, state, created_at, updated_at)
 			VALUES (?1, ?2, ?3, ?4, 'watching', ?5, ?5)
@@ -777,6 +816,8 @@ export function openDb(path: string): Db {
 				start_ref: run.startRef ?? null,
 				start_commit: run.startCommit ?? null,
 				continues_run_id: run.continuesRunId ?? null,
+				session_key: run.sessionKey ?? null,
+				scratch_dir: run.scratchDir ?? null,
 				now: now(),
 			})!,
 		getRun: id => q.runById.get(id),
@@ -785,6 +826,14 @@ export function openDb(path: string): Db {
 			return db
 				.query<RunRow, string[]>(`SELECT * FROM runs WHERE state IN (${states.map(() => "?").join(", ")}) ORDER BY created_at, rowid`)
 				.all(...states);
+		},
+		currentRun: (column, ownerId) => {
+			if (!RUN_OWNER_COLUMNS.includes(column)) throw new Error(`not a run owner column: ${column}`);
+			return db
+				.query<RunRow, [string]>(
+					`SELECT * FROM runs WHERE ${column} = ? AND (state != 'finished' OR result IS NOT NULL) ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+				)
+				.get(ownerId);
 		},
 		claimRun: (workerId, leaseMs) => {
 			const at = new Date();
@@ -821,6 +870,8 @@ export function openDb(path: string): Db {
 		outbox: runId => q.outbox.all(runId),
 		ackOutbox: (runId, seq) => q.ackOutbox.run(runId, seq).changes,
 		acceptInbound: (runId, seq) => q.acceptInbound.get(seq, runId) !== null,
+		workerClaim: workerId => q.workerClaim.get(workerId)?.run_id ?? null,
+		recordWorkerClaim: (workerId, runId) => q.recordWorkerClaim.run(workerId, runId, now()).changes === 1,
 
 		insertQuestion: question =>
 			q.insertQuestion.get(
@@ -835,6 +886,9 @@ export function openDb(path: string): Db {
 		questionsForRun: runId => q.questionsForRun.all(runId),
 		deleteQuestion: (runId, requestId) => {
 			q.deleteQuestion.run(runId, requestId);
+		},
+		setQuestionPosted: (runId, requestId, channelId, messageIds) => {
+			q.setQuestionPosted.run(runId, requestId, channelId, messageIds.join(","));
 		},
 
 		watchRepo: watch => q.watchRepo.get(watch.repoId, watch.repo, watch.channelId, watch.createdBy, now())!,

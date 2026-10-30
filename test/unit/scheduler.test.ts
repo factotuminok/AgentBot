@@ -188,6 +188,10 @@ describe("detach and recover (JOB-08, RUN-09)", () => {
 		const issue = await seedIssue();
 		const job = first.enqueue(issue.id, "plan");
 		await until(() => h.dispatcher.run(jobOwner(job))?.registered === true, "registered run");
+		// RUN-14: the re-attached job keeps editing this status message.
+		const statuses = () => h.discord.messages(issue.thread_id!).filter(m => m.content.includes(`**Planning #${issue.number}**`));
+		await until(() => statuses().length === 1, "status message");
+		const statusId = statuses()[0]!.id;
 
 		await first.detach();
 
@@ -213,6 +217,9 @@ describe("detach and recover (JOB-08, RUN-09)", () => {
 		expect(h.db.getIssue(issue.id)?.state).toBe("awaiting_approval");
 		expect(h.gh.getIssue("o/r", issue.number).comments).toHaveLength(1);
 		expect(h.db.raw.query("SELECT count(*) AS n FROM agent_runs").get()).toEqual({ n: 1 });
+		await h.discord.settled();
+		expect(statuses().map(m => m.id)).toEqual([statusId]);
+		expect(statuses()[0]!.content).toStartWith("✅");
 	});
 
 	test("a run that finished while detached is delivered on re-attach", async () => {

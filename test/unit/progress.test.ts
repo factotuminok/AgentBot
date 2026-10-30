@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { startProgress } from "../../src/orchestrator/discord/progress";
 import type { InteractionResponder, OutMessage } from "../../src/orchestrator/discord/surface";
+import type { RunUiState } from "../../src/orchestrator/dispatch/dispatcher";
 import { ISSUE_ICONS, setTopIcon } from "../../src/orchestrator/discord/topMessage";
 import { createFakeDiscord } from "../fakes/discord";
 
@@ -180,5 +181,53 @@ describe("thread top message icon", () => {
 		const { fake, threadId, top } = await threadWithTop("📥 someone else's message", true);
 		await setTopIcon(fake, threadId, "✅");
 		expect(top()).toBe("📥 someone else's message");
+	});
+});
+
+describe("restore after a restart (RUN-14)", () => {
+	test("stores its state, and a restored progress edits the same status and to-do messages", async () => {
+		const { fake, messages } = setup();
+		let stored: RunUiState | undefined;
+		const first = await startProgress(fake, "thread-1", "Chat", "Starting…", { persist: s => (stored = s) });
+		first.todos(steps(["completed", "in_progress"]));
+		first.phase("Searching", 0.25);
+		await fake.settled();
+		first.stop();
+		expect(stored).toMatchObject({
+			threadId: "thread-1",
+			statusMessage: { channelId: "thread-1", messageId: messages()[0]!.id },
+			todoMessage: { channelId: "thread-1", messageId: messages()[1]!.id },
+			progress: { state: "running", activity: "Searching", costUsd: 0.25 },
+		});
+
+		const second = await startProgress(fake, "thread-1", "Chat", "Starting…", { restore: stored, persist: s => (stored = s) });
+		await fake.settled();
+		expect(messages()).toHaveLength(2);
+		expect(messages()[0]!.content).toContain("$0.25");
+		expect(messages()[0]!.content).toContain("↳ Searching");
+		await second.finish("done");
+		await fake.settled();
+		expect(messages()).toHaveLength(2);
+		expect(messages()[0]!.content).toStartWith("✅ **Chat**");
+		expect(messages()[1]!.content).toBe("📝 **To-do** · 2/2 done\n✅ Step 1\n✅ Step 2");
+	});
+
+	test("a deleted message is posted anew and its new id stored", async () => {
+		const { fake, messages } = setup();
+		let stored: RunUiState | undefined;
+		const first = await startProgress(fake, "thread-1", "Chat", "Starting…", { persist: s => (stored = s) });
+		first.todos(steps(["in_progress"]));
+		await fake.settled();
+		first.stop();
+		const [status, todo] = messages();
+		fake.deleteMessage({ channelId: "thread-1", messageId: status!.id });
+		fake.deleteMessage({ channelId: "thread-1", messageId: todo!.id });
+
+		await startProgress(fake, "thread-1", "Chat", "Starting…", { restore: stored, persist: s => (stored = s) });
+		await fake.settled();
+		expect(messages()).toHaveLength(2);
+		expect(stored?.statusMessage?.messageId).toBe(messages()[0]!.id);
+		expect(stored?.todoMessage?.messageId).toBe(messages()[1]!.id);
+		expect(messages()[1]!.content).toContain("🔄 Step 1");
 	});
 });

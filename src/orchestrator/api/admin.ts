@@ -30,7 +30,7 @@ export interface AdminApiOptions {
 	db: Db;
 	vault: Vault;
 	controller: Controller;
-	dispatcher: Pick<Dispatcher, "counts">;
+	dispatcher: Pick<Dispatcher, "counts" | "workers">;
 	version: string;
 	workerCapacity: number;
 	/** Content of `AGENTBOT_WEB_API_TOKEN_FILE`; undefined refuses every request with 401 (SEC-14). */
@@ -260,6 +260,7 @@ export function createAdminApi(opts: AdminApiOptions): AdminApi {
 			state: state(),
 			engine: controller.snapshot(),
 			runs: opts.dispatcher.counts(),
+			workers: opts.dispatcher.workers(),
 			limits,
 			warnings,
 			issues: issueOverview(db),

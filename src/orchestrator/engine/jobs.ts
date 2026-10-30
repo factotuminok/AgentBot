@@ -4,10 +4,11 @@ import { type Progress, startProgress } from "../discord/progress";
 import { createDiscordUI } from "../discord/questions";
 import { activityText, failureMessage, planMessage } from "../discord/render";
 import { ISSUE_ICONS, setTopIcon } from "../discord/topMessage";
-import { RunDetached, type RunHandle, type RunRequest, type RunResult } from "../dispatch/dispatcher";
+import { RunDetached, type RunHandle, type RunOwner, type RunRequest, type RunResult } from "../dispatch/dispatcher";
 import type { CiFailure, FeedbackItem } from "../github/feedback";
 import { syncLabels } from "../github/labels";
 import { type IssueRow, type JobRow, parseJson } from "../store/db";
+import { createRunUiStore } from "../store/runUi";
 import { issuePlanSessionKey, removeIssueSessions } from "../store/sessions";
 import { loadoutKey } from "../store/stats";
 import type { EngineDeps } from "./deps";
@@ -340,16 +341,25 @@ export async function runJob(deps: EngineDeps, job: JobRow, signal: AbortSignal,
 	// Implement, revise and fix_ci run on worker checkouts (phases 4 and 5).
 	if (job.kind !== "plan") throw new Error(`${job.kind} runs need worker checkouts, which this build does not have yet`);
 	if (signal.aborted) throw new RunDetached();
+	// RUN-14: a job re-executed after a restart keeps editing its status and to-do messages.
+	const owner: RunOwner = { kind: "job", jobId: job.id };
+	const runUi = createRunUiStore(deps.db);
 	// JOB-09: a re-executed plan job whose plan is already out only completes (no progress message, nothing republished).
 	const published = parseJson<PlanJobResult>(job.result);
-	if (published?.announced && issue.state === "awaiting_approval") return { result: published };
+	if (published?.announced && issue.state === "awaiting_approval") {
+		runUi.clear(owner);
+		return { result: published };
+	}
 	const threadId = issue.thread_id;
 	const ctx: RunContext = {
 		deps,
 		job,
 		issue,
 		threadId,
-		progress: await startProgress(deps.discord, threadId, `${JOB_TITLES[job.kind]} #${issue.number}`, "Starting…"),
+		progress: await startProgress(deps.discord, threadId, `${JOB_TITLES[job.kind]} #${issue.number}`, "Starting…", {
+			restore: runUi.get(owner),
+			persist: state => runUi.set(owner, state),
+		}),
 		signal,
 		onRegister: handle => opts.onRegister?.(handle),
 	};
@@ -357,6 +367,7 @@ export async function runJob(deps: EngineDeps, job: JobRow, signal: AbortSignal,
 	try {
 		const success = await planJob(ctx, parseJson<JobInput>(job.input) ?? {});
 		await ctx.progress.finish("done");
+		runUi.clear(owner);
 		return success;
 	} catch (err) {
 		// Detached: stop updating and leave Discord as it is; the next engine re-attaches and reports from there.
@@ -366,6 +377,7 @@ export async function runJob(deps: EngineDeps, job: JobRow, signal: AbortSignal,
 		}
 		// The scheduler posts the failure (with Retry) or the cancellation below this message.
 		await ctx.progress.finish(err instanceof JobCancelled ? "cancelled" : "failed");
+		runUi.clear(owner);
 		throw err;
 	}
 }

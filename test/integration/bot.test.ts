@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import { attachBot, type BotHandle } from "../../src/orchestrator/discord/bot";
 import { encodeId } from "../../src/orchestrator/discord/render";
 import { createFakeDispatcher, type FakeDispatcher } from "../../src/orchestrator/dispatch/fake";
+import { type AskChat, createAskChat } from "../../src/orchestrator/engine/chat";
 import type { Scheduler } from "../../src/orchestrator/engine/deps";
 import { createTrackIssue } from "../../src/orchestrator/engine/issues";
 import { createScheduler } from "../../src/orchestrator/engine/scheduler";
@@ -16,6 +18,7 @@ interface Bot {
 	h: EngineHarness;
 	bot: BotHandle;
 	scheduler: Scheduler;
+	askChat: AskChat;
 	allowed: Actor;
 	stranger: Actor;
 }
@@ -26,6 +29,7 @@ afterEach(async () => {
 	if (!current) return;
 	current.bot.detach();
 	await current.scheduler.detach();
+	await current.askChat.stop();
 	await current.h.stop();
 	current = undefined;
 });
@@ -35,12 +39,14 @@ async function setup(opts: { config?: Record<string, unknown>; dispatcher?: Fake
 	const scheduler = createScheduler(h.deps);
 	const trackIssue = createTrackIssue(h.deps, scheduler);
 	const poller = createPoller(h.deps, scheduler, trackIssue);
-	const bot = attachBot({ deps: h.deps, connection: h.discord, scheduler, trackIssue, poller });
+	const askChat = createAskChat(h.deps, { scratchRoot: join(h.stateDir, "scratch") });
+	const bot = attachBot({ deps: h.deps, connection: h.discord, scheduler, trackIssue, poller, askChat });
 	await h.discord.login("token");
 	current = {
 		h,
 		bot,
 		scheduler,
+		askChat,
 		allowed: h.discord.actor(ALLOWED_USER, { username: "alice" }),
 		stranger: h.discord.actor("u-stranger", { username: "mallory" }),
 	};
@@ -326,16 +332,16 @@ describe("thread messages (DSC-18, DSC-23, DSC-24)", () => {
 		expect(b.h.discord.message(ignored.ref!.messageId)?.reactions).toEqual([]);
 		expect(run.steers).toHaveLength(1);
 
-		// A waiting question takes the message as its answer (DSC-18).
+		// A waiting question takes the message as its answer (DSC-18); the question message, not the reply, shows delivery (RUN-15).
 		const answer = b.h.deps.replies.next(issue.thread_id!, 60_000);
 		const typed = await b.h.discord.emitMessage({ channelId: issue.thread_id!, content: "yes", actor: b.allowed });
 		expect(await answer).toBe("yes");
 		await b.h.discord.settled();
-		expect(b.h.discord.message(typed.ref!.messageId)?.reactions).toEqual(["✅"]);
+		expect(b.h.discord.message(typed.ref!.messageId)?.reactions).toEqual([]);
 		expect(run.steers).toHaveLength(1);
 	});
 
-	test("a message for a run that cannot take it yet is marked ⏳", async () => {
+	test("a message for a run that cannot take it yet is marked ⏳, then 👀 once delivered (RUN-15)", async () => {
 		const dispatcher = createFakeDispatcher();
 		dispatcher.script({ kind: "plan" }, { hold: true, steerResult: "queued" }, 1);
 		const b = await setup({ dispatcher });
@@ -345,8 +351,25 @@ describe("thread messages (DSC-18, DSC-23, DSC-24)", () => {
 		const issue = b.h.db.findIssue("acme/app", gh.number)!;
 		await until(() => dispatcher.runs.some(r => r.registered), "a registered run");
 		const e = await b.h.discord.emitMessage({ channelId: issue.thread_id!, content: "later", actor: b.allowed });
-		await b.h.discord.settled();
-		expect(b.h.discord.message(e.ref!.messageId)?.reactions).toEqual(["⏳"]);
+		await until(() => b.h.discord.message(e.ref!.messageId)?.reactions.includes("⏳") === true, "⏳");
+		dispatcher.runs[0]!.deliverSteers();
+		await until(() => b.h.discord.message(e.ref!.messageId)?.reactions.join() === "👀", "👀 replacing ⏳");
+	});
+
+	test("a message the run ended before reading gets a Not delivered reply", async () => {
+		const dispatcher = createFakeDispatcher();
+		dispatcher.script({ kind: "plan" }, { hold: true, steerResult: "queued" }, 1);
+		const b = await setup({ dispatcher });
+		b.h.gh.addRepo("acme/app");
+		const gh = b.h.gh.addIssue("acme/app", { title: "Too late" });
+		await work(b, "start", { repo: "acme/app", issue: gh.number });
+		const issue = b.h.db.findIssue("acme/app", gh.number)!;
+		await until(() => dispatcher.runs.some(r => r.registered), "a registered run");
+		const e = await b.h.discord.emitMessage({ channelId: issue.thread_id!, content: "later", actor: b.allowed });
+		await until(() => b.h.discord.message(e.ref!.messageId)?.reactions.includes("⏳") === true, "⏳");
+		dispatcher.runs[0]!.finish();
+		await until(() => b.h.discord.messages(issue.thread_id!).some(m => m.replyTo === e.ref!.messageId && m.content.startsWith("Not delivered")), "Not delivered reply");
+		expect(b.h.discord.message(e.ref!.messageId)?.reactions).toEqual([]);
 	});
 
 	test("an idle issue thread says what it waits on", async () => {

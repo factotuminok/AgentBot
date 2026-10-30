@@ -1,5 +1,5 @@
 import type { Config, LabelNames } from "../../shared/config";
-import type { Dispatcher } from "../dispatch/dispatcher";
+import type { Dispatcher, SteerOptions } from "../dispatch/dispatcher";
 import type { InteractionRouter } from "../discord/interactions";
 import type { ThreadReplies } from "../discord/replies";
 import type { DiscordSurface } from "../discord/surface";
@@ -40,8 +40,11 @@ export interface Scheduler {
 	cancelIssue(issueId: number, reason: string): Promise<void>;
 	/** True when the issue has a queued or running job. */
 	isBusy(issueId: number): boolean;
-	/** Steers the issue's live run, if any (AGT-15, DSC-24). */
-	steer(issueId: number, text: string, from: string): Promise<"delivered" | "queued" | "not-ready" | "ended" | "none">;
+	/**
+	 * Steers the issue's live run (AGT-15, DSC-24, RUN-15): `delivered`/`ended` as the run settled it, `not-ready` when the
+	 * job's run has not registered yet, `none` when the issue has no job executing.
+	 */
+	steer(issueId: number, text: string, from: string, opts?: SteerOptions): Promise<"delivered" | "ended" | "not-ready" | "none">;
 	/** Engine start (JOB-08): re-executes jobs left `running`; the dispatcher re-attaches to their runs or reports them lost. */
 	recover(): void;
 	/** Engine stop: stop claiming and detach from runs. Never aborts runs (RUN-09). */

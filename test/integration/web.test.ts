@@ -55,6 +55,7 @@ function emptyReport(): StatusReport {
 	return {
 		state: {} as AdminState, // replaced per request
 		runs: { pending: 0, running: 0, oldestPendingMs: null },
+		workers: [],
 		limits: null,
 		warnings: [],
 		issues: { counts: {}, open: [] },
@@ -712,6 +713,9 @@ function liveReport(title: string): StatusReport {
 			queuedJobs: 3,
 		},
 		runs: { pending: 2, running: 1, oldestPendingMs: 95_000 },
+		workers: [
+			{ id: "agentbot-worker-x7k2p", address: "10.0.0.7", version: "0.4.12", ompVersion: "18.12.1", runId: "run-1", phase: "running", connectedAt: new Date(now - 125_000).toISOString() },
+		],
 		limits: { maxConcurrentJobs: 2, maxChatSessions: 2, maxConcurrentRuns: 10, workerCapacity: 10, effectiveConcurrency: 4 },
 		warnings: ["maxConcurrentJobs + maxChatSessions (4) is below worker capacity (10): at most 4 workers will be used"],
 		issues: {
@@ -780,6 +784,8 @@ describe("status", () => {
 		expect(page).toContain("App not installed");
 		expect(page).toContain("<td>Worker capacity</td><td>10</td>");
 		expect(page).toContain("at most 4 workers will be used");
+		// The web's clock was frozen a little before the report was built.
+		expect(page).toMatch(/<td>agentbot-worker-x7k2p<\/td><td>10\.0\.0\.7<\/td><td>run-1<\/td><td>running<\/td><td>18\.12\.1<\/td><td>2m \d+s<\/td>/);
 		expect(page).toContain('href="https://github.com/acme/widgets/issues/8"');
 		expect(page).toContain('href="https://discord.com/channels/guild-1/thread-9"');
 		expect(page).toContain('href="https://discord.com/channels/guild-1/chan-9"');

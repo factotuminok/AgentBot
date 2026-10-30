@@ -1,5 +1,6 @@
 import { ComponentType, TextInputStyle } from "discord-api-types/v10";
 import { errorMessage, log } from "../../shared/log";
+import type { AskChat } from "../engine/chat";
 import { applyEvent, terminalCleanup } from "../engine/jobs";
 import type { EngineDeps, Scheduler, TrackIssue } from "../engine/deps";
 import { type IssueState, TERMINAL_STATES } from "../engine/state";
@@ -9,6 +10,7 @@ import type { AvailableRepo } from "../github/types";
 import type { IssueRow } from "../store/db";
 import { commandAccess, memberAllowed, refusalMessage } from "./access";
 import { commandDefinitions } from "./commands";
+import { acknowledgeSteer } from "./questions";
 import { type ComponentId, encodeId, parseId } from "./render";
 import {
 	type AutocompleteEvent,
@@ -35,6 +37,8 @@ export interface BotOptions {
 	scheduler: Scheduler;
 	trackIssue: TrackIssue;
 	poller: Poller;
+	/** `/ask` and messages in ask threads (CHAT-03 to CHAT-11). */
+	askChat: AskChat;
 }
 
 export interface BotHandle {
@@ -62,7 +66,7 @@ class Refusal extends Error {}
  * the nickname are set at every ready event (DSC-01, DSC-29). Unhandled errors propagate to the connection, which logs
  * them and answers `Error: <message>` (DSC-08).
  */
-export function attachBot({ deps, connection, scheduler, trackIssue, poller }: BotOptions): BotHandle {
+export function attachBot({ deps, connection, scheduler, trackIssue, poller, askChat }: BotOptions): BotHandle {
 	const { config, db, github } = deps;
 	const agentName = config.agent.name;
 	const guildId = config.discord.guildId;
@@ -142,7 +146,7 @@ export function attachBot({ deps, connection, scheduler, trackIssue, poller }: B
 			return;
 		}
 		try {
-			if (e.command === "ask") await notYet(e, "`/ask`");
+			if (e.command === "ask") await askChat.command(e);
 			else await onWork(e);
 		} catch (err) {
 			if (!(err instanceof Refusal)) throw err;
@@ -394,30 +398,25 @@ export function attachBot({ deps, connection, scheduler, trackIssue, poller }: B
 	async function onMessage(e: MessageEvent): Promise<void> {
 		// DSC-08: bot authors, DMs and channel messages are not for us.
 		if (e.actor.isBot || !e.where.guildId || !e.where.isThread) return;
+		// Ask threads check their own access (DSC-06).
+		if (await askChat.message(e)) return;
 		if (!memberAllowed(config, e.actor)) return;
 		const threadId = e.where.channelId;
 		try {
-			// A question is waiting: the message is its answer, not steering (DSC-18).
-			if (deps.replies.deliver(threadId, e.content)) {
-				await deps.discord.react(e.ref, "✅");
-				return;
-			}
+			// A question is waiting: the message is its answer, not steering (DSC-18). The question marks delivery (RUN-15).
+			if (deps.replies.deliver(threadId, e.content)) return;
 			const issue = db.issueByThread(threadId);
 			if (!issue) return;
-			const steered = await scheduler.steer(issue.id, e.content, e.actor.username);
-			switch (steered) {
-				case "delivered":
-					await deps.discord.react(e.ref, "👀");
-					return;
-				case "queued":
-					await deps.discord.react(e.ref, "⏳");
-					return;
-				case "not-ready":
-					await deps.discord.reply(e.ref, { content: "Not ready: the agent's session is still starting. Send your message again in a moment." }, "high");
-					return;
-				default:
-					await deps.discord.reply(e.ref, { content: idleIssueReply(agentName, issue.state, scheduler.isBusy(issue.id)) }, "high");
-			}
+			// Delivery can wait for the worker (RUN-15); the handler does not.
+			void acknowledgeSteer(deps.discord, e.ref, onQueued => scheduler.steer(issue.id, e.content, e.actor.username, { onQueued }))
+				.then(async steered => {
+					if (steered === "not-ready") {
+						await deps.discord.reply(e.ref, { content: "Not ready: the agent's session is still starting. Send your message again in a moment." }, "high");
+					} else if (steered === "none") {
+						await deps.discord.reply(e.ref, { content: idleIssueReply(agentName, issue.state, scheduler.isBusy(issue.id)) }, "high");
+					}
+				})
+				.catch(err => log("error", "thread message failed", { thread: threadId, error: errorMessage(err) }));
 		} catch (err) {
 			log("error", "thread message failed", { thread: threadId, error: errorMessage(err) });
 		}

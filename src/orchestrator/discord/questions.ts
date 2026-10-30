@@ -14,7 +14,7 @@ import {
 } from "discord-api-types/v10";
 import { errorMessage, log } from "../../shared/log";
 import { abortError, selectViaAskDialog } from "../../shared/ui";
-import type { RunUi } from "../dispatch/dispatcher";
+import { type RunUi, uiCallContext } from "../dispatch/dispatcher";
 import type { Mention } from "./access";
 import type { InteractionRouter } from "./interactions";
 import { button, buttonRow } from "./render";
@@ -44,8 +44,31 @@ export function createSilentUI(jobId: string): RunUi {
 const SELECT_MAX_OPTIONS = 25;
 const COMPONENT_TEXT_MAX = 100;
 const MESSAGE_MAX = 2000;
-/** A dismissed modal never submits, so stop listening for it after this; the menu, buttons and typed replies keep working until the question's deadline. */
 const MODAL_WAIT_MS = 15 * 60_000;
+/** An answer the run has not acknowledged by then gets ⏳ until it does (RUN-15). */
+const QUEUED_REACT_MS = 1_000;
+export const NOT_DELIVERED = "Not delivered: the run ended before it could read this.";
+
+/**
+ * RUN-15, DSC-24: acknowledges a steering message as `steer` settles it: ⏳ while the run cannot take it yet, then 👀
+ * once the run received it, or a reply when the run ended first. Other outcomes (no run to steer) are left to the
+ * caller. Discord failures are only logged.
+ */
+export async function acknowledgeSteer<T extends string>(
+	surface: DiscordSurface,
+	message: MsgRef,
+	steer: (onQueued: () => void) => Promise<T | "delivered" | "ended">,
+): Promise<T | "delivered" | "ended"> {
+	let queued: Promise<void> | undefined;
+	const quiet = (err: unknown) => log("debug", "steer acknowledgement failed", { channel: message.channelId, error: errorMessage(err) });
+	const outcome = await steer(() => {
+		queued ??= surface.react(message, "⏳").catch(quiet);
+	});
+	if (queued) await queued.then(() => surface.unreact(message, "⏳")).catch(quiet);
+	if (outcome === "delivered") await surface.react(message, "👀").catch(quiet);
+	else if (outcome === "ended") await surface.reply(message, { content: NOT_DELIVERED }, "high").catch(quiet);
+	return outcome;
+}
 
 function clip(text: string, max: number): string {
 	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
@@ -90,11 +113,21 @@ export interface DiscordUIOptions {
 	onWaiting?(waiting: boolean): void;
 	/** Counts the waits as paused run time (DSC-20); nested waits count once. */
 	pauseClock?: { during<T>(fn: () => Promise<T>): Promise<T> };
-	/**
-	 * A question was answered (menu, button, modal or typed reply). Delivery reactions (✅ once the run received it,
-	 * ⏳ while queued, DSC-17) hook in here in phase 3.
-	 */
-	onAnswered?(question: MsgRef): void;
+	/** Delay before an unacknowledged answer gets ⏳; default `QUEUED_REACT_MS`. */
+	queuedReactMs?: number;
+}
+
+/**
+ * One `RunUi` call's question messages (RUN-08, RUN-15): binds to the messages already posted before an orchestrator
+ * restart instead of posting again, records new ones, and marks the answered questions ✅ once the run received the
+ * answer (⏳ while it is still queued).
+ */
+interface CallMessages {
+	/** The call's `index`-th question message: the stored one if it was posted already, else a new one. */
+	post(index: number, content: string, components?: MessageRow[]): Promise<MsgRef>;
+	answered(ref: MsgRef): void;
+	/** The call is returning its answer: start the delivery reactions. */
+	returned(): void;
 }
 
 export function createDiscordUI(surface: DiscordSurface, threadId: string, opts: DiscordUIOptions): RunUi {
@@ -119,8 +152,48 @@ export function createDiscordUI(surface: DiscordSurface, threadId: string, opts:
 		});
 	}
 
-	function post(content: string, components?: MessageRow[]): Promise<MsgRef> {
-		return surface.send(threadId, { content: clip(content, MESSAGE_MAX), components, mentions }, "high");
+	/** Best-effort reaction change: delivery marks never change the answer. */
+	async function mark(ref: MsgRef, change: "react" | "unreact", emoji: string): Promise<void> {
+		await surface[change](ref, emoji).catch(err => log("debug", "question reaction failed", { job: opts.jobId, emoji, error: errorMessage(err) }));
+	}
+
+	function callMessages(dialogOptions: unknown): CallMessages {
+		const call = uiCallContext(dialogOptions);
+		const posted = call?.posted;
+		const ids = posted?.channelId === threadId ? [...posted.messageIds] : [];
+		const answered: MsgRef[] = [];
+		return {
+			async post(index, content, components) {
+				const kept = ids[index];
+				if (kept) return { channelId: threadId, messageId: kept };
+				const ref = await surface.send(threadId, { content: clip(content, MESSAGE_MAX), components, mentions }, "high");
+				ids[index] = ref.messageId;
+				call?.onPosted({ channelId: threadId, messageIds: [...ids] });
+				return ref;
+			},
+			answered: ref => void answered.push(ref),
+			returned() {
+				if (answered.length === 0) return;
+				// Answered in this process with no relay (no call context): the run has it once the call returns.
+				if (!call) {
+					for (const ref of answered) void mark(ref, "react", "✅");
+					return;
+				}
+				void (async () => {
+					let queued = false;
+					const timer = setTimeout(() => {
+						queued = true;
+						for (const ref of answered) void mark(ref, "react", "⏳");
+					}, opts.queuedReactMs ?? QUEUED_REACT_MS);
+					const delivered = await call.delivered.catch(() => false);
+					clearTimeout(timer);
+					for (const ref of answered) {
+						if (queued) await mark(ref, "unreact", "⏳");
+						if (delivered) await mark(ref, "react", "✅");
+					}
+				})();
+			},
+		};
 	}
 
 	function say(content: string): Promise<void> {
@@ -141,7 +214,7 @@ export function createDiscordUI(surface: DiscordSurface, threadId: string, opts:
 		const stop = () => local.abort();
 		signal?.addEventListener("abort", stop, { once: true });
 		try {
-			const answer = await Promise.race([
+			return await Promise.race([
 				opts.interactions
 					.nextComponent(message.messageId, {
 						timeoutMs: timeMs,
@@ -156,8 +229,6 @@ export function createDiscordUI(surface: DiscordSurface, threadId: string, opts:
 				opts.replies.next(threadId, timeMs, local.signal).then(text => (text === undefined ? undefined : { text })),
 				...(modal ? [modal.then(submitted => (submitted ? { submitted } : Promise.withResolvers<never>().promise))] : []),
 			]);
-			if (answer) opts.onAnswered?.(message);
-			return answer;
 		} finally {
 			signal?.removeEventListener("abort", stop);
 			local.abort();
@@ -178,7 +249,13 @@ export function createDiscordUI(surface: DiscordSurface, threadId: string, opts:
 	}
 
 	/** Waits for one question's answer until `deadline`; undefined on timeout. */
-	async function askOne(q: ExtensionAskDialogQuestion, qIndex: number, deadline: number, signal: AbortSignal | undefined): Promise<ExtensionAskDialogResultItem | undefined> {
+	async function askOne(
+		call: CallMessages,
+		q: ExtensionAskDialogQuestion,
+		qIndex: number,
+		deadline: number,
+		signal: AbortSignal | undefined,
+	): Promise<ExtensionAskDialogResultItem | undefined> {
 		const labels = q.options.map(o => o.label);
 		const shown = q.options.slice(0, SELECT_MAX_OPTIONS);
 		const prefix = `ask:${opts.jobId}:${qIndex}`;
@@ -212,7 +289,7 @@ export function createDiscordUI(surface: DiscordSurface, threadId: string, opts:
 			labels.length > 0
 				? "_Choose from the menu, reply in this thread with a number or your own answer, or press **Other…**._"
 				: "_Reply in this thread, or press **Other…**._";
-		const message = await post([`❓ ${opts.mention.text}${header}`, numbered, hint].filter(Boolean).join("\n"), rows);
+		const message = await call.post(qIndex, [`❓ ${opts.mention.text}${header}`, numbered, hint].filter(Boolean).join("\n"), rows);
 		const base = { id: q.id, question: q.question, options: labels, multi: !!q.multi };
 		const modalId = `${prefix}:modal`;
 
@@ -231,6 +308,7 @@ export function createDiscordUI(surface: DiscordSurface, threadId: string, opts:
 				await settle(message, `${header}\n→ (no answer)`);
 				return undefined;
 			}
+			call.answered(message);
 			if ("text" in answer) {
 				const result = { ...base, ...answerFromText(answer.text, labels, !!q.multi) };
 				await settle(message, `${header}\n→ ${answerText(result)}`);
@@ -269,11 +347,12 @@ export function createDiscordUI(surface: DiscordSurface, threadId: string, opts:
 	async function askDialog(questions: ExtensionAskDialogQuestion[], dialogOptions?: ExtensionUIDialogOptions): Promise<ExtensionAskDialogSubmitResult> {
 		return waitingFor(async () => {
 			const signal = dialogOptions?.signal;
+			const call = callMessages(dialogOptions);
 			const deadline = Date.now() + opts.askTimeoutMs;
 			const results: ExtensionAskDialogResultItem[] = [];
 			for (let index = 0; index < questions.length; index++) {
 				// Questions are answered sequentially; the timeout covers the whole dialog.
-				const result = await askOne(questions[index]!, index, deadline, signal);
+				const result = await askOne(call, questions[index]!, index, deadline, signal);
 				if (!result) {
 					// DSC-19: a select continues with the recommended options.
 					await say(`No answer in ${askHours}h; continuing with recommended options.`);
@@ -282,17 +361,20 @@ export function createDiscordUI(surface: DiscordSurface, threadId: string, opts:
 				}
 				results.push(result);
 			}
+			call.returned();
 			return { kind: "submit", results };
 		});
 	}
 
-	async function nextMessage(title: string, signal: AbortSignal | undefined): Promise<string | undefined> {
+	async function nextMessage(title: string, dialogOptions: ExtensionUIDialogOptions | undefined): Promise<string | undefined> {
 		return waitingFor(async () => {
-			const question = await post(`❓ ${opts.mention.text}**${title}**\n_Reply in this thread._`);
-			const text = await opts.replies.next(threadId, opts.askTimeoutMs, signal);
+			const call = callMessages(dialogOptions);
+			const question = await call.post(0, `❓ ${opts.mention.text}**${title}**\n_Reply in this thread._`);
+			const text = await opts.replies.next(threadId, opts.askTimeoutMs, dialogOptions?.signal);
 			// DSC-19: free text proceeds with no answer.
 			if (text === undefined) await say(`No answer in ${askHours}h; continuing without one.`);
-			else opts.onAnswered?.(question);
+			else call.answered(question);
+			call.returned();
 			return text;
 		});
 	}
@@ -300,12 +382,13 @@ export function createDiscordUI(surface: DiscordSurface, threadId: string, opts:
 	return {
 		askDialog,
 		select: (title, options, dialogOptions) => selectViaAskDialog(askDialog, title, options, dialogOptions),
-		input: (title, _placeholder, dialogOptions) => nextMessage(title, dialogOptions?.signal),
-		editor: (title, _prefill, dialogOptions) => nextMessage(title, dialogOptions?.signal),
+		input: (title, _placeholder, dialogOptions) => nextMessage(title, dialogOptions),
+		editor: (title, _prefill, dialogOptions) => nextMessage(title, dialogOptions),
 		async confirm(title, message, dialogOptions) {
 			return waitingFor(async () => {
 				const prefix = `ask:${opts.jobId}:confirm`;
-				const sent = await post(`❓ ${opts.mention.text}**${title}**\n${message}\n_Press a button or reply yes / no._`, [
+				const call = callMessages(dialogOptions);
+				const sent = await call.post(0, `❓ ${opts.mention.text}**${title}**\n${message}\n_Press a button or reply yes / no._`, [
 					buttonRow(button(`${prefix}:yes`, "Yes", ButtonStyle.Success), button(`${prefix}:no`, "No", ButtonStyle.Danger)),
 				]);
 				let answer: Answer | undefined;
@@ -324,6 +407,8 @@ export function createDiscordUI(surface: DiscordSurface, threadId: string, opts:
 				const content = clip(`**${title}**\n${message}\n→ ${answer ? (yes ? "Yes" : "No") : "(no answer: No)"}`, MESSAGE_MAX);
 				if (answer && "component" in answer) await answer.component.update({ content, components: [] }).catch(() => settle(sent, content));
 				else await settle(sent, content);
+				if (answer) call.answered(sent);
+				call.returned();
 				return yes;
 			});
 		},

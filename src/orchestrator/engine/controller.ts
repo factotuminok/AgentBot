@@ -17,6 +17,7 @@ import type { AgentLog } from "../store/agentlog";
 import type { Db } from "../store/db";
 import { sweepSessions } from "../store/sessions";
 import type { Vault } from "../store/vault";
+import { createAskChat } from "./chat";
 import type { EngineDeps } from "./deps";
 import { createTrackIssue } from "./issues";
 import { createScheduler } from "./scheduler";
@@ -100,8 +101,9 @@ async function startEngine(opts: ControllerOptions, { config, secrets }: Setting
 	const scheduler = createScheduler(deps);
 	const trackIssue = createTrackIssue(deps, scheduler);
 	const poller = createPoller(deps, scheduler, trackIssue);
+	const askChat = createAskChat(deps, { scratchRoot: join(stateDir, "scratch") });
 	// Attached before login: command registration and the nickname run on every ready event (DSC-01, DSC-29).
-	const bot = attachBot({ deps, connection, scheduler, trackIssue, poller });
+	const bot = attachBot({ deps, connection, scheduler, trackIssue, poller, askChat });
 	try {
 		try {
 			await connection.login(secrets.discordToken);
@@ -112,11 +114,13 @@ async function startEngine(opts: ControllerOptions, { config, secrets }: Setting
 		await relabelTrackedIssues(deps);
 		scheduler.recover();
 		scheduler.tick();
+		askChat.start();
 		poller.start();
 	} catch (err) {
 		poller.stop();
 		lifetime.abort();
 		await scheduler.detach().catch(detachErr => log("warn", "scheduler detach failed", { error: errorMessage(detachErr) }));
+		await askChat.stop().catch(detachErr => log("warn", "ask chat detach failed", { error: errorMessage(detachErr) }));
 		bot.detach();
 		await connection.destroy().catch(destroyErr => log("warn", "discord destroy failed", { error: errorMessage(destroyErr) }));
 		throw err;
@@ -130,6 +134,7 @@ async function startEngine(opts: ControllerOptions, { config, secrets }: Setting
 			poller.stop();
 			lifetime.abort();
 			await scheduler.detach().catch(err => log("error", "scheduler detach failed", { error: errorMessage(err) }));
+			await askChat.stop().catch(err => log("error", "ask chat detach failed", { error: errorMessage(err) }));
 			bot.detach();
 			await connection.destroy();
 			log("info", "engine stopped");

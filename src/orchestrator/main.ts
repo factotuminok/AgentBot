@@ -6,15 +6,19 @@ import { errorMessage, log, setLogSink } from "../shared/log";
 import { DEFAULT_LOG_MAX_BYTES, logCapBytes, openRollingFiles, splitLogCap } from "../shared/rollinglog";
 import { versionInfo } from "../shared/version";
 import { createAdminApi, generateSetupToken, loadWebApiToken } from "./api/admin";
-import { startInternalApi } from "./api/server";
-import { createFakeDispatcher } from "./dispatch/fake";
+import { loadInternalToken, startInternalApi } from "./api/server";
+import { createWorkerDispatcher } from "./dispatch/workers";
 import { createController } from "./engine/controller";
 import { openAgentLog } from "./store/agentlog";
 import { dbPath, openDb } from "./store/db";
+import { ensureOmpAssetsDir, skillsBundle } from "./store/ompAssets";
+import { openSignins } from "./store/signins";
 import { loadMasterKey, openVault } from "./store/vault";
 
 /** `kv` key holding the last applied total log budget in bytes (plain text; a size isn't secret). */
 const LOG_CAP_KEY = "logs.maxBytes";
+/** `workers.reattachGraceSeconds` default, used when the settings are locked at start (RUN-07). */
+const DEFAULT_REATTACH_GRACE_S = 90;
 
 export async function runOrchestrator(): Promise<void> {
 	const env = loadEnv();
@@ -41,9 +45,37 @@ export async function runOrchestrator(): Promise<void> {
 
 	const vault = await openVault(db, await loadMasterKey(env.masterKeyFile));
 	const { agentbot: version } = await versionInfo();
-	// Process-wide: engine restarts never touch runs (RUN-09). Phase 2 has no workers.
-	const dispatcher = createFakeDispatcher();
-	log("warn", "agent runs are simulated: no workers exist yet, every run gets canned output from the fake dispatcher");
+	/** Settings, or undefined while locked, unsaved or invalid (the engine reports that itself). */
+	const settings = () => {
+		try {
+			return vault.isUnlocked() ? vault.readSettings() : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+	const signins = await openSignins(env.stateDir);
+	await ensureOmpAssetsDir(env.ompDir);
+	// Process-wide: engine restarts never touch runs, and shutdown never aborts them (RUN-09).
+	const dispatcher = createWorkerDispatcher({
+		db,
+		stateDir: env.stateDir,
+		limits: () => {
+			const config = settings()?.config;
+			if (!config) return undefined;
+			const { maxConcurrentJobs, maxChatSessions } = config.limits;
+			return { maxConcurrentJobs, maxChatSessions, maxConcurrentRuns: config.workers.maxConcurrentRuns ?? env.workerCapacity };
+		},
+		reattachGraceMs: (settings()?.config.workers.reattachGraceSeconds ?? DEFAULT_REATTACH_GRACE_S) * 1000,
+		spec: {
+			stateDir: env.stateDir,
+			ompConfig: () => vault.readOmpConfig(),
+			providerKeys: () => settings()?.secrets.providerKeys ?? {},
+			credentials: () => signins.snapshotForRun(),
+			skillsHash: async () => (await skillsBundle(env.ompDir)).hash,
+		},
+		skills: () => skillsBundle(env.ompDir),
+		credentialRequest: req => signins.handleCredentialRequest(req),
+	});
 	const controller = createController({ stateDir: env.stateDir, db, vault, agentLog, dispatcher, applyLogCap });
 
 	// First run: whoever can read the orchestrator log proves it before claiming the admin account (WEB-02).
@@ -66,9 +98,12 @@ export async function runOrchestrator(): Promise<void> {
 		version,
 		workerCapacity: env.workerCapacity,
 		phase: () => controller.status().phase,
-		config: () => (vault.isUnlocked() ? vault.readSettings()?.config : undefined),
+		config: () => settings()?.config,
 		dispatcher,
 		admin,
+		workers: dispatcher,
+		workerToken: await loadInternalToken(env.workerTokenFile, "AGENTBOT_WORKER_TOKEN_FILE", "the worker WebSocket"),
+		scaleToken: await loadInternalToken(env.scaleTokenFile, "AGENTBOT_SCALE_TOKEN_FILE", "the scale endpoint"),
 	});
 	log("info", "orchestrator started", { url: api.url, version, stateDir: env.stateDir });
 	if (setupToken) log("info", "first run: open the web UI's /setup page and enter this setup token to create the admin account", { setupToken });
@@ -81,8 +116,11 @@ export async function runOrchestrator(): Promise<void> {
 		async reason => {
 			log("info", "shutting down", { reason });
 			try {
+				// RUN-09: stop serving workers and dispatching; runs keep going on their workers and re-attach after the restart.
 				await api.stop();
+				dispatcher.close();
 				await controller.stop();
+				signins.close();
 				db.close();
 			} catch (err) {
 				log("error", "shutdown failed", { error: errorMessage(err) });

@@ -23,6 +23,8 @@ export interface LiveView {
 	limits: [string, Cell][];
 	warnings: string[][];
 	open: Cell[][];
+	/** Connected workers: id, address, run, phase, omp version, connected for (§9.3). */
+	workers: Cell[][];
 }
 
 /** `$1.23`; four decimals for non-zero amounts under a cent. */
@@ -106,5 +108,13 @@ export function liveView(report: StatusReport, ctx: LiveContext): LiveView {
 		issue.job ?? "",
 		issue.threadId ? discordLink("thread", issue.threadId) : "",
 	]);
-	return { state, watches, limits, warnings, open };
+	const workers: Cell[][] = report.workers.map(worker => [
+		worker.id,
+		worker.address,
+		worker.runId ?? "",
+		worker.phase ?? "",
+		worker.ompVersion,
+		formatDuration(ctx.now - Date.parse(worker.connectedAt)),
+	]);
+	return { state, watches, limits, warnings, open, workers };
 }

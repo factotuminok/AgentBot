@@ -29,9 +29,17 @@ async function main(): Promise<void> {
 			await runWeb();
 			return;
 		}
-		case "worker":
+		case "worker": {
+			const { runWorker } = await import("./worker/main");
+			await runWorker();
+			return;
+		}
+		case "health": {
+			// The worker's probe; the launcher's arrives with the launcher (phase 8).
+			const { runWorkerHealth } = await import("./worker/health");
+			process.exit(runWorkerHealth(process.argv.slice(3)));
+		}
 		case "launcher":
-		case "health":
 			log("error", `the ${arg} command is not built yet`, { command: arg });
 			process.exit(2);
 	}

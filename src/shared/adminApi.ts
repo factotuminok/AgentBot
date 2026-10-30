@@ -1,4 +1,5 @@
 import type { Config } from "./config";
+import type { WorkerPhase } from "./wire";
 
 /**
  * Web ↔ orchestrator admin API (architecture §4.5 `/internal/admin/*`). The web pod holds no database or vault: every
@@ -80,6 +81,19 @@ export interface SettingsSaveResponse {
 
 export type UsageWindow = "24h" | "7d" | "30d" | "all";
 
+/** A connected worker (§9.3, architecture §6: every connected worker is listed, so an unknown one stands out). */
+export interface WorkerStatus {
+	/** Pod or container name. */
+	id: string;
+	address: string;
+	version: string;
+	/** omp version of its run (after `run-info`), else of its image. */
+	ompVersion: string;
+	runId?: string;
+	phase?: WorkerPhase;
+	connectedAt: string;
+}
+
 /** GET /internal/admin/status?window=7d — the status page and `/status.json` (§9.3). Phase 2 subset. */
 export interface StatusReport {
 	state: AdminState;
@@ -93,6 +107,7 @@ export interface StatusReport {
 		queuedJobs: number;
 	};
 	runs: { pending: number; running: number; oldestPendingMs: number | null };
+	workers: WorkerStatus[];
 	limits: {
 		maxConcurrentJobs: number;
 		maxChatSessions: number;
