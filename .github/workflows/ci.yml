@@ -1,7 +1,11 @@
 name: CI
 on:
+  # Every change reaches main through a PR (branch ruleset), so PRs get CI, forks included (read-only token, no
+  # secrets; the image and tag jobs only run on main). No path filter on PRs: `test` and `kind` are required checks,
+  # and a filtered-out run would leave them pending forever.
+  pull_request:
   push:
-    branches: ["**"]
+    branches: [main]
     paths-ignore: ["**.md", "wiki/**"]
 concurrency:
   group: ci-${{ github.ref }}
