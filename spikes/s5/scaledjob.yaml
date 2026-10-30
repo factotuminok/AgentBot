@@ -1,0 +1,76 @@
+# Worker ScaledJob + TriggerAuthentication per architecture §4.4, with the S5 fix:
+# scalingStrategy.pendingPodConditions [Ready] + a readiness probe that passes only after the
+# worker has claimed a run, so KEDA counts a started-but-unclaimed pod as pending (see wiki/spikes/S5.md).
+# Spike-only: maxReplicaCount 10 is hard-coded (Helm: worker.maxReplicas); image/command run the
+# simulated worker; STARTUP_SECONDS/WORK_SECONDS/CLAIM_TIMEOUT_SECONDS simulate the worker.
+# scaledjob-baseline.yaml is the same without the fix.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: agentbot-scale-auth
+  namespace: agentbot-s5
+spec:
+  secretTargetRef:
+    - parameter: token
+      name: agentbot-scale-token
+      key: token
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: worker
+  namespace: agentbot-s5
+spec:
+  pollingInterval: 5
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  failedJobsHistoryLimit: 5
+  scalingStrategy:
+    strategy: accurate
+    pendingPodConditions: ["Ready"]
+  triggers:
+    - type: metrics-api
+      metadata:
+        url: http://orchestrator.agentbot-s5.svc:8081/internal/scale
+        format: json
+        valueLocation: pendingRuns
+        targetValue: "1"
+        authMode: bearer
+      authenticationRef:
+        name: agentbot-scale-auth
+  jobTargetRef:
+    backoffLimit: 0
+    ttlSecondsAfterFinished: 60
+    template:
+      metadata:
+        labels: { app: worker }
+      spec:
+        restartPolicy: Never
+        terminationGracePeriodSeconds: 60
+        containers:
+          - name: worker
+            image: docker.io/library/python:3.12-alpine
+            command: ["python", "-u", "/scripts/worker.py"]
+            env:
+              - name: SCALE_URL
+                value: http://orchestrator.agentbot-s5.svc:8081
+              - name: SCALE_TOKEN
+                valueFrom: { secretKeyRef: { name: agentbot-scale-token, key: token } }
+              - name: POD_NAME
+                valueFrom: { fieldRef: { fieldPath: metadata.name } }
+              - name: STARTUP_SECONDS
+                value: "0"
+              - name: CLAIM_TIMEOUT_SECONDS
+                value: "20"
+              - name: WORK_SECONDS
+                value: "60"
+            # Ready = "has claimed a run". KEDA's pendingPodConditions counts the Job as pending until then.
+            readinessProbe:
+              exec: { command: ["test", "-f", "/tmp/claimed"] }
+              periodSeconds: 1
+              failureThreshold: 1
+            volumeMounts: [{ name: scripts, mountPath: /scripts }]
+            resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 64Mi } }
+        volumes:
+          - name: scripts
+            configMap: { name: s5-scripts }

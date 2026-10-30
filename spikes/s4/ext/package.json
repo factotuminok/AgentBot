@@ -1,0 +1,41 @@
+{
+	"name": "agentbot-lockdown",
+	"displayName": "AgentBot lock-down (spike S4)",
+	"description": "Closes the integrated terminal, tasks and debug sessions in code-server.",
+	"publisher": "agentbot",
+	"version": "0.0.1",
+	"license": "MIT",
+	"engines": { "vscode": "^1.90.0" },
+	"main": "./extension.js",
+	"extensionKind": ["workspace"],
+	"capabilities": { "untrustedWorkspaces": { "supported": true }, "virtualWorkspaces": false },
+	"activationEvents": ["*"],
+	"contributes": {
+		"commands": [
+			{ "command": "agentbot.terminalDisabled", "title": "AgentBot: Terminal is disabled" }
+		],
+		"menus": {
+			"commandPalette": [{ "command": "agentbot.terminalDisabled", "when": "false" }]
+		},
+		"keybindings": [
+			{ "key": "ctrl+`", "command": "-workbench.action.terminal.toggleTerminal" },
+			{ "key": "ctrl+shift+`", "command": "-workbench.action.terminal.new" },
+			{ "key": "ctrl+shift+c", "command": "-workbench.action.terminal.openNativeConsole" },
+			{ "key": "ctrl+shift+5", "command": "-workbench.action.terminal.split" },
+			{ "key": "ctrl+`", "command": "agentbot.terminalDisabled" },
+			{ "key": "ctrl+shift+`", "command": "agentbot.terminalDisabled" },
+			{ "key": "ctrl+shift+c", "command": "agentbot.terminalDisabled" }
+		],
+		"configurationDefaults": {
+			"terminal.integrated.profiles.linux": {
+				"bash": null,
+				"sh": null,
+				"tmux": null,
+				"pwsh": null,
+				"JavaScript Debug Terminal": null
+			},
+			"terminal.integrated.hideOnStartup": "always",
+			"terminal.integrated.showLinkHover": false
+		}
+	}
+}

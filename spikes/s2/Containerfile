@@ -1,0 +1,15 @@
+# Spike S2: DevForge's agent host, unchanged, in its own container. Base and packages as in DevForge's Dockerfile, minus
+# everything the host does not use (sshd, tmux, code-server, gosu).
+FROM docker.io/oven/bun:1.4.2-debian
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends git ca-certificates procps \
+	&& rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY app/package.json ./
+RUN bun install
+COPY app/ ./
+COPY setup-and-run.sh /usr/local/bin/s2-run
+RUN chmod 0755 /usr/local/bin/s2-run && mkdir -p /agentrun /opt/downloaded && chown bun:bun /agentrun /opt/downloaded
+USER bun
+ENV HOME=/agentrun/home S2_RUN_DIR=/agentrun S2_SKILLS_DIR=/opt/downloaded/omp LANG=C.UTF-8
+ENTRYPOINT ["/usr/local/bin/s2-run"]

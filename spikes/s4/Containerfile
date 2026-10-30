@@ -1,0 +1,49 @@
+# Spike S4: code-server lock-down. Throwaway image, built as agentbot-spike-s4.
+FROM docker.io/library/debian:bookworm-slim
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends ca-certificates curl procps \
+	&& rm -rf /var/lib/apt/lists/*
+
+# Same pin style as DevForge's Dockerfile (release tarball under /opt).
+# WEB-14: keep only JSON, YAML and Markdown support (plus the default colour and file-icon themes, which hold no code);
+# every other built-in extension (debuggers, task providers, git, github, npm, copilot chat, ...) is deleted in the
+# same layer, so it never reaches the image.
+ARG CODE_SERVER_VERSION=4.143.1
+RUN arch="$(dpkg --print-architecture)" \
+	&& curl -fsSL "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server-${CODE_SERVER_VERSION}-linux-${arch}.tar.gz" \
+		| tar -xz -C /opt \
+	&& ln -s "/opt/code-server-${CODE_SERVER_VERSION}-linux-${arch}" /opt/code-server \
+	&& ln -s /opt/code-server/bin/code-server /usr/local/bin/code-server \
+	&& cd /opt/code-server/lib/vscode/extensions \
+	&& for d in */; do \
+		case "${d%/}" in json|json-language-features|yaml|markdown-basics|markdown-language-features|theme-defaults|theme-seti) ;; \
+		*) rm -rf "$d" ;; esac; \
+	done \
+	&& ls \
+	&& code-server --version
+
+# WEB-30/WEB-31: code-server runs as agentbot (10001) whose login shell is nologin. VS Code offers every shell in
+# /etc/shells as a terminal profile, so /etc/shells lists only nologin (bash/dash stay installed for scripts).
+RUN groupadd --gid 10001 agentbot \
+	&& useradd --uid 10001 --gid 10001 --create-home --home-dir /home/agentbot --shell /usr/sbin/nologin agentbot \
+	&& printf '/usr/sbin/nologin\n' > /etc/shells
+
+COPY --chown=10001:10001 home/ /home/agentbot/
+COPY start.sh /usr/local/bin/agentbot-vscode
+COPY fwd.js /opt/agentbot/fwd.js
+# Root-owned, read-only to agentbot: the locked user/machine settings and user tasks (symlinked from the
+# user-data-dir at start), and an extensions dir that holds only the bundled extension, so nothing can be added to it.
+COPY vscode/ /opt/agentbot/vscode/
+COPY agentbot-lockdown.vsix /tmp/agentbot-lockdown.vsix
+RUN code-server --user-data-dir /tmp/cs-build --extensions-dir /opt/agentbot/vscode-extensions \
+		--install-extension /tmp/agentbot-lockdown.vsix \
+	&& rm -rf /tmp/cs-build /tmp/agentbot-lockdown.vsix \
+	&& chmod -R a+rX,go-w /opt/agentbot \
+	&& ls -la /opt/agentbot/vscode-extensions
+
+USER agentbot
+WORKDIR /home/agentbot
+ENV SHELL=/usr/sbin/nologin
+EXPOSE 13337
+ENTRYPOINT ["/usr/local/bin/agentbot-vscode"]

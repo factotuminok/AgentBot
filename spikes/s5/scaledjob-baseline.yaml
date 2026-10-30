@@ -1,0 +1,68 @@
+# S5 baseline: worker ScaledJob exactly per architecture §4.4 (no pendingPodConditions).
+# Over-provisions when worker start-up exceeds pollingInterval (wiki/spikes/S5.md, scenarios 4/4b).
+# Spike-only: maxReplicaCount 4 (patched to 10 for 4b); image/command run the simulated worker.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: agentbot-scale-auth
+  namespace: agentbot-s5
+spec:
+  secretTargetRef:
+    - parameter: token
+      name: agentbot-scale-token
+      key: token
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: worker
+  namespace: agentbot-s5
+spec:
+  pollingInterval: 5
+  minReplicaCount: 0
+  maxReplicaCount: 4
+  successfulJobsHistoryLimit: 0
+  failedJobsHistoryLimit: 5
+  scalingStrategy:
+    strategy: accurate
+  triggers:
+    - type: metrics-api
+      metadata:
+        url: http://orchestrator.agentbot-s5.svc:8081/internal/scale
+        format: json
+        valueLocation: pendingRuns
+        targetValue: "1"
+        authMode: bearer
+      authenticationRef:
+        name: agentbot-scale-auth
+  jobTargetRef:
+    backoffLimit: 0
+    ttlSecondsAfterFinished: 60
+    template:
+      metadata:
+        labels: { app: worker }
+      spec:
+        restartPolicy: Never
+        terminationGracePeriodSeconds: 60
+        containers:
+          - name: worker
+            image: docker.io/library/python:3.12-alpine
+            command: ["python", "-u", "/scripts/worker.py"]
+            env:
+              - name: SCALE_URL
+                value: http://orchestrator.agentbot-s5.svc:8081
+              - name: SCALE_TOKEN
+                valueFrom: { secretKeyRef: { name: agentbot-scale-token, key: token } }
+              - name: POD_NAME
+                valueFrom: { fieldRef: { fieldPath: metadata.name } }
+              - name: STARTUP_SECONDS
+                value: "0"
+              - name: CLAIM_TIMEOUT_SECONDS
+                value: "20"
+              - name: WORK_SECONDS
+                value: "60"
+            volumeMounts: [{ name: scripts, mountPath: /scripts }]
+            resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 64Mi } }
+        volumes:
+          - name: scripts
+            configMap: { name: s5-scripts }

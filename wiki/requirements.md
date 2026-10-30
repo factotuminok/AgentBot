@@ -177,8 +177,8 @@ Any non-terminal state also accepts `cancelled`.
 
 - **JOB-18** A fresh implement job MUST start from a fresh checkout of the base branch (architecture RUN-17). It runs the `implement` profile and gives the approved plan as input.
 - **JOB-19** The agent MUST commit but MUST NOT push. When the agent finishes:
-  - the worker commits any leftover changes as `AgentBot: remaining changes for #N` and uploads its temporary branch as a bundle (architecture RUN-19);
-  - the orchestrator fails the job with "Agent produced no commits" when the bundle has no new commits;
+  - the worker commits any leftover changes as `AgentBot: remaining changes for #N` and uploads its temporary branch as a bundle, or reports that the branch has no new commits, since git cannot create an empty bundle (architecture RUN-19);
+  - the orchestrator fails the job with "Agent produced no commits" when the worker reports no new commits;
   - otherwise the orchestrator pushes the commits to `refs/heads/<branch>` as a fast-forward and verifies that the remote branch exists.
 
   When the run fails with a time or cost limit or an error, its bundle and last checkpoint MUST be kept, not pushed, so that Retry continues from them (DSC-21, architecture RUN-20). When the push is rejected because the branch moved on GitHub, the bundle is discarded and Retry starts from the new head (architecture RUN-17, RUN-19).
@@ -228,22 +228,22 @@ Any non-terminal state also accepts `cancelled`.
 - **JOB-21** A follow-up run MUST start from a fresh checkout of the issue branch's current head (architecture RUN-17).
   - `revise` resumes the implement session with the feedback items as input and outputs `{summary}`.
   - `fix_ci` resumes it with the failing checks and their logs.
-- **JOB-22** The worker MUST commit any leftover changes as `AgentBot: follow-up changes for #N` in its result bundle. The orchestrator pushes the bundle as a fast-forward when it has new commits; a bundle without new commits means no code changes were needed.
+- **JOB-22** The worker MUST commit any leftover changes as `AgentBot: follow-up changes for #N` in its result bundle. The orchestrator pushes the bundle as a fast-forward when it has new commits; when the worker reports no new commits instead of a bundle, no code changes were needed.
   - On success, revise MUST comment "AgentBot addressed feedback: <summary>" on the PR and mark its items as seen.
   - A failed revise MUST still mark its items as seen, and Retry re-runs the same items.
 - **JOB-23** A non-resumed `fix_ci` MUST increment `ci_attempts` and set `ci_last_sha`. A resume MUST NOT increment it. If the fix pushes nothing, the system MUST comment on the PR that it could not find a fix and post "Couldn't fix the failing checks — this needs a human" in the thread.
 
 ## 5. Git workspace
 
-- **WS-01** The orchestrator MUST keep a bare mirror at `<state>/repos/<owner>__<repo>.git` for each repository it works on. The mirror is cloned on first use and fetched with `--prune` before each use. Mirror operations MUST be serialised per repository. A mirror with no tracked issue that has not been used for 14 days MUST be deleted.
+- **WS-01** The orchestrator MUST keep a bare mirror at `<state>/repos/<owner>__<repo>.git` for each repository it works on, and next to it a runs repo `<state>/repos/<owner>__<repo>.runs.git` that borrows the mirror's objects through `objects/info/alternates` and holds the temporary refs (architecture §5, STO-03). The mirror is cloned on first use and fetched with `--prune` before each use. It MUST fetch only `+refs/heads/*:refs/heads/*` and `+refs/tags/*:refs/tags/*` (not `clone --mirror`'s `+refs/*:refs/*`), MUST set `gc.pruneExpire=never`, and pushes to GitHub by explicit URL. Mirror operations MUST be serialised per repository. A mirror with no tracked issue that has not been used for 14 days MUST be deleted, together with its runs repo.
 - **WS-02** Tokens MUST reach git only through per-process `GIT_CONFIG_*` environment variables (an `http.extraheader` with a basic `x-access-token` header). Tokens MUST NOT appear in argv, the global environment or `.git/config`. `GIT_TERMINAL_PROMPT=0` MUST be set.
 - **WS-03** Issue branches on GitHub MUST be named `agentbot/issue-<n>-<slug>`, where the slug is at most 40 characters. They are the PR head and the only branches the system pushes. Each run works on its own temporary branch `agentbot/run-<runId>` in a private checkout on its worker, which never leaves the worker except as a bundle (architecture RUN-17 to RUN-20).
 - **WS-04** Plan, chat and draft runs MUST check out read-only from the base branch. Anything they commit is discarded when the run ends. `/ask` runs have no checkout.
 - **WS-05** When a repository's `.agentbot.yml` sets `setupCommand` (GH-26), it MUST run with `sh -c` in the worker's checkout at the start of every run that checks out that repository. A non-zero exit MUST fail the run and report the tail of the output.
 - **WS-06** The system MUST NOT delete remote branches. Branch deletion is left to GitHub's "Automatically delete head branches" setting.
-- **WS-07** The mirror's temporary refs (`refs/agentbot/runs/*`, `refs/agentbot/checkpoints/*`) MUST exist only while their run is unfinished, requeued after a lost worker, or failed with Retry still possible (architecture RUN-20). The system MUST NOT keep local issue branches or worktrees. Other refs MUST NOT be touched. Pruning MUST run at start for every existing mirror and MUST log failures without throwing.
+- **WS-07** The runs repo's temporary refs (`refs/agentbot/runs/*`, `refs/agentbot/checkpoints/*`) MUST exist only while their run is unfinished, requeued after a lost worker, or failed with Retry still possible (architecture RUN-20). The mirror MUST NOT hold them. The system MUST NOT keep local issue branches or worktrees. Other refs MUST NOT be touched. Pruning MUST run at start for every existing runs repo and MUST log failures without throwing.
 - **WS-08** Terminal cleanup MUST:
-  - delete the issue's temporary refs and checkpoints;
+  - delete the issue's temporary refs and checkpoints from the runs repo;
   - delete the issue's session files, for `done` and `cancelled` only;
   - post the final message;
   - archive the thread.
@@ -298,7 +298,7 @@ Any non-terminal state also accepts `cancelled`.
   - implement commits, references the issue, and MUST NOT push or change remotes or credentials;
   - fix_ci fixes the root cause and MUST NOT disable checks;
   - an exit code of 137 or "Killed" means out of memory, and the agent MUST NOT re-run the command and MUST report it;
-  - the checkout is shallow: only the start commit and the run's own commits are visible, so the agent MUST NOT try to fetch history or compare with older commits.
+  - the checkout is shallow: only the start commit and the run's own commits are visible, so the agent MUST NOT try to fetch history or compare with older commits, and MUST NOT amend or rebase the start commit (architecture RUN-17).
 
   Repo guidance (`AGENTS.md` and similar files) is loaded by omp from the checkout.
 - **AGT-14** Wall-clock time MUST be checked every 15 s and MUST exclude time spent waiting for a human answer. Cost MUST be checked at the end of every turn. The limits are:
@@ -584,7 +584,7 @@ Any non-terminal state also accepts `cancelled`.
   - stopped when the service stops;
   - proxied at `/admin/vscode/` behind the admin login, with the origin check on WebSockets and hop-by-hop headers stripped.
 
-  It MUST open the config workspace (WEB-25). The bundled AgentBot extension (WEB-28) MUST be installed at every start. The extension marketplace MUST be disabled, so no other extension can be installed. Only the bundled extension and the built-in JSON, YAML and Markdown support are enabled. The built-in debuggers, task providers, git and npm extensions MUST be disabled.
+  It MUST open the config workspace (WEB-25). The bundled AgentBot extension (WEB-28) MUST be installed at image build into a root-owned extensions directory that holds only it, so nothing else can be installed or removed; code-server loads it at every start. The extension marketplace MUST be disabled with `EXTENSIONS_GALLERY='{}'` and `extensions.allowed`, so no other extension can be installed. Only the bundled extension and the built-in JSON, YAML and Markdown support (plus the default themes) are present: every other built-in extension, including the debuggers, task providers, git and npm extensions, MUST be deleted from the image, because code-server has no per-extension disable flag.
 - **WEB-25** The config workspace MUST contain:
   - `settings.json`: every setting in §13. Each secret appears only as `"<set>"` or `"<not set>"`.
   - `omp.json`: omp setting overrides and MCP servers. Credential settings and MCP env and header values appear only as `"<set>"` or `"<not set>"`.
@@ -610,11 +610,17 @@ Any non-terminal state also accepts `cancelled`.
 
   It MUST offer the commands "AgentBot: Reload from server" and "AgentBot: Accept server version".
 - **WEB-29** Every change applied from the workspace MUST be logged in the orchestrator, like a page save, with the file and the admin username.
-- **WEB-30** The web pod MUST hold only the masked workspace, code-server data and its internal API token: no repo checkouts, model sign-ins, omp or secrets. code-server runs as the `agentbot` user. WEB-31 closes the obvious ways to a shell, but VS Code can still start programs, for example through user-level task settings. VS Code access therefore remains as powerful as the admin login, which it already requires.
+- **WEB-30** The web pod MUST hold only the masked workspace, code-server data and its internal API token: no repo checkouts, model sign-ins, omp or secrets. code-server runs as the `agentbot` user. WEB-31 closes the obvious ways to a shell, but VS Code can still start programs. Known gaps (spike S4):
+  - the admin can disable the lock-down extension in the Extensions view, which removes layer 1 until the state is reset;
+  - closing a terminal or task when it opens is a race, not a gate: a short task can finish first, so tasks stay safe only while nothing runs them;
+  - an extension cannot remove palette entries, menu items or the panel's Terminal tab; they stay visible and lead to a "disabled" message;
+  - the extension host runs `/bin/sh` for port detection, and nologin cannot stop VS Code or extensions from starting programs through `/bin/sh`.
+
+  VS Code access therefore remains as powerful as the admin login, which it already requires.
 - **WEB-31** code-server's integrated terminal MUST be disabled, in layers:
-  1. The bundled extension MUST remove the terminal's commands, keybindings and panel entry, and close any terminal the moment it opens, logging it.
-  2. code-server MUST run with `SHELL=/usr/sbin/nologin`, and the `agentbot` user's login shell MUST be `/usr/sbin/nologin`, so a terminal that opens anyway starts no shell.
-  3. The web process MUST delete `.vscode/tasks.json` and `.vscode/launch.json` from the workspace as soon as they appear, and report it in the extension. Machine-level settings MUST turn off automatic tasks and workspace trust prompts.
+  1. The bundled extension MUST block the terminal, task and extension-install commands by re-registering their command ids, periodically so that late registrations are covered, bind the terminal keybindings to a no-op, and close any terminal the moment it opens, logging it.
+  2. code-server MUST run with `SHELL=/usr/sbin/nologin`, the `agentbot` user's login shell MUST be `/usr/sbin/nologin`, and `/etc/shells` MUST list only `/usr/sbin/nologin`, so a terminal that opens anyway starts no shell.
+  3. The web process MUST delete `.vscode/tasks.json` and `.vscode/launch.json` from the workspace as soon as they appear, and report it in the extension. It MUST own `.vscode/settings.json`: it rewrites it from the orchestrator's version and rejects local edits, including terminal profile settings. The settings that turn off automatic tasks, workspace trust and all but the allowed extensions MUST be in a locked `User/settings.json` (root-owned, recreated at every start), because code-server ignores these application-scoped settings at machine level; `User/tasks.json` MUST be locked the same way. Before each code-server start, the web process MUST reset the stored extension-disabled state, so a disabled lock-down extension is enabled again.
 
 ### 9.6 Repositories
 
@@ -729,7 +735,7 @@ Any non-terminal state also accepts `cancelled`.
 - **ENG-03** Engine start MUST:
   1. create the state directories;
   2. list the existing mirrors, without cloning or fetching anything (mirrors are created on first use, WS-01);
-  3. prune the temporary refs of finished runs in those mirrors (WS-07);
+  3. prune the temporary refs of finished runs in the runs repos (WS-07);
   4. sweep stale session files;
   5. relabel tracked issues if the label names changed (GH-23);
   6. recover jobs (JOB-08);
@@ -817,7 +823,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
   - a key-value store (vault, log cap, omp update state, loadouts, label names last applied (GH-23), and the revision of each config workspace file (WEB-26)).
 
   Model sign-ins live in omp's own SQLite store `<state>/omp-agent/agent.db`, next to the main database (CRED-01). The packed omp runtime copies and their failed markers live in `<state>/omp-runtime/` (architecture §8).
-- **DB-03** All persistent state MUST live in the orchestrator's **state** volume (`<state>`, RWO): the database, the model sign-in store, the mirrors and their temporary refs, session files, ask scratch files, skills and agents, omp runtime copies, and the orchestrator and agent logs. The web pod has its own **web home** volume (RWO) for the `agentbot` user's `$HOME`: the synced copy of the config workspace (WEB-25), queued saves (WEB-27) and code-server data. Workers keep nothing: their checkout and run-local storage are deleted with them (architecture §5, RUN-20). No volume is shared between components.
+- **DB-03** All persistent state MUST live in the orchestrator's **state** volume (`<state>`, RWO): the database, the model sign-in store, the mirrors and their runs repos with the temporary refs, session files, ask scratch files, skills and agents, omp runtime copies, and the orchestrator and agent logs. The web pod has its own **web home** volume (RWO) for the `agentbot` user's `$HOME`: the synced copy of the config workspace (WEB-25), queued saves (WEB-27) and code-server data. Workers keep nothing: their checkout and run-local storage are deleted with them (architecture §5, RUN-20). No volume is shared between components.
 
 ## 15. omp version and in-place updates (architecture §8)
 
@@ -855,7 +861,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
   - a KEDA `ScaledJob` for workers, from 0 to `worker.maxReplicas` (default 10) pods, one run per pod, each pod deleted shortly after its run;
   - RWO PVCs for the orchestrator state and the web home;
   - generated secrets, NetworkPolicies and an optional Ingress.
-- **OPS-08** The Kubernetes prerequisites MUST be documented and checked by the chart where possible: Kubernetes ≥ 1.27 and KEDA ≥ 2.12 (the chart fails with a clear message when the `ScaledJob` CRD is missing). No ReadWriteMany storage is needed.
+- **OPS-08** The Kubernetes prerequisites MUST be documented and checked by the chart where possible: Kubernetes ≥ 1.27 and KEDA ≥ 2.12, with KEDA ≥ 2.19 recommended, because older versions can start one extra worker pod near `maxReplicaCount` (spike S5). The chart fails with a clear message when the `ScaledJob` CRD is missing. No ReadWriteMany storage is needed.
 - **OPS-09** Workers MUST behave the same in both runtimes: one worker per run, started by the launcher (Podman) or KEDA (Kubernetes), deleted after the run.
 
 ## 17. Resource requirements
@@ -866,7 +872,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
   - per concurrent agent run: about 250 MB, plus about 1.2 GB during a heavy check such as `tsc` or `bun test` on a large TypeScript project.
 
   For Podman hosts, 4 GiB is the minimum and 8 GiB is recommended. Concurrency MUST be tunable down for small hosts (`maxConcurrentJobs`, `maxChatSessions`, `AGENTBOT_WORKER_CAPACITY`).
-- **NFR-02** Each worker MUST have its own memory limit (default 4 GiB) and checkout space limit (default 20 GiB), in both runtimes, so that an out-of-memory kill or a full disk affects only that run and is reported for that run only (AGT-19, architecture STO-06). Detection of OOM kills relies on cgroup v2.
+- **NFR-02** Each worker MUST have its own memory limit (default 4 GiB, no swap) and checkout space limit (default 20 GiB), in both runtimes, so that an out-of-memory kill or a full disk affects only that run and is reported for that run only (AGT-19, architecture STO-06). The worker enforces the checkout limit by measuring its checkout periodically; under Podman this is a soft limit and the host disk is the hard ceiling, because rootless Podman cannot enforce a per-container disk limit (spike S6). Under Kubernetes, `emptyDir.sizeLimit` also enforces it. Detection of OOM kills relies on cgroup v2.
 - **NFR-06** Every run pays for a fresh worker start, a shallow checkout and `setupCommand` before the agent starts. The time MUST NOT count toward the run's time limit (architecture RUN-03), and the status page MUST show it per run, so that slow repos stand out.
 
 ## 18. Reliability summary

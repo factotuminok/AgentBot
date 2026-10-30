@@ -1,0 +1,9 @@
+node_modules/
+state/
+web-home/
+.tools/
+.env
+*.pem
+master.key
+dist/
+.DS_Store

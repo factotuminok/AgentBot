@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "target": "ESNext",
+    "noEmit": true,
+    "types": ["bun"],
+    "skipLibCheck": true
+  },
+  "include": ["src", "scripts", "test"]
+}

@@ -92,7 +92,7 @@ The web component is a thin front end:
 - It sets the security headers and checks the `Origin` header (WEB-05 to WEB-09).
 - It reads and writes all data through the orchestrator's admin API, holding no database or vault of its own. Setup, login and unlock are forwarded to the orchestrator, which owns the vault. The setup token is printed in the **orchestrator's** log.
 - It proxies the log stream (SSE) and log-file downloads from the orchestrator.
-- It runs the **configuration editor**, code-server, on its own home volume as the `agentbot` user (§2.5). There is no SSH server. code-server's integrated terminal, extension marketplace, tasks and debuggers are disabled (requirements WEB-14, WEB-31).
+- It runs the **configuration editor**, code-server, on its own home volume as the `agentbot` user (§2.5). There is no SSH server. code-server's integrated terminal, extension marketplace, tasks and debuggers are disabled, and built-in extensions other than JSON, YAML and Markdown support are deleted from the image (requirements WEB-14, WEB-31; spike S4).
   - The web pod holds no repo checkouts, no model sign-ins and no omp.
 
 When the orchestrator is unreachable, the web UI MUST still serve: login fails with "orchestrator unavailable", and the home page shows it.
@@ -103,7 +103,7 @@ A worker exists for exactly one run. It:
 1. connects to the orchestrator and claims one run (within `AGENTBOT_WORKER_CLAIM_TIMEOUT`, default 15 s; if nothing is left to claim, it exits 0, because another worker won the race);
 2. downloads what the run needs: the skills and agents, the omp runtime copy if one applies (§8), the session file to resume, and the ask scratch inputs;
 3. makes a shallow checkout of the run's start commit and creates the run's temporary branch (§4.6), then runs the repo's `setupCommand`;
-4. spawns the agent host as a **child process** (AGT-01 still holds inside the worker), with a run-private auth store seeded from the run spec (CRED-02);
+4. spawns the agent host as a **child process** (AGT-01 still holds inside the worker), with a run-private auth store seeded from the run spec (CRED-02). The host's `HOME` and `PI_CODING_AGENT_DIR` MUST point at writable run-local directories, set before omp is loaded; omp writes its logs, install id, auth store and an ~8 MB model cache (`models.db`) there (spike S2);
 5. relays the host's IPC to the orchestrator, and uploads checkpoints while it runs (RUN-18);
 6. when the host ends, uploads the result (RUN-19), wipes everything (RUN-20), and exits.
 
@@ -111,12 +111,12 @@ It has no GitHub or Discord credentials and never talks to GitHub. Its commits a
 
 ### 2.4 Launcher (Docker/Podman only)
 
-- **LCH-01** The launcher MUST start worker containers through a **rootless** Podman API socket mounted into it. At start it MUST check that the engine is rootless and refuse to run otherwise. `AGENTBOT_LAUNCHER_ALLOW_ROOTFUL=1` overrides this and logs a warning at every start, because a rootful socket gives the launcher root on the host.
+- **LCH-01** The launcher MUST start worker containers through a **rootless** Podman API socket mounted into it. At start it MUST check that the engine is rootless and refuse to run otherwise: `GET /libpod/info` must return 200 with `host.security.rootless` set to `true`; any other response, including a Docker socket without `/libpod/` routes, counts as not rootless (spike S6). `AGENTBOT_LAUNCHER_ALLOW_ROOTFUL=1` overrides this and logs a warning at every start, because a rootful socket gives the launcher root on the host.
 - **LCH-02** Every 2 s it MUST read `pendingRuns` from `/internal/scale` (scale token). It then starts that many worker containers, never more than `AGENTBOT_WORKER_CAPACITY` (default 4) at once. Each worker container MUST be started:
   - from the worker image, with `--rm`, on the stack's internal network, with no published ports;
   - with the label `agentbot.role=worker`;
-  - with a memory limit (`AGENTBOT_WORKER_MEMORY`, default 4 GiB);
-  - with the worker token as a Podman secret, a tmpfs for run-local storage, and a size-limited scratch area for the checkout (STO-06);
+  - with a memory limit (`AGENTBOT_WORKER_MEMORY`, default 4 GiB) and swap set equal to it, so the worker has no swap;
+  - with the worker token as a Podman secret, and a tmpfs for run-local storage owned by uid 10001 through the `U` mount option (tmpfs pages count against the memory limit, spike S6). The checkout lives in the container's own storage; its size is limited by the worker's measurement (STO-06), because rootless Podman cannot enforce a per-container disk limit;
   - with the command `agentbot worker`.
 - **LCH-03** At start, and every minute after that, it MUST remove exited worker containers it started. It MUST NOT touch any container without its label.
 - **LCH-04** It MUST hold no secret other than the scale token. It reports its health with `agentbot health` (§4.5).
@@ -201,8 +201,8 @@ Bulk data (the clone, bundles, session files, scratch files, the omp runtime and
 | worker → orch | `setup-output` | exit code and output tail of `setupCommand` (WS-05) |
 | worker → orch | `checkpoint` | a checkpoint was uploaded (RUN-18) |
 | worker → orch | `gone` | the host exited without `done` or `failed`: exit code, signal, OOM count (AGT-05) |
-| worker → orch | `credential-request` | provider whose sign-in needs a refresh (CRED-03) |
-| orch → worker | `credential-response` | the refreshed credential, or the refusal |
+| worker → orch | `credential-request` | provider, the orchestrator's credential id of the sign-in that needs a refresh, and the worker's current access token (CRED-03) |
+| orch → worker | `credential-response` | the access token and its expiry, or the refusal (CRED-05) |
 | orch → worker | `scratch-input` | a new ask attachment to download before the next steer (CHAT-08) |
 | both | `ack` | per run and direction, the highest relay sequence number received and stored |
 
@@ -231,7 +231,7 @@ The **run spec** contains everything the worker needs:
 - the bot's git name and email, for local commits only;
 - whether a session file exists to resume;
 - omp setting overrides, MCP servers (implement profile only), and the content hash of the skills and agents bundle;
-- provider API keys and a snapshot of the model sign-ins (CRED-02);
+- provider API keys and a snapshot of the model sign-ins, with refresh tokens replaced by omp's `__remote__` placeholder (CRED-02);
 - the repo's `setupCommand`;
 - for ask runs, the list of scratch inputs.
 
@@ -299,7 +299,8 @@ Every run starts a new worker, in both runtimes, and every worker ends with its 
 |---|---|---|
 | trigger | `metrics-api` on `http://orchestrator:8081/internal/scale`, `valueLocation: pendingRuns`, `targetValue: "1"`, bearer token via `TriggerAuthentication` | one pod per pending run |
 | `minReplicaCount` / `maxReplicaCount` | 0 / 10 (Helm `worker.maxReplicas`) | the requested range |
-| `scalingStrategy.strategy` | `accurate` | `pendingRuns` excludes runs already claimed, which is the queue model `accurate` expects |
+| `scalingStrategy.strategy` | `accurate` | `pendingRuns` excludes runs already claimed, which is the queue model `accurate` expects, together with `pendingPodConditions` |
+| `scalingStrategy.pendingPodConditions` | `["Ready"]`, with a worker readiness probe that passes only once the worker has claimed a run | a started pod that has not claimed yet counts as pending, so slow worker start-up does not add pods (spike S5) |
 | `pollingInterval` | 5 s | short cold-start delay |
 | Job `backoffLimit` | 0 | the orchestrator owns retries (RUN-04) |
 | Job `restartPolicy` | `Never` | same reason |
@@ -307,7 +308,7 @@ Every run starts a new worker, in both runtimes, and every worker ends with its 
 | Job `activeDeadlineSeconds` | unset | runs may wait up to `askTimeoutHours` for an answer |
 | Pod `terminationGracePeriodSeconds` | 60 | time for a final checkpoint on eviction (RUN-18) |
 
-KEDA can start one extra pod for a run claimed between two polls; that pod finds nothing to claim and exits after the claim timeout.
+KEDA can start an extra pod for a run claimed between two polls (and, on KEDA < 2.19, near `maxReplicaCount`); that pod finds nothing to claim and exits 0 after the claim timeout. With `backoffLimit: 0`, a non-zero exit would leave failed Jobs behind. The worker's readiness MUST stay true from the claim until it exits, including while it waits for an answer.
 
 - **RUN-10** The orchestrator MUST know the worker capacity from `AGENTBOT_WORKER_CAPACITY`. Helm sets it to `worker.maxReplicas`, and compose sets it to the launcher's limit. The orchestrator MUST report the limits, capacity and warnings in its health responses (§4.5) and on the status page, together with pending runs and their age. A mismatch never blocks a settings save.
 - **RUN-11** The concurrency actually reached is `min(maxConcurrentJobs + maxChatSessions, workers.maxConcurrentRuns, worker capacity)`. To use 10 workers, raise `maxConcurrentJobs` and `maxChatSessions`; the health warning says so while their sum is below the capacity.
@@ -322,11 +323,11 @@ A run waiting on a human answer keeps its worker for up to `askTimeoutHours`. Re
 | `GET /readyz` (alias `/healthz`) | orchestrator | none | Readiness: 200 whenever the database is open and the internal API can serve, **in every engine phase**, so that the web UI can always reach the admin API, even in `unconfigured` or `error`. 503 only when the database cannot be opened or the state volume is not writable. |
 | `/internal/admin/*` | orchestrator | web token | Every web UI read and write, the log stream and log-file downloads, repo and channel listing, sign-in, and the config workspace: files, revisions, change notifications, JSON schemas and validation results (§2.5). |
 | `/internal/worker` | orchestrator | worker token | Run protocol WebSocket (§4.2). |
-| `/internal/git/<owner>/<repo>.git` | orchestrator | lease token | Read-only git smart HTTP (`git-upload-pack` only) from the mirror, for the run's repo only (RUN-17). |
+| `/internal/git/<owner>/<repo>.git` | orchestrator | lease token | Read-only git smart HTTP (`git-upload-pack` only, protocol v2 and v0, gzip request bodies) from the mirror, for the run's repo only (RUN-17). |
 | `/internal/runs/<id>/…` | orchestrator | that run's lease token | Run artifacts: `GET` session, checkpoint bundle, scratch inputs, skills bundle and omp runtime; `PUT` checkpoint, result bundle, session and scratch outputs (RUN-18, RUN-19). |
 | `GET /internal/scale` | orchestrator | scale token | `{pendingRuns}` for KEDA and the launcher. |
 | `GET /healthz` | web | none | 200 while the web UI serves, whatever the orchestrator's state (requirements §9.3). Relays the orchestrator's `phase` and `limits`. |
-| `agentbot health` (command) | worker, launcher | — | Worker: prints `{status, version, phase, runId, connected}`, where phase is `claiming`, `checkout`, `running`, `uploading` or `cleanup`. Launcher: prints `{status, version, rootless, workers, capacity}`. Exits 0 while the process is alive. Used by the container `HEALTHCHECK` (output kept in `podman inspect`) and as the Kubernetes exec liveness probe. |
+| `agentbot health` (command) | worker, launcher | — | Worker: prints `{status, version, phase, runId, connected}`, where phase is `claiming`, `checkout`, `running`, `uploading` or `cleanup`. Launcher: prints `{status, version, rootless, workers, capacity}`. Exits 0 while the process is alive. Used by the container `HEALTHCHECK` (output kept in `podman inspect`) and as the Kubernetes exec liveness probe. `agentbot health --claimed` (worker) exits 0 only once the worker has claimed a run; it is the Kubernetes readiness probe (§4.4). |
 
 The orchestrator's health body reports its limits:
 
@@ -356,10 +357,13 @@ The orchestrator's health body reports its limits:
 
 ```mermaid
 flowchart LR
-    GH[(GitHub<br/>agentbot/issue-n-slug)] -->|fetch| MR[(orchestrator mirror)]
+    GH[(GitHub<br/>agentbot/issue-n-slug)] -->|fetch heads and tags| MR[(orchestrator mirror)]
     MR -->|shallow fetch of the start commit| WC[worker checkout<br/>branch agentbot/run-id]
-    WC -->|checkpoint bundle every 5 min| CP[(refs/agentbot/checkpoints/id)]
-    WC -->|result bundle| RR[(refs/agentbot/runs/id)]
+    MR -.->|objects via alternates| RX[(runs repo)]
+    WC -->|checkpoint bundle every 5 min| CP[refs/agentbot/checkpoints/id<br/>in the runs repo]
+    WC -->|result bundle| RR[refs/agentbot/runs/id<br/>in the runs repo]
+    CP --- RX
+    RR --- RX
     RR -->|fast-forward push| GH
 ```
 
@@ -375,57 +379,57 @@ flowchart LR
   4. create the temporary branch `agentbot/run-<runId>` on it.
 
   - The lease token reaches git only through a per-command `http.extraHeader` environment variable (as WS-02).
-  - The endpoint MUST serve only that repo, only `git-upload-pack`, and MUST hide `refs/agentbot/*`.
+  - The endpoint MUST serve only that repo's mirror, only `git-upload-pack`, and MUST support protocol v2 and gzip request bodies. Temporary refs live in the runs repo (§5), never in the mirror, because upload-pack serves any object in the repo it serves whatever `uploadpack.hideRefs` says (spike S3). The endpoint still sets `uploadpack.hideRefs=refs/agentbot` as defence in depth.
   - If the run continues an earlier one, the worker fetches that run's kept checkpoint through the run artifact endpoint and restores it:
     1. check out the checkpoint commit on the temporary branch;
-    2. reset to its parent with a mixed reset, which keeps the run's commits and turns the checkpoint's working tree back into uncommitted changes.
+    2. reset to its parent with a mixed reset, which keeps the run's commits and turns the checkpoint's working tree back into uncommitted changes. Files that were staged come back as untracked.
 
-  The agent has no history: `git log`, `git blame` and diffs against older commits show only the start commit, and the prompts MUST say so. Bundles and pushes are unaffected, because the run's commits sit on top of the start commit.
+  The agent has no history: `git log`, `git blame` and diffs against older commits show only the start commit, and the prompts MUST say so. The prompts MUST also tell the agent not to amend or rebase the start commit; a rewritten start commit makes the result bundle fail the prerequisite check, and the run fails with "the run rewrote the start commit". Bundles and pushes are unaffected, because the run's commits sit on top of the start commit.
 - **RUN-18** **Checkpoints.** For runs that write code (implement, revise, fix_ci), the worker MUST upload a checkpoint:
   - when the host first reports `session_file` (the session file only);
   - every 5 minutes;
   - when it receives SIGTERM (eviction, shutdown);
   - before the result.
 
-  A checkpoint is a bundle with one commit on top of the temporary branch that holds the whole working tree: tracked files plus untracked files that are not ignored. The session file is uploaded with it. The orchestrator keeps only the latest checkpoint per run, as `refs/agentbot/checkpoints/<runId>` in the mirror. Read-only runs upload only the session file at the same times.
+  A checkpoint is a bundle with one commit on top of the temporary branch that holds the whole working tree: tracked files plus untracked files that are not ignored. The session file is uploaded with it. The orchestrator keeps only the latest checkpoint per run, as `refs/agentbot/checkpoints/<runId>` in the runs repo; each import is forced, replacing the previous checkpoint. Read-only runs upload only the session file at the same times.
 - **RUN-19** **Result.** When the host ends, the worker MUST do the following before it relays `done` or `failed`:
-  1. For runs that write code: commit any leftover changes on the temporary branch, as `AgentBot: remaining changes for #N` for implement and as `AgentBot: follow-up changes for #N` for revise and fix_ci (requirements JOB-19, JOB-22). Then upload a bundle of the temporary branch relative to the start commit.
+  1. For runs that write code: commit any leftover changes on the temporary branch, as `AgentBot: remaining changes for #N` for implement and as `AgentBot: follow-up changes for #N` for revise and fix_ci (requirements JOB-19, JOB-22). Then upload a bundle of the temporary branch relative to the start commit, or report that the branch has no new commits (`git rev-list --count <start>..agentbot/run-<runId>` is 0), because git cannot create an empty bundle.
   2. Upload the final session file.
   3. For ask runs, upload new or changed files from `outputs/`.
 
   The orchestrator MUST then:
-  1. check that the bundle's only prerequisite is the run's start commit;
-  2. fetch the bundle into `refs/agentbot/runs/<runId>`;
-  3. push it to the issue branch on GitHub as a **fast-forward only**.
+  1. check that the bundle's only prerequisite is the run's start commit, and that its only head is the temporary branch;
+  2. fetch the bundle into `refs/agentbot/runs/<runId>` in the runs repo (a forced import: the ref belongs to the run);
+  3. push it from the runs repo to the issue branch on GitHub, by explicit URL, as a **fast-forward only**. Only this push is fast-forward only.
 
   If the issue branch moved on GitHub during the run, the push is rejected and the job MUST fail with "The branch changed on GitHub during this run; press Retry to start again from the new head." For read-only runs, any commits are discarded and nothing is pushed.
 - **RUN-20** **Cleanup.** Whatever the outcome, once the orchestrator acknowledges `done` or `failed`, the worker MUST:
   1. delete its checkout, temporary branch, run-local auth store, session copy, skills copy and scratch copy;
   2. exit 0.
 
-  The container (`--rm`, launcher) or Job pod (`ttlSecondsAfterFinished`) is then deleted. In the mirror:
+  The container (`--rm`, launcher) or Job pod (`ttlSecondsAfterFinished`) is then deleted. In the runs repo:
   - **Successful run, or a run whose push was rejected:** the orchestrator MUST delete `refs/agentbot/runs/<runId>` after the push or discard, and `refs/agentbot/checkpoints/<runId>` when the run finishes.
   - **Failed job run** (a time or cost limit, or an error): it keeps both refs, unpushed, until a Retry's run finishes or the issue ends (requirements JOB-19, WS-08).
   - **Run requeued after a worker loss:** it keeps its checkpoint until the resumed run finishes.
 
-  Session files stay in the orchestrator until their issue, plan or draft ends (requirements ENG-05). At start, the orchestrator MUST delete the `refs/agentbot/*` refs of runs that are finished and not kept for Retry.
+  Session files stay in the orchestrator until their issue, plan or draft ends (requirements ENG-05). At start, the orchestrator MUST delete the runs repos' `refs/agentbot/*` refs of runs that are finished and not kept for Retry.
 - **RUN-21** **One run per issue.** At most one run per issue or chat thread MUST be pending or active at a time (the scheduler already guarantees this per issue), so two runs never race to move the same issue branch.
 
 ## 5. Storage
 
 | Volume | Mounted by | Docker/Podman | Kubernetes | Contents |
 |---|---|---|---|---|
-| state | orchestrator | `agentbot-state` | PVC, RWO | `agentbot.db` (SQLite, WAL); `omp-agent/` (omp sign-in store `agent.db`, model cache); `repos/` (bare mirrors, temp refs); `sessions/`; `scratch/` (ask inputs and outputs); `omp/` (skills and agents); `omp-runtime/` (packed omp copies); `logs/agent/`, `logs/orchestrator/` |
-| web home | web | `agentbot-web` | PVC, RWO | the `agentbot` user's `$HOME`: the config workspace copy and its last-synced revisions, queued saves (requirements WEB-27), code-server settings and extensions |
-| worker checkout | one worker | container scratch, size-limited | `emptyDir`, `sizeLimit` (default 20 Gi) | the run's clone, session copy, skills copy, scratch copy |
-| run-local | one worker | tmpfs | `emptyDir`, `medium: Memory` | run-private auth store |
+| state | orchestrator | `agentbot-state` | PVC, RWO | `agentbot.db` (SQLite, WAL); `omp-agent/` (omp sign-in store `agent.db`, model cache); `repos/` (bare mirrors `<owner>__<repo>.git`, and per mirror a runs repo `<owner>__<repo>.runs.git` holding the temp refs and borrowing the mirror's objects through `objects/info/alternates`); `sessions/`; `scratch/` (ask inputs and outputs); `omp/` (skills and agents); `omp-runtime/` (packed omp copies); `logs/agent/`, `logs/orchestrator/` |
+| web home | web | `agentbot-web` | PVC, RWO | the `agentbot` user's `$HOME`: the config workspace copy and its last-synced revisions, queued saves (requirements WEB-27), code-server user data. Extensions are not here: the bundled one is in the image. |
+| worker checkout | one worker | container storage, size measured by the worker (STO-06) | `emptyDir`, `sizeLimit` (default 20 Gi) as a backstop | the run's clone, session copy, skills copy, scratch copy |
+| run-local | one worker | tmpfs (`U` for ownership) | `emptyDir`, `medium: Memory` | run-private auth store, and omp's `HOME` and agent dir (logs, install id, ~8 MB model cache, spike S2). It counts against the memory limit. |
 
 - **STO-01** SQLite databases (`agentbot.db` and omp's `agent.db`) MUST live only on the state volume. No other component may open them.
 - **STO-02** Every container MUST run as uid/gid 10001. In Kubernetes, `fsGroup: 10001` and `runAsNonRoot: true` MUST be set, so nothing has to re-own files at start.
-- **STO-03** Mirrors MUST be read and written only by the orchestrator, under its per-repo lock. Workers and web reach them only through the read-only git endpoint.
+- **STO-03** Mirrors and runs repos MUST be read and written only by the orchestrator, under its per-repo lock. Workers and web reach the mirror only through the read-only git endpoint; the runs repo is never served. Mirrors MUST set `gc.pruneExpire=never`, so that a start commit a kept run still needs is never pruned from the objects the runs repo borrows.
 - **STO-04** At most one run MUST use a given issue branch or chat thread at a time (RUN-21).
 - **STO-05** Withdrawn: there is no shared volume.
-- **STO-06** A worker's checkout space MUST be limited (default 20 GiB). A run that exceeds it fails with "the run ran out of disk space", which is reported like an OOM: the agent is told, and the run is flagged.
+- **STO-06** A worker's checkout space MUST be limited (default 20 GiB). The worker MUST measure its checkout's size every few seconds and fail the run with "the run ran out of disk space" when it passes the limit, which is reported like an OOM: the agent is told, and the run is flagged. Under Podman this is a soft limit, because a rootless engine cannot enforce a per-container disk limit (spike S6); the host disk is the hard ceiling. Under Kubernetes, `emptyDir.sizeLimit` is also enforced, by the kubelet's periodic measurement.
 
 ## 6. Security
 
@@ -437,7 +441,7 @@ flowchart LR
 | `worker-token` | secret | workers, orchestrator |
 | `scale-token` | secret | launcher, KEDA `TriggerAuthentication`, orchestrator |
 | Lease token | issued per run at claim | that run's worker; valid only for that run's git and artifact endpoints, until the run finishes |
-| Model sign-ins (OAuth) | `<state>/omp-agent/agent.db` | orchestrator. A per-run copy goes to the worker (CRED-02). |
+| Model sign-ins (OAuth) | `<state>/omp-agent/agent.db` | orchestrator. A per-run copy without refresh tokens goes to the worker (CRED-02). |
 
 - **SEC-14** Each token MUST be accepted only on its own API surface:
   - the web token on `/internal/admin/*`;
@@ -452,7 +456,7 @@ flowchart LR
   - to workers, nothing;
   - worker → web is denied.
 
-  Egress stays open for the orchestrator and workers: the orchestrator needs Discord, GitHub, npm and the model providers' sign-in endpoints; workers need model providers, web search and package registries. Web needs no egress beyond the orchestrator; the VS Code extension is bundled and the marketplace is off. On Podman the same applies: only the web service publishes ports.
+  Egress stays open for the orchestrator and workers: the orchestrator needs Discord, GitHub, npm and the model providers' sign-in endpoints; workers need model providers, web search (with no search keys configured, omp's keyless default, `search.parallel.ai`, spike S2) and package registries. Web needs no egress beyond the orchestrator; the VS Code extension is bundled and the marketplace is off. On Podman the same applies: only the web service publishes ports.
 - **SEC-16** The master key needs no root-entrypoint stdin trick (DevForge's approach), because no agent ever runs in the orchestrator's container. It is mounted as a file readable only by uid 10001 in the orchestrator.
 
 **Isolation and accepted risks.**
@@ -469,10 +473,15 @@ flowchart LR
 ### 6.1 Model sign-ins
 
 - **CRED-01** Model sign-ins MUST be stored only in the orchestrator, in omp's own SQLite store at `<state>/omp-agent/agent.db` on the state volume. Workers and web MUST NOT mount it.
-- **CRED-02** Before dispatching a run, the orchestrator MUST refresh any sign-in that expires within 10 minutes. It then puts a snapshot of all sign-ins into the run spec. The worker MUST write the snapshot to a run-private auth store on run-local storage (§5), mode 0700, and delete it when the run ends.
-- **CRED-03** Workers MUST NOT refresh tokens with the provider themselves. When a token needs a refresh, the worker sends `credential-request`. The orchestrator refreshes once per provider at a time, stores the result and answers every waiting request with it. This keeps one refresh-token chain: for providers that rotate refresh tokens, a refresh in one run would otherwise invalidate the orchestrator's copy and every other run's. This relies on omp letting AgentBot replace its auth store's refresh step; verify that against the omp SDK before building it.
+- **CRED-02** Before dispatching a run, the orchestrator MUST refresh any sign-in that expires within 10 minutes. It then puts a snapshot of all sign-ins into the run spec, with refresh tokens replaced by omp's `__remote__` placeholder (omp's `credentials.snapshot()`); refresh tokens never leave the orchestrator. The worker MUST write the snapshot to a run-private auth store on run-local storage (§5), mode 0700, and delete it when the run ends.
+- **CRED-03** Workers MUST NOT refresh tokens with the provider themselves. The worker's run-private store MUST install omp's `AuthStorageOptions.refreshOAuthCredential` hook (`discoverAuthStorage(agentDir, { authStorageOptions: { refreshOAuthCredential } })`), which sends `credential-request`. Every session MUST be given that `authStorage` and its `modelRegistry`, because omp code paths that are not given a store open their own without the hook. The orchestrator refreshes once per sign-in at a time and MUST answer within omp's 10 s refresh deadline:
+  - if the sign-in no longer exists, it refuses (CRED-05);
+  - if its stored access token differs from the worker's and is still fresh, it returns the stored token;
+  - otherwise it refreshes, stores the result and answers every waiting request with it.
+
+  This keeps one refresh-token chain per sign-in: for providers that rotate refresh tokens, a refresh in one run would otherwise invalidate the orchestrator's copy and every other run's. Spike S1 confirmed the hook (`wiki/spikes/S1.md`).
 - **CRED-04** Withdrawn: there is no browser terminal.
-- **CRED-05** Signing out in `/admin/models` MUST remove the sign-in from the orchestrator at once. Runs that already hold a copy keep it until they end, but their refresh requests for that provider MUST be refused.
+- **CRED-05** Signing out in `/admin/models` MUST remove the sign-in from the orchestrator at once. Runs that already hold a copy keep it until they end, but their refresh requests for that sign-in MUST be refused.
 
 ## 7. Deployment
 
@@ -485,7 +494,7 @@ The image carries an **app identity**: a file `/app/IDENTITY` holding the AgentB
 | Role | Entrypoint duties |
 |---|---|
 | orchestrator | Open the state volume. Run `agentbot orchestrator`. |
-| web | `agentbot web`, which starts code-server on first use with `SHELL=/usr/sbin/nologin`, the marketplace off and only the allowed extensions enabled (requirements WEB-14, WEB-31). The `agentbot` user's login shell in the image is `/usr/sbin/nologin`. |
+| web | `agentbot web`, which starts code-server on first use with `SHELL=/usr/sbin/nologin`, `EXTENSIONS_GALLERY='{}'` and the root-owned extensions directory that holds only the bundled extension, after recreating the locked `User/settings.json` and `User/tasks.json` (requirements WEB-14, WEB-31). The image deletes every built-in extension except JSON, YAML, Markdown support and the default themes, installs the bundled extension at build time, sets the `agentbot` user's login shell to `/usr/sbin/nologin` and lists only `/usr/sbin/nologin` in `/etc/shells`. |
 | worker | `agentbot worker`: one run, then exit. |
 | launcher | `agentbot launcher` (Podman only). |
 
@@ -494,7 +503,7 @@ No entrypoint runs as root.
 ### 7.2 Podman (compose)
 
 `compose.yaml` defines three long-running services, `orchestrator`, `web` and `launcher`, on one internal network, run with `podman compose` under **rootless Podman ≥ 4.6**. The launcher starts the worker containers. Docker Engine can run the three services but cannot run workers: the launcher refuses a rootful socket (LCH-01).
-- **Podman socket.** The host user enables it once with `systemctl --user enable --now podman.socket`. Compose mounts `$XDG_RUNTIME_DIR/podman/podman.sock` into the launcher only.
+- **Podman socket.** The host user enables it once with `systemctl --user enable --now podman.socket`. Compose mounts `$XDG_RUNTIME_DIR/podman/podman.sock` into the launcher only. The launcher runs with `--security-opt label=disable` (SELinux blocks a confined container from the user's socket) and `--userns=keep-id:uid=10001,gid=10001` (so uid 10001 owns the socket inside the container); without both it cannot connect (spike S6, tested on Fedora CoreOS 44 with Podman 6.1.4 only).
 - **Restarts.** `restart: unless-stopped` on all three.
 - **Health checks.**
   - orchestrator: `GET :8081/healthz` (= `/readyz`, §4.5);
@@ -516,7 +525,7 @@ A Helm chart, `deploy/helm/agentbot`:
 | Service `orchestrator` | ClusterIP, port 8081 |
 | Deployment `web` | `replicas: 1`. Readiness and liveness on `/healthz`, which never fails because of the orchestrator. |
 | Service `web` (+ optional Ingress) | port 8080. The Ingress terminates TLS so the session cookie is `Secure` (WEB-05). |
-| ScaledJob `worker` + TriggerAuthentication | §4.4. Exec liveness probe `agentbot health`. `emptyDir` for the checkout (`sizeLimit`) and a memory-backed `emptyDir` for run-local storage. |
+| ScaledJob `worker` + TriggerAuthentication | §4.4. Exec liveness probe `agentbot health`; exec readiness probe `agentbot health --claimed` (run claimed), `periodSeconds: 1`, `failureThreshold: 1`. `successfulJobsHistoryLimit` stays at its default, so `ttlSecondsAfterFinished` decides when Jobs are deleted. `emptyDir` for the checkout (`sizeLimit`) and a memory-backed `emptyDir` for run-local storage. |
 | PVCs | `state` (RWO), `web-home` (RWO). No RWX storage. |
 | Secrets | master key and the three tokens, generated by the chart on first install and kept on upgrade (`lookup`). Can be supplied instead (`existingSecret`). |
 | NetworkPolicies | SEC-15 |
@@ -529,7 +538,7 @@ Default resources (values):
 | web | 100m CPU, 768 Mi (code-server) | 2 Gi |
 | worker | 500m CPU, 1.5 Gi, 20 Gi ephemeral storage | 4 Gi |
 
-Requirements: Kubernetes ≥ 1.27 and KEDA ≥ 2.12.
+Requirements: Kubernetes ≥ 1.27 and KEDA ≥ 2.12; KEDA ≥ 2.19 is recommended (spike S5).
 
 ## 8. omp updates (in place, workers only)
 
@@ -588,6 +597,11 @@ requirements.md has been updated for these:
 | DB-01 to DB-03 | Volumes per component (§5); the runs and questions tables; sign-ins, mirrors, sessions and scratch on the state volume. |
 | OPS-01 to OPS-05, OPS-07 to OPS-09 | Four roles, Podman compose stack with launcher, Helm chart without RWX storage, health-based deploy check. |
 | NFR-01 to NFR-04 | Memory and disk per worker; reliability across component restarts. |
+| CRED-02, CRED-03, CRED-05 | The run spec's sign-in snapshot carries no refresh tokens; refresh goes through omp's `refreshOAuthCredential` hook, once per sign-in (spike S1). |
+| RUN-17 to RUN-20, STO-03, WS-01, WS-07, WS-08, ENG-03, JOB-19, JOB-22, AGT-13 | Temp refs live in a separate runs repo; the mirror fetches only heads and tags; forced imports; "no commits" is reported instead of an empty bundle; prompts forbid rewriting the start commit (spike S3). |
+| WEB-14, WEB-30, WEB-31 | Bundled extension installed at image build; built-ins deleted; locked user settings and tasks; `/etc/shells`; the gaps S4 found (spike S4). |
+| STO-06, NFR-02, LCH-01, LCH-02 | Under Podman the checkout limit is measured by the worker; rootless detection, no swap, tmpfs ownership (spike S6). |
+| OPS-08 | KEDA ≥ 2.19 recommended (spike S5). |
 | new | RUN-01 to RUN-21, STO-01 to STO-06, SEC-14 to SEC-16, CRED-01 to CRED-05, LCH-01 to LCH-04, OPS-07 to OPS-09, DSC-32 to DSC-38, GH-25 to GH-27, WEB-25 to WEB-32 |
 
 ## 11. Open items
@@ -595,7 +609,7 @@ requirements.md has been updated for these:
 1. **Releasing workers while waiting for an answer.** Checkpoint the session and stop the worker while waiting for a human answer, then resume on a new worker. This would free workers during up to 24 h question waits.
 2. **The on-prem host.** DevForge's on-prem host runs one Quadlet unit. Moving it to this stack means either Quadlet units per service plus the Podman socket, or `podman compose` under systemd. Not decided.
 3. **Web replicas.** More than one web replica needs sessions stored in the orchestrator. Not needed at one admin.
-4. **omp refresh hook.** CRED-03 assumes AgentBot can route omp's token refresh through the orchestrator. Confirm the omp SDK allows a custom auth store or refresh callback before building it. If it doesn't, the fallback is short-lived access tokens only, with no refresh token in the run spec; a run that outlives its token then fails.
+4. **omp refresh hook.** Resolved by spike S1 (`wiki/spikes/S1.md`): omp's `AuthStorageOptions.refreshOAuthCredential` routes every refresh through the orchestrator. CRED-03 is built as written; the short-lived-token fallback is not needed.
 5. **Start-up cost per run.** Every run clones the repo and runs `setupCommand` from scratch. A per-repo dependency cache (a node-local volume in Kubernetes, a named volume under Podman), reused read-only by workers, would cut this. Measure first.
 6. **Agent and supervisor in separate containers.** Running the agent host in a second container, as a different user and without the worker token, would close the remaining claim risk in §6.
 7. **Size of the packed omp copy.** Each worker downloads it when an in-place update is active (UPD-07). Its size is not measured yet. If it is large, cache it per node.

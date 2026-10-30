@@ -1,0 +1,90 @@
+name: CI
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: ["**.md", "wiki/**"]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image: ${{ steps.image.outputs.build }}
+    steps:
+      - name: Wait for follow-up commits (a newer push cancels this run)
+        run: sleep 30
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2 # same as the Dockerfile base image
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+      - name: Set up Helm
+        if: hashFiles('deploy/helm/agentbot/Chart.yaml') != ''
+        uses: azure/setup-helm@v4
+      - name: Helm lint
+        if: hashFiles('deploy/helm/agentbot/Chart.yaml') != ''
+        run: helm lint deploy/helm/agentbot
+      - id: version
+        run: |
+          base=$(jq -r .version package.json)
+          version="${base%.*}.${GITHUB_RUN_NUMBER}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Build version: \`$version\`" >> "$GITHUB_STEP_SUMMARY"
+      - id: image
+        name: Build the image only once a Dockerfile exists
+        if: hashFiles('Dockerfile') != ''
+        run: echo "build=true" >> "$GITHUB_OUTPUT"
+  image:
+    needs: test
+    if: github.ref == 'refs/heads/main' && needs.test.outputs.image == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push the v<version> tag
+      packages: write # push to ghcr.io
+    env:
+      VERSION: ${{ needs.test.outputs.version }}
+    steps:
+      - name: Image name (GHCR needs lower case)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/agentbot" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: date
+        run: echo "value=$(date -u +%FT%TZ)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:latest
+          build-args: |
+            AGENTBOT_VERSION=${{ env.VERSION }}
+            AGENTBOT_COMMIT=${{ github.sha }}
+            AGENTBOT_BUILD_DATE=${{ steps.date.outputs.value }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Tag the release
+        run: |
+          tag="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists (re-run)"; exit 0
+          fi
+          git tag "$tag" "$GITHUB_SHA" && git push origin "refs/tags/$tag"

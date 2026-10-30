@@ -1,0 +1,25 @@
+{
+  "name": "agentbot",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "agentbot": "src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun run src/cli.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.12.1",
+    "@oh-my-pi/pi-utils": "18.12.1",
+    "discord.js": "^14.27.0",
+    "octokit": "^5.0.5",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "typescript": "^5.9.0"
+  }
+}

@@ -42,7 +42,7 @@ One package and one image (architecture A-7). The VS Code extension builds to a 
 
 ## 3. Phase 0: spikes
 
-Each spike answers one question with a throwaway prototype and a short note in `wiki/spikes/`. A spike that fails switches to its fallback, and the requirement is changed before the phase that needs it starts.
+Each spike answers one question with a throwaway prototype and a short note in `wiki/spikes/`. A spike that fails switches to its fallback, and the requirement is changed before the phase that needs it starts. Outcomes: all six passed; their notes are `wiki/spikes/S1.md` to `S6.md`, and the requirement changes they caused are listed in architecture §10.
 
 | # | Question | Method | Pass when | Fallback |
 |---|---|---|---|---|
@@ -170,8 +170,8 @@ Ported tests: `agenthost`, `scratch`, `scratchTools`, `loadout`, `ompAssets`, `o
 **Goal:** private checkouts on temporary branches, with results coming back as bundles.
 
 Work:
-- Mirrors on the state volume (WS-01, WS-02), from `src/git/workspace.ts`.
-- The git endpoint (RUN-17): shallow fetch of the start commit, lease-token auth, `hideRefs`, following the S3 outcome.
+- Mirrors and their runs repos on the state volume (WS-01, WS-02), from `src/git/workspace.ts`.
+- The git endpoint (RUN-17): shallow fetch of the start commit, lease-token auth, protocol v2 and gzip, serving only the mirror, following the S3 outcome.
 - Reading `.agentbot.yml` at dispatch (GH-26); worker checkout, the temporary branch `agentbot/run-<id>`, and `setupCommand` with `setup-output` (WS-03 to WS-05).
 - Checkpoints every 5 minutes, on SIGTERM and before the result (RUN-18; JOB-10, JOB-11).
 - Result (RUN-19): commit leftover changes, upload the bundle, check its prerequisite, import it, fast-forward push, and handle a branch that moved on GitHub.
@@ -322,7 +322,7 @@ DevForge's tests are ported with their modules. Tests that pinned DevForge's wor
 | Releasing workers while waiting for an answer | architecture §11 item 1 | after release, using phase 11 load data |
 | Moving DevForge's on-prem host to this stack | architecture §11 item 2 | phase 10 |
 | Web replicas | architecture §11 item 3 | not needed for release |
-| omp refresh hook | architecture §11 item 4 | spike S1 |
+| omp refresh hook | architecture §11 item 4 | settled by spike S1 (`wiki/spikes/S1.md`) |
 | Per-repo dependency cache | architecture §11 item 5 | phase 11, from NFR-06 data |
 | Agent host in a separate container from the supervisor | architecture §11 item 6 | phase 11 security review |
 | Size of the packed omp copy | architecture §11 item 7 | phase 10 |
@@ -348,10 +348,10 @@ Withdrawn requirements (WEB-12, WEB-13, WEB-15 to WEB-19, SEC-07 to SEC-11, CRED
 
 | Risk | Effect | Mitigation |
 |---|---|---|
-| omp gives no way to route token refresh (S1) | CRED-03 can't be built as written | Short-lived tokens without refresh tokens; decided in phase 0. |
+| omp stops routing token refresh through `refreshOAuthCredential` (S1 passed on 18.12.1) | CRED-03 breaks after an omp upgrade | Port the S1 script into `test/integration`, asserting workers make no token-endpoint requests. |
 | omp changes its SDK between versions | The agent host breaks after an in-place update | Pin in `package.json`, CI on the pin, canary and fallback (UPD-08). |
 | Worker start, clone and `setupCommand` are slow | Chats feel slow; jobs take longer | Measure in phase 5 (NFR-06); dependency cache in phase 11 if needed. |
 | code-server lock-down has gaps (S4) | VS Code can still start programs | Already accepted as admin-level access (WEB-30); record the gaps found. |
 | Discord rate limits with 10 concurrent runs | Delayed or dropped status edits | Shared outbound queue (DSC-32); measured in the phase 11 load test. |
 | KEDA scaling behaves differently from the spike | Too few or extra pods | Extra pods exit after the claim timeout; S5 settings tested again in phase 9. |
-| Rootless Podman differs across hosts | The launcher fails on some hosts | Rootless check at start (LCH-01); Podman ≥ 4.6 documented; S6 on two distributions. |
+| Rootless Podman differs across hosts | The launcher fails on some hosts | Rootless check at start (LCH-01); Podman ≥ 4.6 documented. S6 ran on one distribution only (Fedora CoreOS 44, Podman 6.1.4, SELinux enforcing); test a second one in phase 8. |
