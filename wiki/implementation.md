@@ -318,7 +318,6 @@ DevForge's tests are ported with their modules. Tests that pinned DevForge's wor
 | `answer.md` truncation at a character boundary | requirements §20 item 3 | phase 3 |
 | Strict schema for revise and fix_ci output | requirements §20 item 4 | phase 5 |
 | Enforcing read-only planning beyond the prompt | requirements §20 item 5 | phase 5 |
-| Engine phase after the orchestrator stops | requirements §20 item 6 | phase 2 |
 | Releasing workers while waiting for an answer | architecture §11 item 1 | after release, using phase 11 load data |
 | Moving DevForge's on-prem host to this stack | architecture §11 item 2 | phase 10 |
 | Web replicas | architecture §11 item 3 | not needed for release |

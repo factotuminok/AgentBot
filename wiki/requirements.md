@@ -742,7 +742,7 @@ Any non-terminal state also accepts `cancelled`.
   7. start the poller, the chat idle sweep and plan bookkeeping, and resume dispatch.
 
   A failure to recover plans MUST be logged and MUST NOT abort the start. A Discord login failure MUST end in `error`.
-- **ENG-04** Graceful shutdown of the orchestrator on SIGTERM MUST stop, in order: update checks, the internal API (sockets close with 1001), the engine (poller, idle sweeps, dispatch, then Discord) and the database. Runs on workers MUST keep going (RUN-09). It MUST finish within about 10 s.
+- **ENG-04** Graceful shutdown of the orchestrator on SIGTERM MUST stop, in order: update checks, the internal API (sockets close with 1001), the engine (poller, idle sweeps, dispatch, then Discord) and the database. Runs on workers MUST keep going (RUN-09). It MUST finish within about 10 s. From the start of shutdown the engine phase MUST be `stopping` and no apply MUST start the engine again; no phase is reported once the process has exited.
 - **ENG-05** Session files MUST be deleted when:
   - their issue ends (`done` or `cancelled`);
   - a `/work plan` is rejected;
@@ -898,4 +898,3 @@ These follow from the requirements as written and probably need a deliberate dec
 3. Truncating `answer.md` to the upload limit (CHAT-10) must cut at a character boundary, not in the middle of a UTF-8 sequence.
 4. The revise and fix_ci output schema (AGT-12) should reject extra properties like the other schemas do.
 5. The `plan` profile grants `bash` (AGT-08), so read-only planning (AGT-13) is enforced only by the prompt.
-6. The engine phase after the orchestrator stops is not defined (ENG-01, ENG-02).

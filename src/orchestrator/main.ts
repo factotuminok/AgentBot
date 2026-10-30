@@ -5,28 +5,16 @@ import { loadEnv } from "../shared/env";
 import { errorMessage, log, setLogSink } from "../shared/log";
 import { DEFAULT_LOG_MAX_BYTES, logCapBytes, openRollingFiles, splitLogCap } from "../shared/rollinglog";
 import { versionInfo } from "../shared/version";
-import type { EnginePhase } from "./api/health";
+import { createAdminApi, generateSetupToken, loadWebApiToken } from "./api/admin";
 import { startInternalApi } from "./api/server";
+import { createFakeDispatcher } from "./dispatch/fake";
+import { createController } from "./engine/controller";
+import { openAgentLog } from "./store/agentlog";
 import { dbPath, openDb } from "./store/db";
-import { loadMasterKey, openVault, type Vault } from "./store/vault";
+import { loadMasterKey, openVault } from "./store/vault";
 
 /** `kv` key holding the last applied total log budget in bytes (plain text; a size isn't secret). */
 const LOG_CAP_KEY = "logs.maxBytes";
-
-/**
- * The phase before any engine runs (ENG-02 without the `starting` branch, which the controller owns): `setup` without an admin,
- * `locked` while the vault is locked, `error` when the settings can't be read, `unconfigured` until settings are saved.
- */
-function preEnginePhase(vault: Vault): EnginePhase {
-	if (!vault.isInitialized()) return "setup";
-	if (!vault.isUnlocked()) return "locked";
-	try {
-		vault.readSettings();
-	} catch {
-		return "error";
-	}
-	return "unconfigured";
-}
 
 export async function runOrchestrator(): Promise<void> {
 	const env = loadEnv();
@@ -41,10 +29,35 @@ export async function runOrchestrator(): Promise<void> {
 	const total = logCapBytes((Number.isSafeInteger(storedCap) && storedCap >= 1024 ** 2 ? storedCap : DEFAULT_LOG_MAX_BYTES) / 1024 ** 3);
 	const split = splitLogCap(total);
 	processLog.setMaxBytes(split.process);
+	const agentLog = await openAgentLog({ dir: join(env.stateDir, "logs", "agent"), maxBytes: split.agent });
+	/** Settings → Logs, applied on every apply once settings are readable; remembered for locked boots (OBS-04). */
+	const applyLogCap = (maxGiB: number): void => {
+		const cap = logCapBytes(maxGiB);
+		const shares = splitLogCap(cap);
+		processLog.setMaxBytes(shares.process);
+		agentLog.setMaxBytes(shares.agent);
+		db.kvSet(LOG_CAP_KEY, String(cap));
+	};
 
 	const vault = await openVault(db, await loadMasterKey(env.masterKeyFile));
 	const { agentbot: version } = await versionInfo();
+	// Process-wide: engine restarts never touch runs (RUN-09). Phase 2 has no workers.
+	const dispatcher = createFakeDispatcher();
+	log("warn", "agent runs are simulated: no workers exist yet, every run gets canned output from the fake dispatcher");
+	const controller = createController({ stateDir: env.stateDir, db, vault, agentLog, dispatcher, applyLogCap });
 
+	// First run: whoever can read the orchestrator log proves it before claiming the admin account (WEB-02).
+	const setupToken = vault.isInitialized() ? undefined : generateSetupToken();
+	const admin = createAdminApi({
+		db,
+		vault,
+		controller,
+		dispatcher,
+		version,
+		workerCapacity: env.workerCapacity,
+		webToken: await loadWebApiToken(env.webApiTokenFile),
+		setupToken,
+	});
 	const api = startInternalApi({
 		host: env.internalHost,
 		port: env.internalPort,
@@ -52,10 +65,14 @@ export async function runOrchestrator(): Promise<void> {
 		db,
 		version,
 		workerCapacity: env.workerCapacity,
-		phase: () => preEnginePhase(vault),
+		phase: () => controller.status().phase,
 		config: () => (vault.isUnlocked() ? vault.readSettings()?.config : undefined),
+		dispatcher,
+		admin,
 	});
-	log("info", "orchestrator started", { url: api.url, version, phase: preEnginePhase(vault), stateDir: env.stateDir });
+	log("info", "orchestrator started", { url: api.url, version, stateDir: env.stateDir });
+	if (setupToken) log("info", "first run: open the web UI's /setup page and enter this setup token to create the admin account", { setupToken });
+	else if (!vault.isUnlocked()) log("info", "settings are locked: log in to the web UI to start the engine");
 
 	// omp's SDK installs process-wide SIGINT/SIGTERM handlers that run registered cleanups and then exit;
 	// a separate process.on handler would race that exit, so register with it (ENG-04).
@@ -65,6 +82,7 @@ export async function runOrchestrator(): Promise<void> {
 			log("info", "shutting down", { reason });
 			try {
 				await api.stop();
+				await controller.stop();
 				db.close();
 			} catch (err) {
 				log("error", "shutdown failed", { error: errorMessage(err) });
@@ -74,4 +92,7 @@ export async function runOrchestrator(): Promise<void> {
 		},
 		{ exitOnly: true },
 	);
+
+	await controller.apply();
+	log("info", "startup complete", { phase: controller.status().phase });
 }

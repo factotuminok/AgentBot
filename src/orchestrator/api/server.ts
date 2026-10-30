@@ -1,8 +1,11 @@
 import { accessSync, constants } from "node:fs";
 import type { Server } from "bun";
+import { ADMIN_PREFIX } from "../../shared/adminApi";
 import type { Config } from "../../shared/config";
 import { errorMessage, log } from "../../shared/log";
+import type { Dispatcher } from "../dispatch/dispatcher";
 import type { Db } from "../store/db";
+import type { AdminApi } from "./admin";
 import { type EnginePhase, type HealthBody, healthLimits } from "./health";
 
 export interface InternalApiOptions {
@@ -16,6 +19,10 @@ export interface InternalApiOptions {
 	phase(): EnginePhase;
 	/** Parsed settings, or undefined while locked or not yet saved (RUN-12). */
 	config(): Config | undefined;
+	/** Run counts for the health body (architecture §4.5). */
+	dispatcher: Pick<Dispatcher, "counts">;
+	/** `/internal/admin/*`, web token only (SEC-14). */
+	admin: AdminApi;
 }
 
 export interface InternalApi {
@@ -37,12 +44,11 @@ function ready(opts: InternalApiOptions): boolean {
 }
 
 function healthBody(opts: InternalApiOptions, ok: boolean): HealthBody {
-	let pending = 0;
-	let running = 0;
+	let runs = { pending: 0, running: 0 };
 	let config: Config | undefined;
 	if (ok) {
-		pending = opts.db.runsInState("pending").length;
-		running = opts.db.runsInState("assigned", "running", "finishing").length;
+		const { pending, running } = opts.dispatcher.counts();
+		runs = { pending, running };
 	}
 	try {
 		config = opts.config();
@@ -53,7 +59,7 @@ function healthBody(opts: InternalApiOptions, ok: boolean): HealthBody {
 		status: ok ? "ok" : "unavailable",
 		version: opts.version,
 		phase: opts.phase(),
-		runs: { pending, running },
+		runs,
 		...healthLimits(config, opts.workerCapacity),
 	};
 }
@@ -75,7 +81,11 @@ export function startInternalApi(opts: InternalApiOptions): InternalApi {
 				return Response.json(healthBody(opts, ok), { status: ok ? 200 : 503 });
 			},
 		},
-		fetch: () => Response.json({ error: "not found" }, { status: 404 }),
+		fetch: req => {
+			const { pathname } = new URL(req.url);
+			if (pathname.startsWith(`${ADMIN_PREFIX}/`)) return opts.admin.handle(req);
+			return Response.json({ error: "not found" }, { status: 404 });
+		},
 		error: err => {
 			log("error", "internal API error", { error: errorMessage(err) });
 			return Response.json({ error: "internal error" }, { status: 500 });

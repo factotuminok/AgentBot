@@ -24,7 +24,11 @@ async function main(): Promise<void> {
 			await runOrchestrator();
 			return;
 		}
-		case "web":
+		case "web": {
+			const { runWeb } = await import("./web/main");
+			await runWeb();
+			return;
+		}
 		case "worker":
 		case "launcher":
 		case "health":

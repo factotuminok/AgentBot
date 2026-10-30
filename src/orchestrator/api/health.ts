@@ -1,7 +1,7 @@
+import type { EnginePhase } from "../../shared/adminApi";
 import type { Config } from "../../shared/config";
 
-/** Engine phases (ENG-01). */
-export type EnginePhase = "setup" | "locked" | "unconfigured" | "starting" | "running" | "stopping" | "error";
+export type { EnginePhase };
 
 export interface HealthLimits {
 	maxConcurrentJobs: number;
