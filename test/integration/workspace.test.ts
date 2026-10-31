@@ -218,12 +218,15 @@ describe("settings.json (WEB-25, WEB-26)", () => {
 		const { json, revision } = await getJson("settings.json");
 		json.discord.workChannelId = work.id;
 		json.limits.maxConcurrentJobs = 3;
+		expect(json.omp).toEqual({ autoUpdate: false });
+		json.omp.autoUpdate = true;
 		const result = await saved(await put("settings.json", revision, render(json)));
 		// The new key is stored in the schema's place, not at the end where it was typed: the file is re-rendered.
 		expect(result).toMatchObject({ phase: "running", rewritten: true, warnings: [] });
 		expect(s.controller.status().phase).toBe("running");
 		const stored = s.vault.readSettings()!;
 		expect(stored.config.limits.maxConcurrentJobs).toBe(3);
+		expect(stored.config.omp.autoUpdate).toBe(true);
 		expect(stored.secrets).toEqual({ discordToken: "real-bot-token", githubAppPrivateKey: s.github.privateKey.trim(), providerKeys: { openai: "sk-provider-key" } });
 		expect(result.revision).toBe(await currentRevision("settings.json"));
 		expect(s.logs.some(line => line.includes('"msg":"workspace change applied"') && line.includes('"file":"settings.json"') && line.includes(`"admin":"${ADMIN}"`))).toBe(true);

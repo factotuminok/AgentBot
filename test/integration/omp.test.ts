@@ -12,7 +12,8 @@ import { createFakeDispatcher, type FakeDispatcher } from "../../src/orchestrato
 import { createOmpUpdater } from "../../src/orchestrator/omp/updates";
 import { dbPath, openDb } from "../../src/orchestrator/store/db";
 import { openVault, type Vault } from "../../src/orchestrator/store/vault";
-import type { McpTestState } from "../../src/shared/adminOmp";
+import { AUTO_UPDATE_BY, type McpTestState } from "../../src/shared/adminOmp";
+import { parseSettings } from "../../src/shared/config";
 import { listSettings } from "../../src/shared/ompconfig";
 import { OMP_PACKAGE } from "../../src/shared/ompPins";
 import { MCP_WAITING, OMP_SAVED, ompPages } from "../../src/web/ompPage";
@@ -341,5 +342,23 @@ describe("omp version and updates (UPD-10)", () => {
 		expect(page).toContain("<tr><th>Latest on npm</th><td><code>99.2.0</code></td></tr>");
 		const view = (await (await stack.api("GET", "/omp")).json()) as { update: { active?: { version: string }; image: string } };
 		expect(view.update).toMatchObject({ image: "18.12.1", active: { version: "99.2.0" } });
+
+		// With omp.autoUpdate on, the page and the flash say the update installs by itself.
+		vault.writeSettings(
+			parseSettings({
+				config: { discord: { guildId: "g1", allowedUserIds: ["u1"], workChannelId: "w1" }, github: { appId: 1 }, omp: { autoUpdate: true } },
+				secrets: { discordToken: "discord-token", githubAppPrivateKey: "pem" },
+			}),
+		);
+		registry.answer = () => Response.json({ version: "99.3.0" });
+		await stack.post("/admin/omp/update-check", {});
+		page = await (await stack.get("/admin/omp")).text();
+		expect(page).toContain("Checked npm: the latest omp is 99.3.0. omp 99.3.0 is available for workers; it is installed automatically (Settings → omp).");
+		expect(page).toContain("omp 99.3.0 is available: it is installed automatically (Settings → omp)");
+		expect(page).not.toContain("approve it in the Discord work channel");
+		expect(await updater.install("99.3.0", AUTO_UPDATE_BY, { unattended: true })).toMatchObject({ ok: true });
+		page = await (await stack.get("/admin/omp")).text();
+		expect(page).toContain("omp 99.3.0 (from 99.2.0), installed; installed automatically");
+		expect(page).toContain("in-place update");
 	});
 });

@@ -1,5 +1,5 @@
-import type { McpRow, McpTestState, OmpSettingInfo, OmpUpdateView, OmpView, PinnedSetting, SecretKeyRow } from "../shared/adminOmp";
-import { MCP_TRANSPORTS } from "../shared/adminOmp";
+import type { McpRow, McpTestState, OmpSettingInfo, OmpUpdateAdminView, OmpView, PinnedSetting, SecretKeyRow } from "../shared/adminOmp";
+import { AUTO_UPDATE_BY, installedByText, MCP_TRANSPORTS } from "../shared/adminOmp";
 import { AdminApiError } from "./adminClient";
 import { field } from "./forms";
 import { html, json, type PageContext, type PageRoutes, redirect } from "./http";
@@ -158,10 +158,18 @@ ${actions}
 </fieldset>`;
 }
 
+/** What the Check now flash adds when an update is available: automatic with `omp.autoUpdate`, else approved in Discord. */
+function availableText(update: OmpUpdateAdminView): string {
+	if (!update.autoUpdate) return ` omp ${update.available} is available for workers; approve it in the Discord work channel.`;
+	return update.lastAttempt?.version === update.available && update.lastAttempt?.outcome === "failed"
+		? ` omp ${update.available} is available for workers; its automatic install failed, so approve it in the Discord work channel.`
+		: ` omp ${update.available} is available for workers; it is installed automatically (Settings → omp).`;
+}
+
 /** UPD-10: the image's omp and the workers' copy when they differ, the npm check, the last attempt, and "Check now". */
-function updateSection(update: OmpUpdateView): string {
+function updateSection(update: OmpUpdateAdminView): string {
 	const workers = update.active
-		? `<p>Workers use omp <code>${esc(update.active.version)}</code> (in-place update ${esc(update.active.copy)}, approved by ${esc(update.active.by)}, ${(update.active.size / 1024 ** 2).toFixed(1)} MiB).
+		? `<p>Workers use omp <code>${esc(update.active.version)}</code> (in-place update ${esc(update.active.copy)}, ${esc(installedByText(update.active.by))}, ${(update.active.size / 1024 ** 2).toFixed(1)} MiB).
 The orchestrator keeps the image's omp <code>${esc(update.image)}</code> for settings validation and sign-in.</p>`
 		: `<p>Image omp <code>${esc(update.image)}</code>, used by the orchestrator and by workers.</p>`;
 	const rows: [string, string][] = [
@@ -172,16 +180,21 @@ The orchestrator keeps the image's omp <code>${esc(update.image)}</code> for set
 	const state = !update.supported
 		? esc(update.unsupportedReason ?? "updates are not supported here")
 		: update.installing
-			? `installing omp ${esc(update.installing.version)} (approved by ${esc(update.installing.by)} at ${esc(update.installing.startedAt)})`
+			? `installing omp ${esc(update.installing.version)} (${esc(update.installing.by === AUTO_UPDATE_BY ? "started automatically" : installedByText(update.installing.by))} at ${esc(update.installing.startedAt)})`
 			: update.available
-				? `omp ${esc(update.available)} is available: approve it in the Discord work channel`
+				? update.autoUpdate
+					? update.lastAttempt?.version === update.available && update.lastAttempt.outcome === "failed"
+						? `omp ${esc(update.available)} is available: its automatic install failed; approve it in the Discord work channel`
+						: `omp ${esc(update.available)} is available: it is installed automatically (Settings → omp)`
+					: `omp ${esc(update.available)} is available: approve it in the Discord work channel`
 				: "up to date";
 	rows.push(["Update", state]);
 	const attempt = update.lastAttempt;
 	if (attempt) {
 		const error = attempt.error ? `: ${esc(attempt.error)}` : "";
 		const log = attempt.log ? `<details><summary>Output</summary><pre>${esc(attempt.log)}</pre></details>` : "";
-		rows.push(["Last attempt", `omp ${esc(attempt.version)} (from ${esc(attempt.from)}), ${esc(attempt.outcome)}${error}; approved by ${esc(attempt.by)}, ${esc(attempt.at)}${log}`]);
+		const by = attempt.by === AUTO_UPDATE_BY && attempt.outcome !== "installed" ? "started automatically" : installedByText(attempt.by);
+		rows.push(["Last attempt", `omp ${esc(attempt.version)} (from ${esc(attempt.from)}), ${esc(attempt.outcome)}${error}; ${esc(by)}, ${esc(attempt.at)}${log}`]);
 	}
 	return `<h2>omp version and updates</h2>
 ${workers}
@@ -303,10 +316,10 @@ export const ompPages: PageRoutes = {
 
 	"POST /admin/omp/update-check": {
 		async handle(_req, _url, ctx) {
-			const update = await ctx.admin.call<OmpUpdateView>("POST", "/omp/update-check", { admin: ctx.session.username });
+			const update = await ctx.admin.call<OmpUpdateAdminView>("POST", "/omp/update-check", { admin: ctx.session.username });
 			ctx.session.flash = update.checkError
 				? { text: `The npm check failed: ${update.checkError}`, error: true }
-				: { text: `Checked npm: the latest omp is ${update.latest ?? "unknown"}.${update.available ? ` omp ${update.available} is available for workers; approve it in the Discord work channel.` : ""}` };
+				: { text: `Checked npm: the latest omp is ${update.latest ?? "unknown"}.${update.available ? availableText(update) : ""}` };
 			return redirect("/admin/omp");
 		},
 	},

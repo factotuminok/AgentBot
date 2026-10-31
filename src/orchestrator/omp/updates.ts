@@ -1,4 +1,4 @@
-import type { OmpAttempt, OmpUpdateView } from "../../shared/adminOmp";
+import { type OmpAttempt, type OmpUpdateView, installedByText } from "../../shared/adminOmp";
 import { errorMessage, log } from "../../shared/log";
 import { OMP_PACKAGE, outputTail, SEMVER } from "../../shared/ompPins";
 import type { AppIdentity } from "../../shared/version";
@@ -53,8 +53,11 @@ export interface OmpUpdater extends OmpRuntimeSource {
 	/** UPD-09 cleanup, then a check after `checkDelayMs` and every `checkIntervalMs`. */
 	start(): void;
 	stop(): void;
-	/** UPD-06 for `version`, approved by `by`. Claims the install synchronously, so a second call is refused (UPD-03). */
-	install(version: string, by: string): Promise<InstallResult>;
+	/**
+	 * UPD-06 for `version`, approved by `by`. Claims the install synchronously, so a second call is refused (UPD-03).
+	 * An `unattended` install saves its final attempt as not reported, so the Discord notices post it.
+	 */
+	install(version: string, by: string, opts?: { unattended?: boolean }): Promise<InstallResult>;
 	notice(): OmpNotice | undefined;
 	setNotice(notice: OmpNotice | undefined): void;
 	/** Marks the last attempt as posted in Discord. */
@@ -169,10 +172,10 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 		return status();
 	}
 
-	async function install(version: string, by: string): Promise<InstallResult> {
+	async function install(version: string, by: string, opts?: { unattended?: boolean }): Promise<InstallResult> {
 		const refuse = (error: string): InstallResult => ({ ok: false, error, refused: true });
 		if (!runtimes) return refuse(UNSUPPORTED);
-		if (installing) return refuse(`omp ${installing.version} is already being installed (approved by ${installing.by})`);
+		if (installing) return refuse(`omp ${installing.version} is already being installed (${installedByText(installing.by)})`);
 		if (version !== updateAvailable()) return refuse(`omp ${version} is no longer the update on offer`);
 		const startedAt = new Date().toISOString();
 		installing = { version, by, startedAt };
@@ -184,12 +187,12 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 			const result = await runtimes.create({ version, by, installer });
 			const at = new Date().toISOString();
 			if (result.ok) {
-				saveAttempt({ ...base, outcome: "installed", copy: result.copy.copy, log: outputTail(result.output), at, reported: true });
+				saveAttempt({ ...base, outcome: "installed", copy: result.copy.copy, log: outputTail(result.output), at, reported: !opts?.unattended });
 				log("info", "omp update installed for workers", { version, copy: result.copy.copy, sizeBytes: result.copy.size });
 				return { ok: true, copy: result.copy.copy };
 			}
 			const tail = outputTail(result.output);
-			saveAttempt({ ...base, outcome: "failed", error: result.error, log: tail, at, reported: true });
+			saveAttempt({ ...base, outcome: "failed", error: result.error, log: tail, at, reported: !opts?.unattended });
 			log("error", "omp update failed", { version, error: result.error });
 			return { ok: false, error: result.error, log: tail };
 		} finally {

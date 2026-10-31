@@ -1,6 +1,16 @@
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import type { McpRow, McpServerInput, McpTestRequest, McpTestState, OmpSaveRequest, OmpView, SecretKeyInput, SettingRow } from "../../shared/adminOmp";
+import type {
+	McpRow,
+	McpServerInput,
+	McpTestRequest,
+	McpTestState,
+	OmpSaveRequest,
+	OmpUpdateAdminView,
+	OmpView,
+	SecretKeyInput,
+	SettingRow,
+} from "../../shared/adminOmp";
 import { errorMessage, log } from "../../shared/log";
 import {
 	emptyOmpConfig,
@@ -207,10 +217,19 @@ export function createOmpRoutes(deps: OmpRoutesDeps): AdminRoutes {
 		return storedOmpConfig(vault);
 	}
 
+	/** `omp.autoUpdate` from the stored settings; off when locked, unsaved or no longer valid. */
+	function autoUpdate(): boolean {
+		try {
+			return vault.isUnlocked() ? (vault.readSettings()?.config.omp.autoUpdate ?? false) : false;
+		} catch {
+			return false;
+		}
+	}
+
 	async function view(): Promise<OmpView> {
 		const { config, error } = storedConfig();
 		return {
-			update: deps.updates.status(),
+			update: { ...deps.updates.status(), autoUpdate: autoUpdate() },
 			reference: ompSettings().list,
 			pinned: Object.entries(LOCKED_SETTINGS).map(([id, { value, reason }]) => ({ id, value, reason })),
 			settings: settingRows(config),
@@ -277,7 +296,8 @@ export function createOmpRoutes(deps: OmpRoutesDeps): AdminRoutes {
 			methods: ["POST"],
 			async handle(req) {
 				log("info", "omp update check requested", { admin: actingAdmin(req) });
-				return Response.json(await deps.updates.check());
+				const update: OmpUpdateAdminView = { ...(await deps.updates.check()), autoUpdate: autoUpdate() };
+				return Response.json(update);
 			},
 		},
 		"/omp/mcp-tests/": {

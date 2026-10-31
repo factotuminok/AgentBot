@@ -710,6 +710,30 @@ describe("settings (/admin)", () => {
 		expect(await clash.text()).toContain("is already the work channel");
 	});
 
+	test("omp.autoUpdate is a checkbox that round-trips, and a rejected save keeps it as submitted", async () => {
+		const h = start();
+		await setUp(h);
+		const box = (page: string) => /<input type="checkbox" name="omp\.autoUpdate" value="true" aria-describedby="help-omp\.autoUpdate"( checked)?>/.exec(page);
+
+		await h.post("/admin/settings", VALID_FORM);
+		expect(h.stub.settings!.config.omp.autoUpdate).toBe(false);
+		expect(box(await (await h.get("/admin")).text())?.[1]).toBeUndefined();
+		expect(box(await (await h.get("/admin")).text())).not.toBeNull();
+
+		expect((await h.post("/admin/settings", { ...VALID_FORM, "omp.autoUpdate": "true" })).status).toBe(303);
+		expect(h.stub.settings!.config.omp.autoUpdate).toBe(true);
+		expect(box(await (await h.get("/admin")).text())?.[1]).toBe(" checked");
+
+		const rejected = await h.post("/admin/settings", { ...VALID_FORM, "omp.autoUpdate": "true", "limits.maxConcurrentJobs": "abc" });
+		expect(rejected.status).toBe(400);
+		expect(box(await rejected.text())?.[1]).toBe(" checked");
+
+		// Unchecked sends nothing: back to the default.
+		expect((await h.post("/admin/settings", VALID_FORM)).status).toBe(303);
+		expect(h.stub.settings!.config.omp.autoUpdate).toBe(false);
+		expect(box(await (await h.get("/admin")).text())?.[1]).toBeUndefined();
+	});
+
 	test("a startup error and warnings are reported with the save", async () => {
 		const h = start();
 		await setUp(h);
@@ -759,6 +783,7 @@ describe("settings (/admin)", () => {
 		for (const def of CONFIG_FIELDS) form[def.name] = def.example;
 		expect((await h.post("/admin/settings", form)).status).toBe(303);
 		expect(h.stub.settings!.config.limits.maxCostUsdPerJob).toBe(7.5);
+		expect(h.stub.settings!.config.omp.autoUpdate).toBe(true);
 		expect(h.stub.settings!.config.labels.states.inReview).toBe("ai:in-review");
 	});
 });

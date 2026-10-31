@@ -149,7 +149,7 @@ Everything an admin enters lives in the orchestrator's encrypted settings vault 
 1. **Settings** (`/admin`): the Discord bot token and guild, allowed users and roles, the GitHub App id and private key, labels, models, limits and logs. Once the bot token and guild are saved, the channel fields become dropdowns; the engine starts when a work channel is chosen.
 2. **Repositories** (`/admin/repos`): watch or unwatch the repositories the GitHub App can reach. Each watch gets its own Discord channel.
 3. **Model accounts** (`/admin/models`): sign in to model providers, or add provider API keys under Settings.
-4. **omp and MCP** (`/admin/omp`), **Skills and agents** (`/admin/skills`): omp setting overrides, MCP servers, and the skills and task agents runs load. The omp page also shows the omp update status; updates are approved in Discord.
+4. **omp and MCP** (`/admin/omp`), **Skills and agents** (`/admin/skills`): omp setting overrides, MCP servers, and the skills and task agents runs load. The omp page also shows the omp update status; updates are approved in Discord, or installed automatically when Settings → omp → Install omp updates automatically is on.
 5. **VS Code** (`/admin/vscode/`, unless `AGENTBOT_WEB_VSCODE=off`): the same settings, omp configuration, skills and agents as files, validated on save. Secrets show only as `<set>` and are changed on the pages above.
 
 A repository can add `.agentbot.yml` on its default branch with a `setupCommand` that every run executes after checkout (for example `bun install`). The home page has sample configs and a getting-started checklist.

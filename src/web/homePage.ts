@@ -147,6 +147,7 @@ export const SAMPLE_SETTINGS = {
 		},
 		workers: { reattachGraceSeconds: 90 },
 		logs: { maxGiB: 5 },
+		omp: { autoUpdate: false },
 	},
 	secrets: { discordToken: "<bot token>", githubAppPrivateKey: "<PEM private key>", providerKeys: { openai: "<API key>" } },
 };

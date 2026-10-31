@@ -67,7 +67,7 @@ export interface McpRow {
 
 export interface OmpView {
 	/** omp versions and in-place worker updates (UPD-02 to UPD-10). */
-	update: OmpUpdateView;
+	update: OmpUpdateAdminView;
 	/** Every registered omp setting, in omp's display order. */
 	reference: OmpSettingInfo[];
 	pinned: PinnedSetting[];
@@ -122,9 +122,9 @@ export interface McpTestState {
 /** One in-place update attempt (UPD-03, UPD-08): an approval and what came of it. */
 export interface OmpAttempt {
 	version: string;
-	/** The omp workers used when it was approved. */
+	/** The omp workers used when it was approved or started. */
 	from: string;
-	/** Who approved it, e.g. `@alice`. */
+	/** Who approved it, e.g. `@alice`, or `AUTO_UPDATE_BY` for an automatic install. */
 	by: string;
 	/** `failed` covers both a failed install and a copy that failed its canary run (UPD-08). */
 	outcome: "installing" | "installed" | "failed";
@@ -134,7 +134,7 @@ export interface OmpAttempt {
 	/** The runtime copy it made. */
 	copy?: string;
 	at: string;
-	/** The outcome was posted in Discord. */
+	/** The outcome was posted in Discord. An unattended install saves it `false`, and the Discord notices post it. */
 	reported?: boolean;
 }
 
@@ -156,4 +156,17 @@ export interface OmpUpdateView {
 	unsupportedReason?: string;
 	installing?: { version: string; by: string; startedAt: string };
 	lastAttempt?: OmpAttempt;
+}
+
+/** The `by` of an install started by `omp.autoUpdate` instead of an Approve click. */
+export const AUTO_UPDATE_BY = "auto-update";
+
+/** "installed automatically" or "approved by @alice", for notices and the omp page. */
+export function installedByText(by: string): string {
+	return by === AUTO_UPDATE_BY ? "installed automatically" : `approved by ${by}`;
+}
+
+/** The update status plus the `omp.autoUpdate` setting, for the omp page. */
+export interface OmpUpdateAdminView extends OmpUpdateView {
+	autoUpdate: boolean;
 }

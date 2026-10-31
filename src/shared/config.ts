@@ -71,6 +71,7 @@ const configObject = z.object({
 		})
 		.prefault({}),
 	logs: z.object({ maxGiB: z.number().min(0.1).default(5) }).prefault({}),
+	omp: z.object({ autoUpdate: z.boolean().default(false) }).prefault({}),
 });
 
 export type StateLabelKey = "planning" | "awaitingApproval" | "implementing" | "inReview" | "failed";
