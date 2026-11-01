@@ -23,11 +23,14 @@ export interface WorkerOptions {
 	/** Pod or container name (`HOSTNAME`), else random. */
 	workerId: string;
 	claimTimeoutMs: number;
-	/** Checkout root on container storage: checkout, sessions, skills and scratch copies (architecture §5, "worker checkout"). */
+	/**
+	 * Checkout root on container storage: checkout, sessions, skills and scratch copies, and the host's `TMPDIR` and
+	 * package-manager caches (architecture §5, "worker checkout").
+	 */
 	root: string;
 	/**
 	 * Run-local root (architecture §5, "run-local"; a tmpfs in the image): the status file, the run-private auth store,
-	 * omp's `HOME` and agent dir, and the host's `TMPDIR`. May equal `root`. Both are deleted at the end (RUN-20).
+	 * and omp's `HOME` and agent dir. May equal `root`. Both are deleted at the end (RUN-20).
 	 */
 	runLocal: string;
 	identity: AppIdentity;
