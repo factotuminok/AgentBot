@@ -177,12 +177,20 @@ export function requestPlanMessage(p: {
 
 /**
  * Notice that a newer omp is available for workers (UPD-02), with the button that installs it. `current` is the omp new
- * workers use now; `failure` explains why an earlier attempt did not work (UPD-03, UPD-08).
+ * workers use now; `failure` explains why an earlier attempt did not work (UPD-03, UPD-08). With `auto` (omp.autoUpdate
+ * is on) the install is already starting: the notice says so and has no button.
  */
-export function ompUpdateMessage(p: { current: string; latest: string; failure?: string }): OutMessage {
+export function ompUpdateMessage(p: { current: string; latest: string; failure?: string; auto?: boolean }): OutMessage {
 	const failure = p.failure ? `\n❌ ${clipText(p.failure, MAX_ERROR)}` : "";
+	const link = `\nhttps://www.npmjs.com/package/@oh-my-pi/pi-coding-agent/v/${p.latest}`;
+	if (p.auto) {
+		return {
+			content: `⬆️ **omp ${p.latest}** is available (workers use ${p.current}). It is being installed automatically for new workers (Settings → omp); workers already running keep their omp, and nothing restarts.${failure}${link}`,
+			components: [],
+		};
+	}
 	return {
-		content: `⬆️ **omp ${p.latest}** is available (workers use ${p.current}). Approving installs it for new workers; workers already running keep their omp, and nothing restarts.${failure}\nhttps://www.npmjs.com/package/@oh-my-pi/pi-coding-agent/v/${p.latest}`,
+		content: `⬆️ **omp ${p.latest}** is available (workers use ${p.current}). Approving installs it for new workers; workers already running keep their omp, and nothing restarts.${failure}${link}`,
 		components: [buttonRow(button({ type: "omp", version: p.latest, action: "approve" }, "Approve update", ButtonStyle.Success))],
 	};
 }

@@ -782,6 +782,7 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 | `workers.maxConcurrentRuns` | optional positive integer. Never rejected on save; health reports a warning when it exceeds worker capacity (RUN-10). | unset (= worker capacity) |
 | `workers.reattachGraceSeconds` | positive integer | 90 |
 | `logs.maxGiB` | ≥ 0.1 | 5 |
+| `omp.autoUpdate` | boolean; install a newer omp for workers without an approval click (UPD-02, UPD-03) | `false` |
 | `secrets.discordToken`, `secrets.githubAppPrivateKey` | required, write-only | none |
 | `secrets.providerKeys` | map of provider id to key, write-only | `{}` |
 
@@ -837,8 +838,8 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 ## 15. omp version and in-place updates (architecture §8)
 
 - **UPD-01** An image build MUST install npm's latest omp. It MUST fall back to the version pinned in `package.json` when the latest version fails to install (10 min timeout) or fails to load the app's entry modules (2 min timeout). The build log MUST show which version was used and why. CI MUST test the pinned version.
-- **UPD-02** The service MUST check the npm registry 60 s after start and every 6 h after that (10 s timeout). When a newer omp exists, it MUST post a notice with an **Approve update** button in the work channel (DSC-33). A newer version MUST supersede an older notice. Check errors MUST be stored and shown, and MUST NOT throw.
-- **UPD-03** On approval by an allowed member, the orchestrator MUST install the newer omp for workers as described in architecture UPD-06. Any failure MUST leave the current omp in place and report the error and the output tail in Discord, with a fresh Approve button. A stale approval MUST be refused, and so MUST a second concurrent approval. No component restarts.
+- **UPD-02** The service MUST check the npm registry 60 s after start and every 6 h after that (10 s timeout). When a newer omp exists, it MUST post a notice with an **Approve update** button in the work channel (DSC-33). A newer version MUST supersede an older notice. Check errors MUST be stored and shown, and MUST NOT throw. When `omp.autoUpdate` is on, the notice MUST have no button and MUST say the install is starting automatically, and the install MUST start at once, with no click; an older notice's button MUST be closed.
+- **UPD-03** On approval by an allowed member, the orchestrator MUST install the newer omp for workers as described in architecture UPD-06. Any failure MUST leave the current omp in place and report the error and the output tail in Discord, with a fresh Approve button. A stale approval MUST be refused, and so MUST a second concurrent approval. No component restarts. An automatic install (`omp.autoUpdate`) follows the same install, concurrency, stale-version and failure rules, and is recorded as made by `auto-update`. Its result ("installed automatically", or the failure with a fresh Approve button) MUST be posted after it ends, even when a settings save restarted the engine meanwhile. A version whose last attempt failed (an install failure, a canary failure, or an orchestrator restart during the install) MUST NOT be installed automatically again; a newer version or an Approve click can try. Turning the setting off MUST NOT cancel a running install.
 - **UPD-04** Workers MUST choose the omp per run, falling back to the image's omp, as described in architecture UPD-07 and UPD-08. The orchestrator MUST drop copies from another image (UPD-09).
 - **UPD-05** Updates MUST be refused outside the container image (no `AGENTBOT_OMP_RUNTIME_DIR`). The orchestrator and web keep the image's omp (UPD-10).
 

@@ -18,6 +18,7 @@ describe("parseConfig", () => {
 		expect(config.models).toEqual({ thinking: "high" });
 		expect(config.workers).toEqual({ reattachGraceSeconds: 90 });
 		expect(config.logs).toEqual({ maxGiB: 5 });
+		expect(config.omp).toEqual({ autoUpdate: false });
 		expect(config.limits).toEqual({
 			maxConcurrentJobs: 2,
 			maxChatSessions: 2,
@@ -62,6 +63,11 @@ describe("parseConfig", () => {
 	test("logs.maxGiB rejects less than 0.1", () => {
 		expect(parseConfig({ ...minimal, logs: { maxGiB: 0.1 } }).logs.maxGiB).toBe(0.1);
 		expect(() => parseConfig({ ...minimal, logs: { maxGiB: 0.05 } })).toThrow(/logs\.maxGiB:/);
+	});
+
+	test("omp.autoUpdate must be a boolean", () => {
+		expect(parseConfig({ ...minimal, omp: { autoUpdate: true } }).omp.autoUpdate).toBe(true);
+		expect(() => parseConfig({ ...minimal, omp: { autoUpdate: "yes" } })).toThrow(/omp\.autoUpdate:/);
 	});
 
 	test("rejects empty allow-lists", () => {

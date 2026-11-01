@@ -254,6 +254,11 @@ function textInput(name: string, label: string, value: string, attrs = "", help?
 	return `<label><span>${l.label}</span> <input type="text" name="${esc(name)}" value="${esc(value)}"${l.describedBy} ${attrs}></label>`;
 }
 
+function checkboxInput(name: string, label: string, checked: boolean, help?: Help): string {
+	const l = labelWithHelp(name, label, help);
+	return `<label><span>${l.label}</span> <input type="checkbox" name="${esc(name)}" value="true"${l.describedBy}${checked ? " checked" : ""}></label>`;
+}
+
 function passwordInput(name: string, label: string, autocomplete: string, help?: Help): string {
 	const l = labelWithHelp(name, label, help);
 	return `<label><span>${l.label}</span> <input type="password" name="${esc(name)}" autocomplete="${esc(autocomplete)}"${l.describedBy}></label>`;
@@ -340,6 +345,7 @@ function settingsForm(state: SettingsFormState, channels: ChannelListing): strin
 		const fields = CONFIG_FIELDS.filter(def => def.name.startsWith(`${section}.`)).map(def => {
 			const hint = def.kind === "list" ? ' placeholder="comma or space separated"' : def.kind === "number" ? ' inputmode="decimal"' : "";
 			const help = { text: def.help, example: def.example, fallback: configDefault(def) };
+			if (def.kind === "boolean") return checkboxInput(def.name, def.label, state.config[def.name] === "true", help);
 			const typed = textInput(def.name, def.label, state.config[def.name] ?? "", hint, help);
 			return channelFields.includes(def.name) ? channelFieldHtml(def.name, state.config, channels, labelWithHelp(def.name, def.label, help), typed) : typed;
 		});

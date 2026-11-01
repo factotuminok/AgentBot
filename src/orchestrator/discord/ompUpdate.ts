@@ -1,3 +1,4 @@
+import { AUTO_UPDATE_BY, installedByText } from "../../shared/adminOmp";
 import { errorMessage, log } from "../../shared/log";
 import type { EngineDeps } from "../engine/deps";
 import type { OmpNotice, OmpUpdater } from "../omp/updates";
@@ -7,7 +8,10 @@ import type { ComponentEvent, MsgRef } from "./surface";
 /**
  * The omp update notice in the work channel (UPD-02, UPD-03; ported from DevForge `discord/ompUpdate.ts`): posts
  * "omp X is available" with an **Approve update** button, supersedes an older notice, installs on approval, and posts
- * failures (a failed install, or a copy that failed its canary run, UPD-08) with a fresh Approve button. One per engine.
+ * failures (a failed install, or a copy that failed its canary run, UPD-08) with a fresh Approve button. With
+ * `omp.autoUpdate` on it starts the install itself: the "available" notice has no button, and the outcome of the
+ * unattended install is posted from the stored attempt, so it is reported by whichever engine runs when it ends, even
+ * after a settings save replaced this one. One per engine.
  */
 
 const MAX_MESSAGE = 2000;
@@ -34,6 +38,7 @@ export function createOmpNotices(deps: Pick<EngineDeps, "config" | "discord">, u
 	const { discord } = deps;
 	const channelId = deps.config.discord.workChannelId;
 	let unsubscribe: (() => void) | undefined;
+	let stopped = false;
 
 	async function closeNotice(ref: MsgRef, note: string): Promise<void> {
 		try {
@@ -47,18 +52,60 @@ export function createOmpNotices(deps: Pick<EngineDeps, "config" | "discord">, u
 
 	/** Posts a notice with the Approve button and remembers it. */
 	async function postNotice(latest: string, failure?: string): Promise<void> {
-		const ref = await discord.send(channelId, ompUpdateMessage({ current: updater.status().active?.version ?? updater.status().image, latest, failure }), "high");
+		const status = updater.status();
+		const ref = await discord.send(channelId, ompUpdateMessage({ current: status.active?.version ?? status.image, latest, failure }), "high");
 		updater.setNotice({ version: latest, channelId: ref.channelId, messageId: ref.messageId, buttons: true });
 	}
 
-	async function syncOnce(): Promise<void> {
+	/**
+	 * Starts the automatic install of the update on offer. Reads the state and claims the install in one synchronous
+	 * step, so a click, another sync or another engine is refused while it runs (UPD-03). A version whose last attempt
+	 * failed is not tried again: the failure is posted with an Approve button instead.
+	 */
+	function claimAutoInstall(): string | undefined {
 		const status = updater.status();
-		// Outside the image there is nothing to approve (UPD-05); during an install the approval handler reports.
+		const version = updater.updateAvailable();
+		if (!status.supported || status.installing || !version) return undefined;
+		if (status.lastAttempt?.version === version && status.lastAttempt.outcome === "failed") return undefined;
+		void updater
+			.install(version, AUTO_UPDATE_BY, { unattended: true })
+			.catch(err => log("warn", "automatic omp install failed", { version, error: errorMessage(err) }));
+		return updater.status().installing?.version === version ? version : undefined;
+	}
+
+	async function syncOnce(): Promise<void> {
+		if (stopped) return;
+		// Outside the image there is nothing to offer (UPD-05); during an install its end triggers the next sync.
+		if (!updater.status().supported || updater.status().installing) return;
+		// An unattended install that ended: nobody is waiting for its result, so it is posted here. Marked first, so a
+		// second engine does not post it too.
+		const done = updater.status().lastAttempt;
+		if (done?.outcome === "installed" && !done.reported) {
+			updater.markReported();
+			await discord.send(
+				channelId,
+				{ content: `✅ omp ${done.version} is installed for workers (${installedByText(done.by)}). New workers use it; workers already running keep their omp.` },
+				"high",
+			);
+		}
+		const status = updater.status();
 		if (!status.supported || status.installing) return;
 		const attempt = status.lastAttempt;
 		const failure = attempt?.outcome === "failed" && !attempt.reported ? failureText(`Updating omp to ${attempt.version} failed: ${attempt.error ?? "unknown error"}`, attempt.log) : undefined;
-		const available = updater.updateAvailable();
 		const stored: OmpNotice | undefined = updater.notice();
+		const current = status.active?.version ?? status.image;
+
+		if (deps.config.omp.autoUpdate) {
+			const claimed = claimAutoInstall();
+			if (claimed) {
+				if (stored?.buttons) await closeNotice(stored, stored.version === claimed ? `⬆️ Installing omp ${claimed} automatically; see below.` : `Superseded by omp ${claimed}.`);
+				const ref = await discord.send(channelId, ompUpdateMessage({ current, latest: claimed, failure, auto: true }), "high");
+				updater.setNotice({ version: claimed, channelId: ref.channelId, messageId: ref.messageId, buttons: false });
+				return;
+			}
+		}
+
+		const available = updater.updateAvailable();
 		if (available && (failure || stored?.version !== available)) {
 			if (stored?.buttons) await closeNotice(stored, stored.version === available ? "See the newer notice below." : `Superseded by omp ${available}.`);
 			await postNotice(available, failure);
@@ -79,7 +126,7 @@ export function createOmpNotices(deps: Pick<EngineDeps, "config" | "discord">, u
 		const refusal = !status.supported
 			? (status.unsupportedReason ?? "omp updates are not supported here.")
 			: status.installing
-				? `omp ${status.installing.version} is already being installed (approved by ${status.installing.by}).`
+				? `omp ${status.installing.version} is already being installed (${installedByText(status.installing.by)}).`
 				: id.version !== updater.updateAvailable()
 					? STALE_UPDATE
 					: undefined;
@@ -100,7 +147,7 @@ export function createOmpNotices(deps: Pick<EngineDeps, "config" | "discord">, u
 		if (result.ok) {
 			await discord.send(
 				channelId,
-				{ content: `✅ omp ${id.version} is installed for workers (approved by ${who}). New workers use it; workers already running keep their omp.` },
+				{ content: `✅ omp ${id.version} is installed for workers (${installedByText(who)}). New workers use it; workers already running keep their omp.` },
 				"high",
 			);
 			return;
@@ -114,10 +161,12 @@ export function createOmpNotices(deps: Pick<EngineDeps, "config" | "discord">, u
 
 	return {
 		start() {
+			stopped = false;
 			unsubscribe ??= updater.subscribe(sync);
 			sync();
 		},
 		stop() {
+			stopped = true;
 			unsubscribe?.();
 			unsubscribe = undefined;
 		},

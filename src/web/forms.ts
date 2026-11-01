@@ -1,7 +1,7 @@
 import type { SecretsView, SettingsSaveRequest, SettingsView } from "../shared/adminApi";
 import { type Config, parseConfig } from "../shared/config";
 
-export type FieldKind = "text" | "number" | "list";
+export type FieldKind = "text" | "number" | "list" | "boolean";
 
 export interface FieldDef {
 	/** Dotted path into `Config`; also the form field name. */
@@ -237,6 +237,13 @@ export const CONFIG_FIELDS: FieldDef[] = [
 		example: "2",
 		help: "Total disk space for the orchestrator's rolling logs (agent transcripts and its own log); the oldest files are deleted when it is exceeded. AGENTBOT_AGENT_LOG_MAX_BYTES overrides it.",
 	},
+	{
+		name: "omp.autoUpdate",
+		label: "Install omp updates automatically",
+		kind: "boolean",
+		example: "true",
+		help: "When on, a newer omp for workers is installed as soon as the npm check finds it, without the Approve update button in the work channel. Discord still gets a notice before and a message after. A version whose install or first run failed is not retried automatically; approve it in Discord. Only in the container image.",
+	},
 ];
 
 export const SECTION_LABELS: Record<string, string> = {
@@ -248,6 +255,7 @@ export const SECTION_LABELS: Record<string, string> = {
 	limits: "Limits",
 	workers: "Workers",
 	logs: "Logs",
+	omp: "omp",
 };
 
 export const SECRET_FIELDS = {
@@ -321,7 +329,10 @@ function display(value: unknown): string {
 	return String(value);
 }
 
-/** Blank → undefined (schema default applies); unparsable text is kept so validation reports it with its path. */
+/**
+ * Blank → undefined (schema default applies); unparsable text is kept so validation reports it with its path.
+ * Booleans are checkboxes: checked sends "true", unchecked sends nothing.
+ */
 function parseField(kind: FieldKind, raw: string): unknown {
 	const text = raw.trim();
 	if (kind === "list") return text ? text.split(/[\s,]+/).filter(Boolean) : [];
@@ -330,6 +341,7 @@ function parseField(kind: FieldKind, raw: string): unknown {
 		const number = Number(text);
 		return Number.isNaN(number) ? text : number;
 	}
+	if (kind === "boolean") return text === "true" ? true : text === "false" ? false : text;
 	return text;
 }
 
