@@ -428,8 +428,8 @@ flowchart LR
 |---|---|---|---|---|
 | state | orchestrator | `agentbot-state` | PVC, RWO | `agentbot.db` (SQLite, WAL with `synchronous=NORMAL`: commits do not wait for an fsync, which stalled the orchestrator on a busy node; see `wiki/load-test.md`); `omp-agent/` (omp sign-in store `agent.db`, model cache); `repos/` (bare mirrors `<owner>__<repo>.git`, and per mirror a runs repo `<owner>__<repo>.runs.git` holding the temp refs and borrowing the mirror's objects through `objects/info/alternates`); `sessions/`; `scratch/` (ask inputs and outputs); `omp/` (skills and agents); `omp-runtime/` (packed omp copies); `logs/agent/`, `logs/orchestrator/` |
 | web home | web | `agentbot-web` | PVC, RWO | the `agentbot` user's `$HOME`: the config workspace copy and its last-synced revisions, queued saves (requirements WEB-27), code-server user data. Extensions are not here: the bundled one is in the image. |
-| worker checkout | one worker | container storage, size measured by the worker (STO-06) | `emptyDir`, `sizeLimit` (default 20 Gi) as a backstop | at `/tmp/agentbot-worker/<pid>/` (`$TMPDIR/agentbot-worker`): the run's clone, session copy, skills copy, scratch copy, checkpoint and result bundles, the unpacked omp runtime copy when one applies (§8; about 1 GB, not counted against the checkout's STO-06 limit), and `cache/`, the package-manager caches of `setupCommand` and the agent's commands (`XDG_CACHE_HOME`, `npm_config_cache`; a typical web app's `bun install` caches ~500 MB, more than the run-local tmpfs holds; not counted against STO-06 either) |
-| run-local | one worker | tmpfs (`U` for ownership) | `emptyDir`, `medium: Memory` | at `AGENTBOT_WORKER_RUN_DIR` (image: `/run/agentbot`), one `<pid>/` per worker process: the status file read by `agentbot health`, run-private auth store, omp's `HOME` and agent dir (logs, install id, ~8 MB model cache, spike S2), and the agent host's `TMPDIR`. It counts against the memory limit. |
+| worker checkout | one worker | container storage, size measured by the worker (STO-06) | `emptyDir`, `sizeLimit` (default 20 Gi) as a backstop | at `/tmp/agentbot-worker/<pid>/` (`$TMPDIR/agentbot-worker`): the run's clone, session copy, skills copy, scratch copy, checkpoint and result bundles, the unpacked omp runtime copy when one applies (§8; about 1 GB, not counted against the checkout's STO-06 limit), `cache/`, the package-manager caches of `setupCommand` and the agent's commands (`XDG_CACHE_HOME`, `npm_config_cache`; a typical web app's `bun install` caches ~500 MB, more than the run-local tmpfs holds; not counted against STO-06 either), and `tmp/`, the agent host's `TMPDIR` (test suites and builds write state there: on the run-local tmpfs it filled up, failed free-space checks and counted against the memory limit; not counted against STO-06) |
+| run-local | one worker | tmpfs (`U` for ownership) | `emptyDir`, `medium: Memory` | at `AGENTBOT_WORKER_RUN_DIR` (image: `/run/agentbot`), one `<pid>/` per worker process: the status file read by `agentbot health`, run-private auth store, and omp's `HOME` and agent dir (logs, install id, ~8 MB model cache, spike S2). It counts against the memory limit. |
 
 - **STO-01** SQLite databases (`agentbot.db` and omp's `agent.db`) MUST live only on the state volume. No other component may open them.
 - **STO-02** Every container MUST run as uid/gid 10001. In Kubernetes, `fsGroup: 10001` and `runAsNonRoot: true` MUST be set, so nothing has to re-own files at start.
@@ -570,7 +570,7 @@ Default resources (values):
 | web | 100m CPU, 768 Mi (code-server) | 2 Gi |
 | worker | 500m CPU, 1.5 Gi, 20 Gi ephemeral storage | 4 Gi |
 
-Requirements: Kubernetes ≥ 1.27 and KEDA ≥ 2.12; KEDA ≥ 2.19 is recommended (spike S5).
+Requirements: Kubernetes ≥ 1.27 and KEDA ≥ 2.12; KEDA ≥ 2.19 is recommended (spike S5). On cgroup v2 nodes, Kubernetes ≥ 1.32 with the kubelet's `singleProcessOOMKill: true` (requirements NFR-02, OPS-08): Kubernetes 1.28 and later otherwise set `memory.oom.group` on every container, so an OOM kill ends the whole worker, supervisor included.
 
 ## 8. omp updates (in place, workers only)
 
@@ -612,7 +612,7 @@ How it is built (`src/orchestrator/omp/`, `src/shared/ompRuntime.ts`, worker `ru
 | KEDA or the launcher missing or not starting workers | Runs stay pending. Discord shows "Waiting for a worker…" and the status page shows pending runs and their age. |
 | Launcher pointed at a rootful socket | The launcher refuses to start (LCH-01). Runs stay pending. |
 | Issue branch moved on GitHub during a run | The fast-forward push is rejected and the job fails with a Retry button (RUN-19). |
-| OOM or full disk in a worker | AGT-17 to AGT-19 and STO-06. Each worker has its own limits, so it is reported for that run only. |
+| OOM or full disk in a worker | AGT-17 to AGT-19 and STO-06. Each worker has its own limits, so it is reported for that run only. On Kubernetes this needs the kubelet's `singleProcessOOMKill: true`; without it the whole worker container is killed, the lease expires and the run is lost (RUN-04), and its resume repeats the same command. |
 
 ## 10. Changes to requirements
 
@@ -644,6 +644,7 @@ requirements.md has been updated for these:
 | WEB-14, WEB-30, WEB-31 | Bundled extension installed at image build; built-ins deleted; locked user settings and tasks; `/etc/shells`; the gaps S4 found (spike S4). |
 | STO-06, NFR-02, LCH-01, LCH-02 | Under Podman the checkout limit is measured by the worker; rootless detection, no swap, tmpfs ownership (spike S6). |
 | OPS-08 | KEDA ≥ 2.19 recommended (spike S5). |
+| NFR-02, OPS-08 | Kubernetes nodes on cgroup v2 need the kubelet's `singleProcessOOMKill: true` (Kubernetes ≥ 1.32), found when OOM kills on k3s ended whole worker pods. |
 | new | RUN-01 to RUN-21, STO-01 to STO-06, SEC-14 to SEC-16, CRED-01 to CRED-05, LCH-01 to LCH-04, OPS-07 to OPS-09, DSC-32 to DSC-38, GH-25 to GH-27, WEB-25 to WEB-32 |
 
 ## 11. Open items

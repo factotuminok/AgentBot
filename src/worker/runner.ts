@@ -79,7 +79,10 @@ export interface RunDirs {
 	sessions: string;
 	/** The downloaded skills and agents (AGT-24). */
 	omp: string;
-	/** The host's `TMPDIR`. Run-local. */
+	/**
+	 * The host's `TMPDIR`: what the agent's commands write there (test suites, builds) can be large and must not count
+	 * against the memory limit, so on container storage like `cache`.
+	 */
 	tmp: string;
 	/**
 	 * Package-manager caches of `setupCommand` and the agent's commands (`XDG_CACHE_HOME`, npm's cache): hundreds of MB
@@ -106,7 +109,7 @@ export async function makeRunDirs(root: string, runLocal: string, scratch: boole
 		auth: join(runLocal, "auth"),
 		sessions: join(root, "sessions"),
 		omp: join(root, "omp"),
-		tmp: join(runLocal, "tmp"),
+		tmp: join(root, "tmp"),
 		cache: join(root, "cache"),
 		bundles: join(root, "bundles"),
 		work: join(root, "work"),
@@ -123,8 +126,9 @@ export async function makeRunDirs(root: string, runLocal: string, scratch: boole
 }
 
 /**
- * The agent host's environment: omp's `HOME`, agent dir and `TMPDIR` run-local (spike S2), package-manager caches on
- * container storage (`dirs.cache`; omp ignores `XDG_CACHE_HOME` unless `<it>/omp` exists) and the run marker (AGT-06).
+ * The agent host's environment: omp's `HOME` and agent dir run-local (spike S2), `TMPDIR` and package-manager caches
+ * on container storage (`dirs.tmp`, `dirs.cache`; omp ignores `XDG_CACHE_HOME` unless `<it>/omp` exists) and the run
+ * marker (AGT-06).
  * `setupCommand` runs with it too, so whatever it leaves running is reaped with the run.
  */
 export function hostEnv(dirs: RunDirs, marker: string): Record<string, string | undefined> {

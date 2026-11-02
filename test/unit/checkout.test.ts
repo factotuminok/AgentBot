@@ -222,12 +222,16 @@ describe("runSetupCommand", () => {
 		expect(Date.now() - t0).toBeLessThan(5000);
 	});
 
-	test("with the host environment, package-manager caches land on the run root, not the run-local tmpfs", async () => {
+	test("with the host environment, TMPDIR and package-manager caches land on the run root, not the run-local tmpfs", async () => {
 		const runRoot = join(root, "run-root");
 		const runLocal = join(root, "run-local");
 		const dirs = await makeRunDirs(runRoot, runLocal, false);
 		const env = hostEnv(dirs, "marker");
 		expect(env.HOME).toStartWith(runLocal);
+		expect(env.PI_CODING_AGENT_DIR).toStartWith(runLocal);
+		// The agent's own test suites put state dirs in TMPDIR: on the 256 MiB tmpfs, free-space checks failed (507).
+		const tmp = await runSetupCommand(runRoot, `bun -e 'console.log(require("node:os").tmpdir())'`, { env });
+		expect(tmp.tail.trim()).toEndWith(join(runRoot, "tmp"));
 		expect(env.XDG_CACHE_HOME).toBe(join(runRoot, "cache"));
 		expect(env.npm_config_cache).toStartWith(runRoot);
 		// What `bun install` in a setupCommand uses: before, $HOME/.bun/install/cache on the 256 MiB tmpfs (ENOSPC).

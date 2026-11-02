@@ -1,6 +1,7 @@
 # AgentBot Helm chart (architecture §7.3, requirements OPS-07, OPS-08).
 # Prerequisites: Kubernetes >= 1.27 and KEDA >= 2.12 (>= 2.19 recommended: older versions can start one extra worker pod
-# near worker.maxReplicas, spike S5). No ReadWriteMany storage is needed.
+# near worker.maxReplicas, spike S5). No ReadWriteMany storage is needed. On cgroup v2 nodes, Kubernetes >= 1.32 with the
+# kubelet's singleProcessOOMKill: true, or an OOM kill ends the whole worker and its run is lost (requirements NFR-02).
 
 # The one AgentBot image; the role is the container argument. The tag defaults to the chart's appVersion.
 image:
@@ -99,6 +100,8 @@ worker:
   # KEDA polling interval in seconds (architecture §4.4).
   pollingInterval: 5
   failedJobsHistoryLimit: 5
+  # limits.memory: an OOM kill takes only the offending process when the kubelet runs with singleProcessOOMKill: true
+  # (see the top of this file); the worker then reports it to the agent and in the PR (AGT-17 to AGT-19).
   resources:
     requests:
       cpu: 500m

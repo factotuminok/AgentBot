@@ -97,7 +97,7 @@ The stack runs in the machine's VM; use its rootless connection (`export CONTAIN
 
 The Helm chart `deploy/helm/agentbot` runs the orchestrator and web as single-replica Deployments and the workers as a KEDA `ScaledJob`: one Job pod per pending run, from 0 up to `worker.maxReplicas` (default 10), each deleted a minute after its run (architecture §7.3).
 
-**Requirements:** Kubernetes ≥ 1.27 and KEDA ≥ 2.12 (≥ 2.19 recommended: older versions can start one extra worker pod near `worker.maxReplicas`). The chart refuses to install on an older cluster or without KEDA's `ScaledJob` API. ReadWriteOnce storage for two PVCs; no ReadWriteMany.
+**Requirements:** Kubernetes ≥ 1.27 and KEDA ≥ 2.12 (≥ 2.19 recommended: older versions can start one extra worker pod near `worker.maxReplicas`). The chart refuses to install on an older cluster or without KEDA's `ScaledJob` API. ReadWriteOnce storage for two PVCs; no ReadWriteMany. On cgroup v2 nodes, run Kubernetes ≥ 1.32 with the kubelet's `singleProcessOOMKill: true` (NFR-02): by default the kubelet sets `memory.oom.group`, so a command that runs a worker out of memory kills the whole worker and the run is lost ("pod evicted or crashed") instead of the OOM being reported to the agent and in the PR. The chart cannot check this; `kubectl get --raw /api/v1/nodes/<node>/proxy/configz | jq .kubeletconfig.singleProcessOOMKill` shows it.
 
 ```sh
 helm install agentbot deploy/helm/agentbot -n agentbot --create-namespace --set image.tag=<version>

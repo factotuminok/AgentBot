@@ -24,3 +24,5 @@ The master key and internal tokens are in Secret {{ include "agentbot.secretName
 `helm uninstall` (like the state volume {{ include "agentbot.fullname" . }}-state). Back them up together.
 {{- end }}
 KEDA >= 2.19 is recommended: older versions can start one extra worker pod near worker.maxReplicas.
+On cgroup v2 nodes, run the kubelet with singleProcessOOMKill: true (Kubernetes >= 1.32): otherwise an out-of-memory
+command ends the whole worker pod and its run is lost instead of reported (requirements NFR-02).
