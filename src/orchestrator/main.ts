@@ -14,6 +14,7 @@ import { createRepos } from "./git/repos";
 import { type Controller, createController } from "./engine/controller";
 import { createOmpUpdater, type OmpUpdater } from "./omp/updates";
 import { openAgentLog } from "./store/agentlog";
+import { storedAccounts } from "./store/accounts";
 import { type Db, dbPath, openDb } from "./store/db";
 import { ensureOmpAssetsDir, skillsBundle } from "./store/ompAssets";
 import { openSignins, type Signins } from "./store/signins";
@@ -89,7 +90,7 @@ export async function runOrchestrator(): Promise<void> {
 	});
 	// UPD-09 cleanup now; the first npm check 60 s from now.
 	ompUpdates.start();
-	const controller = createController({ stateDir: env.stateDir, db, vault, agentLog, dispatcher, applyLogCap, ompUpdates });
+	const controller = createController({ stateDir: env.stateDir, db, vault, agentLog, dispatcher, applyLogCap, ompUpdates, signinAccounts: () => storedAccounts(signins) });
 
 	// First run: whoever can read the orchestrator log proves it before claiming the admin account (WEB-02).
 	const setupToken = vault.isInitialized() ? undefined : generateSetupToken();

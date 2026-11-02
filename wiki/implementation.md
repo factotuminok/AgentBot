@@ -361,7 +361,7 @@ DevForge's tests are ported with their modules. Tests that pinned DevForge's wor
 | RUN-01 to RUN-09, RUN-14 to RUN-16, AGT-01 to AGT-29, CRED, CHAT-07 to CHAT-11 | 3 |
 | WS, GH-26, RUN-17 to RUN-21, STO, JOB-10, JOB-11 | 4 |
 | JOB-18 to JOB-23, CI, PR, DSC-21, DSC-23, DSC-25 to DSC-28, CHAT-01 to CHAT-06, NFR-03, NFR-06 | 5 |
-| WEB-20 to WEB-24, WEB-32, SEC-12, SEC-13, OBS-03 to OBS-06 | 6 |
+| WEB-20 to WEB-24, WEB-32, SEC-12, SEC-13, SEC-17, OBS-03 to OBS-06 | 6 |
 | WEB-14, WEB-25 to WEB-31 | 7 |
 | OPS-01 to OPS-03, LCH, UPD-01, SEC-16, NFR-01, NFR-02 | 8 |
 | OPS-07 to OPS-09, SEC-15, and the Kubernetes side of RUN-10 to RUN-13 | 9 |

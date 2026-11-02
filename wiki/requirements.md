@@ -722,6 +722,7 @@ Any non-terminal state also accepts `cancelled`.
   - A sign-in left unattended MUST be aborted after 15 minutes.
   - Anthropic grants MUST show their re-login deadline.
 - **SEC-13** Model sign-ins MUST be stored only by the orchestrator and refreshed only by the orchestrator (architecture CRED-01 to CRED-05). They MUST be usable by the next run without a restart. The UI MUST state that, unlike stored API keys, a run's copy of these tokens is readable by that run's agent shell.
+- **SEC-17** When a stored sign-in's re-login deadline (SEC-12) is 3 days or less away and has not passed, the orchestrator MUST post a notice in the work channel (DSC-33), without mentions (DSC-07), naming the provider, the account and the deadline and pointing to `/admin/models`. It MUST check at least hourly while the engine runs, post at most once per 24 h and at most 3 times per deadline per sign-in, send a missed notice late, and retry a failed post at the next check. A new sign-in starts a new cycle; a signed-out sign-in gets no further notices. The sent-notice state MUST survive engine and orchestrator restarts.
 
 ## 12. Engine lifecycle
 
