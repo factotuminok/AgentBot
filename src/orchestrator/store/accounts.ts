@@ -84,6 +84,25 @@ function defaultSchedule(fn: () => void, ms: number): () => void {
 
 const TIMED_OUT = "Sign-in timed out: it was left unattended for 15 minutes.";
 
+/** The stored sign-ins as the admin page and the re-login notices (SEC-12, SEC-17) see them. `reloginBy` is set only for Anthropic grants. */
+export function storedAccounts(signins: Pick<Signins, "authStorage">): StoredAccount[] {
+	return signins.authStorage.credentials.list().map(({ id, provider, credential, disabledCause }) => {
+		const account: StoredAccount = { credentialId: id, provider, type: credential.type };
+		if (credential.type === "oauth") {
+			if (credential.email) account.email = credential.email;
+			if (credential.accountId) account.accountId = credential.accountId;
+			if (credential.orgName) account.orgName = credential.orgName;
+			if (typeof credential.expires === "number") account.expiresAt = new Date(credential.expires).toISOString();
+			if (typeof credential.authorizedAt === "number") {
+				account.authorizedAt = new Date(credential.authorizedAt).toISOString();
+				if (provider === "anthropic") account.reloginBy = new Date(credential.authorizedAt + ANTHROPIC_OAUTH_GRANT_TTL_MS).toISOString();
+			}
+		}
+		if (disabledCause) account.disabledCause = disabledCause;
+		return account;
+	});
+}
+
 export function createAccounts(opts: AccountsOptions): Accounts {
 	const { signins, backend } = opts;
 	const schedule = opts.schedule ?? defaultSchedule;
@@ -95,24 +114,6 @@ export function createAccounts(opts: AccountsOptions): Accounts {
 			.providers()
 			.map(p => ({ ...p, featured: FEATURED_PROVIDERS.includes(p.id) }))
 			.sort((a, b) => rank(a.id) - rank(b.id) || a.name.localeCompare(b.name));
-	}
-
-	function accounts(): StoredAccount[] {
-		return signins.authStorage.credentials.list().map(({ id, provider, credential, disabledCause }) => {
-			const account: StoredAccount = { credentialId: id, provider, type: credential.type };
-			if (credential.type === "oauth") {
-				if (credential.email) account.email = credential.email;
-				if (credential.accountId) account.accountId = credential.accountId;
-				if (credential.orgName) account.orgName = credential.orgName;
-				if (typeof credential.expires === "number") account.expiresAt = new Date(credential.expires).toISOString();
-				if (typeof credential.authorizedAt === "number") {
-					account.authorizedAt = new Date(credential.authorizedAt).toISOString();
-					if (provider === "anthropic") account.reloginBy = new Date(credential.authorizedAt + ANTHROPIC_OAUTH_GRANT_TTL_MS).toISOString();
-				}
-			}
-			if (disabledCause) account.disabledCause = disabledCause;
-			return account;
-		});
 	}
 
 	function finish(record: LoginRecord, patch: Partial<LoginState>): void {
@@ -142,7 +143,7 @@ export function createAccounts(opts: AccountsOptions): Accounts {
 		view() {
 			return {
 				providers: providers(),
-				accounts: accounts(),
+				accounts: storedAccounts(signins),
 				models: backend.models().sort((a, b) => a.id.localeCompare(b.id)),
 			};
 		},

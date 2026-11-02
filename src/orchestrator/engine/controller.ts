@@ -1,6 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { EnginePhase, StatusReport } from "../../shared/adminApi";
+import type { StoredAccount } from "../../shared/adminModels";
 import { type EngineConfig, hasWorkChannel, type LabelNames, resolveLabelNames, type Settings, WORK_CHANNEL_MISSING } from "../../shared/config";
 import { errorMessage, log } from "../../shared/log";
 import { attachBot } from "../discord/bot";
@@ -8,6 +9,7 @@ import { createDiscordJsConnection } from "../discord/discordjs";
 import { createInteractionRouter } from "../discord/interactionRouter";
 import { createThreadReplies } from "../discord/replies";
 import { createOmpNotices } from "../discord/ompUpdate";
+import { createReloginNotices } from "../discord/reloginNotices";
 import type { DiscordConnection } from "../discord/surface";
 import type { Dispatcher } from "../dispatch/dispatcher";
 import { createGitHub } from "../github/app";
@@ -71,6 +73,8 @@ export interface ControllerOptions {
 	connectGitHub?: GitHubFactory;
 	/** Process-wide in-place omp updates (UPD-02, UPD-03): each engine posts the notices and handles Approve. */
 	ompUpdates?: OmpUpdater;
+	/** Process-wide sign-ins for re-login notices (SEC-17); absent in tests that don't need them. */
+	signinAccounts?(): StoredAccount[];
 }
 
 /** A running engine instance: everything that must be torn down before settings can be re-applied. */
@@ -126,6 +130,7 @@ async function startEngine(opts: ControllerOptions, config: EngineConfig, secret
 			features.map(({ name, feature }) => feature.stop().catch(err => log("error", `${name} detach failed`, { error: errorMessage(err) }))),
 		);
 	const ompNotices = opts.ompUpdates ? createOmpNotices(deps, opts.ompUpdates) : undefined;
+	const reloginNotices = opts.signinAccounts ? createReloginNotices(deps, { accounts: opts.signinAccounts }) : undefined;
 	// Attached before login: command registration and the nickname run on every ready event (DSC-01, DSC-29).
 	const bot = attachBot({ deps, connection, scheduler, trackIssue, poller, askChat, repoChat, planner, drafter, ompNotices });
 	try {
@@ -141,8 +146,10 @@ async function startEngine(opts: ControllerOptions, config: EngineConfig, secret
 		for (const { feature } of features) feature.start();
 		poller.start();
 		ompNotices?.start();
+		reloginNotices?.start();
 	} catch (err) {
 		poller.stop();
+		reloginNotices?.stop();
 		lifetime.abort();
 		await scheduler.detach().catch(detachErr => log("warn", "scheduler detach failed", { error: errorMessage(detachErr) }));
 		await detachFeatures();
@@ -158,6 +165,7 @@ async function startEngine(opts: ControllerOptions, config: EngineConfig, secret
 			// ENG-04 order: poller, dispatch (detach from runs; never abort them), then Discord.
 			poller.stop();
 			ompNotices?.stop();
+			reloginNotices?.stop();
 			lifetime.abort();
 			await scheduler.detach().catch(err => log("error", "scheduler detach failed", { error: errorMessage(err) }));
 			await detachFeatures();

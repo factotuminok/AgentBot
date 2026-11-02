@@ -506,6 +506,7 @@ flowchart LR
   This keeps one refresh-token chain per sign-in: for providers that rotate refresh tokens, a refresh in one run would otherwise invalidate the orchestrator's copy and every other run's. Spike S1 confirmed the hook (`wiki/spikes/S1.md`).
 - **CRED-04** Withdrawn: there is no browser terminal.
 - **CRED-05** Signing out in `/admin/models` MUST remove the sign-in from the orchestrator at once. Runs that already hold a copy keep it until they end, but their refresh requests for that sign-in MUST be refused.
+- **Re-login notices (SEC-17).** Each engine runs one `createReloginNotices` check (`src/orchestrator/discord/reloginNotices.ts`) once Discord is connected, then hourly, over the stored sign-ins (`storedAccounts`). Its state is one `kv` key, `signin.relogin.notices`: a JSON object that maps each credential id to `{ reloginBy, sent, lastAt }`. Every check prunes it to the current sign-ins and their current `reloginBy`, so a new sign-in restarts the count and a sign-out drops the entry. An entry is written right after its notice was posted; a failed post records nothing and is retried at the next check.
 
 ## 7. Deployment
 

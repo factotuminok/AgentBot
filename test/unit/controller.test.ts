@@ -10,6 +10,7 @@ import { type Db, openDb } from "../../src/orchestrator/store/db";
 import { openVault, type Vault } from "../../src/orchestrator/store/vault";
 import { parseSettings, type Settings, WORK_CHANNEL_MISSING } from "../../src/shared/config";
 import { createFakeDiscord, type FakeDiscord } from "../fakes/discord";
+import type { StoredAccount } from "../../src/shared/adminModels";
 import { type FakeGitHub, startFakeGitHub } from "../fakes/github";
 
 const PASSWORD = "correct horse battery";
@@ -30,7 +31,7 @@ afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function harness(opts: { loginError?: string; initialize?: boolean } = {}): Promise<Harness> {
+async function harness(opts: { loginError?: string; initialize?: boolean; signinAccounts?: () => StoredAccount[] } = {}): Promise<Harness> {
 	const stateDir = mkdtempSync(join(tmpdir(), "agentbot-controller-"));
 	const db = openDb(":memory:");
 	const vault = await openVault(db);
@@ -47,10 +48,11 @@ async function harness(opts: { loginError?: string; initialize?: boolean } = {})
 		dispatcher: createFakeDispatcher(),
 		applyLogCap: gib => applied.push(gib),
 		connectDiscord: () => {
-			const discord = createFakeDiscord({ loginError: opts.loginError });
+			const discord = createFakeDiscord({ loginError: opts.loginError, channels: opts.signinAccounts ? [{ id: "w", name: "work" }] : undefined });
 			discords.push(discord);
 			return discord;
 		},
+		signinAccounts: opts.signinAccounts,
 		connectGitHub: gh => createGitHub({ ...gh, baseUrl: github.url }),
 	});
 	cleanups.push(async () => {
@@ -147,6 +149,22 @@ test("overlapping applies are serialised: each restart stops the previous engine
 	expect(h.controller.status().phase).toBe("running");
 	expect(h.discords).toHaveLength(3);
 	expect(h.discords.map(d => d.destroyed)).toEqual([true, true, false]);
+});
+
+test("a sign-in near its re-login deadline is announced in the work channel after login, and a re-apply does not repeat it (SEC-17)", async () => {
+	const accounts: StoredAccount[] = [
+		{ credentialId: 1, provider: "anthropic", type: "oauth", email: "alice@example.com", reloginBy: new Date(Date.now() + 2 * 86_400_000).toISOString() },
+	];
+	const h = await harness({ signinAccounts: () => accounts });
+	h.vault.writeSettings(h.settings());
+	await h.controller.apply();
+	await h.discords[0]!.settled();
+	expect(h.discords[0]!.messages("w").map(m => m.content)).toEqual([expect.stringContaining("alice@example.com")]);
+
+	await h.controller.apply();
+	await h.discords[1]!.settled();
+	expect(h.discords).toHaveLength(2);
+	expect(h.discords[1]!.messages("w")).toEqual([]);
 });
 
 test("a bad GitHub key ends the start in error without touching Discord", async () => {
